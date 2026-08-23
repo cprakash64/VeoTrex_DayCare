@@ -1,0 +1,60 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: veotrex
+          POSTGRES_USER: veotrex
+          POSTGRES_PASSWORD: ci_only_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U veotrex -d veotrex"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      VEOTREX_ENVIRONMENT: ci
+      VEOTREX_APP_VERSION: 0.1.0-ci
+      VEOTREX_DATABASE_URL: postgresql+psycopg://veotrex:ci_only_password@localhost:5432/veotrex
+      VEOTREX_EDGE_NODE_ID: 00000000-0000-0000-0000-000000000001
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with: {enable-cache: true}
+      - run: uv sync --all-packages --all-groups --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - run: uv run --package veotrex-api alembic -c apps/api/alembic.ini upgrade head
+      - run: uv run --package veotrex-api alembic -c apps/api/alembic.ini check
+      - run: uv run pytest --cov=veotrex_api --cov=veotrex_edge_agent --cov-report=term-missing
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: {version: 11.19.0}
+      - uses: actions/setup-node@v4
+        with: {node-version: 22, cache: pnpm}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm web:lint
+      - run: pnpm web:typecheck
+      - run: pnpm web:test
+      - run: pnpm --dir apps/web build
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: gitleaks/gitleaks-action@v2

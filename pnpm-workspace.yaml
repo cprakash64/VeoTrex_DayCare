@@ -1,0 +1,7 @@
+packages:
+  - apps/web
+verifyDepsBeforeRun: false
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

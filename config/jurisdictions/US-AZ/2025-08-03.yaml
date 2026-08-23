@@ -1,0 +1,79 @@
+schema_version: 1
+jurisdiction: US-AZ
+policy_version: "2025-08-03.supp-25-2"
+effective_date: 2025-08-03
+enabled: true
+disclaimer: >-
+  This policy pack is a machine-readable operational aid, not legal advice or a
+  guarantee of compliance. Authorized personnel must verify it against current law.
+sources:
+  - authority: Arizona Administrative Code / Arizona Secretary of State
+    rule: R9-5-404
+    title: Title 9, Chapter 5, Child Care Facilities
+    url: https://apps.azsos.gov/public_services/Title_09/9-05.pdf
+    supplement: Supp. 25-2
+    verified_on: 2026-08-23
+age_groups:
+  - {id: INFANT, label: Infant, precedence: 0}
+  - {id: ONE_YEAR_OLD, label: 1-year-old child, precedence: 1}
+  - {id: TWO_YEAR_OLD, label: 2-year-old child, precedence: 2}
+  - {id: THREE_YEAR_OLD, label: 3-year-old child, precedence: 3}
+  - {id: FOUR_YEAR_OLD, label: 4-year-old child, precedence: 4}
+  - {id: FIVE_YEAR_OLD_NON_SCHOOL_AGE, label: 5-year-old child not school-age, precedence: 5}
+  - {id: SCHOOL_AGE, label: School-age child, precedence: 6}
+staff_qualification_categories:
+  - DIRECTOR
+  - CHILD_EDUCATOR
+  - ASSISTANT_CHILD_EDUCATOR
+ratio_rules:
+  - id: R9-5-404.A.INFANT
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: INFANT
+    tiers:
+      - {staff_count: 1, max_children: 5}
+      - {staff_count: 2, max_children: 11}
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.ONE_YEAR_OLD
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: ONE_YEAR_OLD
+    tiers:
+      - {staff_count: 1, max_children: 6}
+      - {staff_count: 2, max_children: 13}
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.TWO_YEAR_OLD
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: TWO_YEAR_OLD
+    tiers: [{staff_count: 1, max_children: 8}]
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.THREE_YEAR_OLD
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: THREE_YEAR_OLD
+    tiers: [{staff_count: 1, max_children: 13}]
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.FOUR_YEAR_OLD
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: FOUR_YEAR_OLD
+    tiers: [{staff_count: 1, max_children: 15}]
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.FIVE_YEAR_OLD_NON_SCHOOL_AGE
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: FIVE_YEAR_OLD_NON_SCHOOL_AGE
+    tiers: [{staff_count: 1, max_children: 20}]
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+  - id: R9-5-404.A.SCHOOL_AGE
+    type: STAFF_TO_CHILD_RATIO
+    age_group_id: SCHOOL_AGE
+    tiers: [{staff_count: 1, max_children: 20}]
+    eligible_staff_categories: [DIRECTOR, CHILD_EDUCATOR, ASSISTANT_CHILD_EDUCATOR]
+    parameters: {youngest_child_governs: true}
+retention_requirements:
+  - record_type: POLICY_DECISION_METADATA
+    duration_days: null
+    status: UNRESOLVED
+attendance_release_rules: []

@@ -1,0 +1,19 @@
+[project]
+name = "veotrex-edge-agent"
+version = "0.1.0"
+description = "Hardware-neutral VeoTrex edge runtime skeleton"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "pydantic-settings==2.10.1",
+  "structlog==25.4.0",
+]
+
+[project.scripts]
+veotrex-edge-agent = "veotrex_edge_agent.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/veotrex_edge_agent"]

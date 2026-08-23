@@ -1,0 +1,42 @@
+[project]
+name = "veotrex-childcare"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "mypy==1.17.1",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.9",
+  "types-pyyaml==6.0.12.20250822",
+]
+
+[tool.uv.workspace]
+members = ["apps/api", "services/edge-agent"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+testpaths = ["tests", "apps/api/tests", "services/edge-agent/tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["apps/api/src", "services/edge-agent/src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+packages = ["veotrex_api", "veotrex_edge_agent"]
+mypy_path = ["apps/api/src", "services/edge-agent/src"]
