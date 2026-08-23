@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -109,6 +110,89 @@ async def test_rls_fails_closed_without_tenant_context(settings: Settings) -> No
         async with engine.begin() as connection:
             await connection.execute(text("DROP OWNED BY veotrex_test_runtime"))
             await connection.execute(text("DROP ROLE IF EXISTS veotrex_test_runtime"))
+        await engine.dispose()
+
+
+async def test_pending_ring_table_requires_narrow_function_access(settings: Settings) -> None:
+    engine = make_engine(settings)
+    role = "veotrex_ring_runtime_test"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+            )
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+            await connection.execute(
+                text(
+                    f"GRANT EXECUTE ON FUNCTION list_ring_pending_candidates(timestamptz) TO {role}"
+                )
+            )
+        async with engine.begin() as connection:
+            assert not await connection.scalar(
+                text("SELECT has_table_privilege(:role, 'ring_pending_links', 'SELECT')"),
+                {"role": role},
+            )
+            assert await connection.scalar(
+                text(
+                    "SELECT has_function_privilege"
+                    "(:role, 'list_ring_pending_candidates(timestamptz)', 'EXECUTE')"
+                ),
+                {"role": role},
+            )
+            await connection.execute(text(f"SET LOCAL ROLE {role}"))
+            assert (
+                await connection.execute(text("SELECT * FROM list_ring_pending_candidates(now())"))
+            ).all() == []
+            with pytest.raises(DBAPIError):
+                await connection.execute(text("SELECT * FROM ring_pending_links"))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        await engine.dispose()
+
+
+async def test_pending_candidate_query_excludes_expired_and_archived(settings: Settings) -> None:
+    engine = make_engine(settings)
+    active, expired, archived = uuid4(), uuid4(), uuid4()
+    try:
+        async with engine.begin() as connection:
+            now = datetime.now(UTC)
+            for pending_id, account, expiry in (
+                (active, f"active-{active.hex}", now + timedelta(hours=1)),
+                (expired, f"expired-{expired.hex}", now - timedelta(seconds=1)),
+                (archived, f"archived-{archived.hex}", now + timedelta(hours=1)),
+            ):
+                await connection.execute(
+                    text("SELECT create_ring_pending_link(:id, :ref, 1, :expires)"),
+                    {
+                        "id": pending_id,
+                        "ref": f"vault://test/{pending_id}",
+                        "expires": expiry,
+                    },
+                )
+                assert await connection.scalar(
+                    text("SELECT complete_ring_pending_account(:id, :account)"),
+                    {"id": pending_id, "account": account},
+                )
+            assert await connection.scalar(
+                text("SELECT transition_ring_pending_link(:id, 'UNCLAIMED', 'ARCHIVED', NULL)"),
+                {"id": archived},
+            )
+            rows = (
+                await connection.execute(
+                    text("SELECT id FROM list_ring_pending_candidates(now() - interval '1 hour')")
+                )
+            ).all()
+            ids = {row.id for row in rows}
+            assert active in ids
+            assert expired not in ids
+            assert archived not in ids
+    finally:
         await engine.dispose()
 
 

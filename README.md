@@ -69,7 +69,15 @@ authoritative. Never put Auth0 secrets in source files. The privileged first-own
 MFA requirements, runtime database grants, and failure behavior are documented in
 [identity and access](docs/architecture/identity-and-access.md).
 
+## Ring account linking
+
+Ring uses its Ring-driven one-way account-linking flow, a pre-tenant pending credential boundary,
+and a versioned credential-vault abstraction. Local/test uses only a non-persistent in-memory vault;
+production fails closed until a managed vault adapter is configured. See
+[Ring account linking](docs/architecture/ring-account-linking.md) and
+[ADR 0007](docs/adr/0007-ring-one-way-linking-and-credential-vault.md).
+
 ## Stage boundary
 
-Stage 1A introduces only identity and access. Provider adapters (including Ring), streaming,
-inference, recording, and alerts remain deliberately absent.
+Stage 1B adds only secure Ring account linking and credential lifecycle. Ring devices, webhooks,
+streaming, inference, recording, and alerts remain deliberately absent.

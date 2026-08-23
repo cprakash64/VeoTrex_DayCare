@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     String,
     UniqueConstraint,
     Uuid,
@@ -116,14 +117,101 @@ class CameraProviderConnection(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
             ondelete="RESTRICT",
             name="fk_provider_connections_facility_tenant",
         ),
-        CheckConstraint("status IN ('ACTIVE', 'DISABLED')", name="ck_connections_status"),
+        CheckConstraint(
+            "status IN ('PENDING', 'ACTIVE', 'DISABLED', 'ARCHIVED')",
+            name="ck_connections_status",
+        ),
+        CheckConstraint(
+            "integration_state IN ('CONFIGURING', 'ACTIVE', 'REAUTH_REQUIRED', "
+            "'REFRESH_UNCERTAIN', 'DISCONNECTED', 'ARCHIVED')",
+            name="ck_connections_integration_state",
+        ),
+        CheckConstraint("credential_generation >= 1", name="ck_connections_generation_positive"),
+        ForeignKeyConstraint(
+            ["linked_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_connections_linked_actor_tenant",
+        ),
+        Index(
+            "uq_ring_active_account",
+            "provider_type",
+            "external_account_id",
+            unique=True,
+            postgresql_where=text(
+                "provider_type = 'RING' AND external_account_id IS NOT NULL "
+                "AND integration_state NOT IN ('DISCONNECTED', 'ARCHIVED')"
+            ),
+        ),
     )
 
-    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    facility_id: Mapped[UUID | None] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    secret_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    secret_ref: Mapped[str | None] = mapped_column(String(512))
+    credential_owner_id: Mapped[UUID | None] = mapped_column(Uuid)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    external_account_id: Mapped[str | None] = mapped_column(String(512))
+    integration_state: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="CONFIGURING"
+    )
+    linked_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    access_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credential_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_category: Mapped[str | None] = mapped_column(String(128))
+    disconnected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RingPendingLink(Base, IdMixin):
+    __tablename__ = "ring_pending_links"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('RECEIVED', 'UNCLAIMED', 'CLAIMING', "
+            "'RING_CONFIRMATION_UNCERTAIN', 'RING_CONFIRMED_UNBOUND', "
+            "'CLAIMED', 'FAILED', 'ARCHIVED')",
+            name="ck_ring_pending_links_state",
+        ),
+        CheckConstraint(
+            "state IN ('RECEIVED', 'FAILED', 'ARCHIVED') OR ring_account_id IS NOT NULL",
+            name="ck_ring_pending_account_required",
+        ),
+        CheckConstraint("credential_generation >= 1", name="ck_ring_pending_generation_positive"),
+        ForeignKeyConstraint(
+            ["claim_actor_id", "claim_tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_ring_pending_claim_actor_tenant",
+        ),
+        Index(
+            "uq_ring_pending_eligible_account",
+            "ring_account_id",
+            unique=True,
+            postgresql_where=text(
+                "ring_account_id IS NOT NULL AND state IN "
+                "('UNCLAIMED', 'CLAIMING', 'RING_CONFIRMATION_UNCERTAIN', "
+                "'RING_CONFIRMED_UNBOUND') AND archived_at IS NULL"
+            ),
+        ),
+        Index("ix_ring_pending_state_received", "state", "received_at"),
+    )
+
+    ring_account_id: Mapped[str | None] = mapped_column(String(512))
+    credential_secret_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    credential_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    access_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(String(40), nullable=False, default="RECEIVED")
+    claim_tenant_id: Mapped[UUID | None] = mapped_column(Uuid)
+    claim_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    claim_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_category: Mapped[str | None] = mapped_column(String(128))
 
 
 class Camera(Base, IdMixin, TenantOwnedMixin, TimestampMixin):

@@ -4,7 +4,16 @@ title = "VeoTrex secret scanning"
 useDefault = true
 
 [allowlist]
-description = "Documented local-only compose credential"
+description = "Documented local-only credential and generated artifacts"
 regexTarget = "line"
 regexes = ['''veotrex_local_only''']
-paths = ['''(^|/)\.env\.example$''', '''infra/local/compose\.ya?ml$''']
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''infra/local/compose\.ya?ml$''',
+  '''(^|/)\.next/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)\.pytest_cache/''',
+  '''(^|/)\.ruff_cache/''',
+  '''(^|/)htmlcov/''',
+]
