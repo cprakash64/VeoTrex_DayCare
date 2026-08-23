@@ -224,14 +224,121 @@ class Actor(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     __tablename__ = "actors"
     __table_args__ = (
         UniqueConstraint("id", "tenant_id", name="uq_actors_id_tenant"),
-        UniqueConstraint("tenant_id", "external_subject", name="uq_actors_external_subject"),
         CheckConstraint("status IN ('ACTIVE', 'DISABLED')", name="ck_actors_status"),
     )
 
-    external_subject: Mapped[str] = mapped_column(String(512), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(200))
-    role: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+
+
+class TenantIdentityBinding(Base, IdMixin, TenantOwnedMixin):
+    __tablename__ = "tenant_identity_bindings"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_tenant_identity_bindings_id_tenant"),
+        UniqueConstraint(
+            "provider",
+            "issuer",
+            "external_organization_id",
+            name="uq_tenant_identity_bindings_external_org",
+        ),
+    )
+
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False)
+    external_organization_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ActorIdentity(Base, IdMixin, TenantOwnedMixin):
+    __tablename__ = "actor_identities"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_actor_identities_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "issuer",
+            "subject",
+            name="uq_actor_identities_external_principal",
+        ),
+        ForeignKeyConstraint(
+            ["actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_actor_identities_actor_tenant",
+        ),
+    )
+
+    actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False)
+    subject: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_authenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RoleAssignment(Base, IdMixin, TenantOwnedMixin):
+    __tablename__ = "role_assignments"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_role_assignments_id_tenant"),
+        ForeignKeyConstraint(
+            ["actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_role_assignments_actor_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["facility_id", "tenant_id"],
+            ["facilities.id", "facilities.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_role_assignments_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_role_assignments_creator_tenant",
+        ),
+        CheckConstraint(
+            "role IN ('TENANT_OWNER', 'FACILITY_ADMIN', 'SAFETY_REVIEWER', 'VIEWER')",
+            name="ck_role_assignments_role",
+        ),
+        CheckConstraint(
+            "role <> 'TENANT_OWNER' OR facility_id IS NULL",
+            name="ck_tenant_owner_is_tenant_scoped",
+        ),
+        Index(
+            "uq_role_assignments_active_tenant_scope",
+            "tenant_id",
+            "actor_id",
+            "role",
+            unique=True,
+            postgresql_where=text("facility_id IS NULL AND archived_at IS NULL"),
+        ),
+        Index(
+            "uq_role_assignments_active_facility_scope",
+            "tenant_id",
+            "actor_id",
+            "role",
+            "facility_id",
+            unique=True,
+            postgresql_where=text("facility_id IS NOT NULL AND archived_at IS NULL"),
+        ),
+    )
+
+    actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    role: Mapped[str] = mapped_column(String(64), nullable=False)
+    facility_id: Mapped[UUID | None] = mapped_column(Uuid)
+    created_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditEvent(Base, IdMixin, TenantOwnedMixin):
@@ -304,5 +411,15 @@ TENANT_OWNED_TABLES = (
     "edge_nodes",
     "camera_assignments",
     "actors",
+    "tenant_identity_bindings",
+    "actor_identities",
+    "role_assignments",
     "audit_events",
+)
+
+# The organization-to-Tenant binding is the pre-context root of trust. Runtime roles
+# receive no direct table privileges and use only the exact-match security-definer
+# function. Applying tenant RLS before the Tenant is known would be circular.
+RLS_TENANT_TABLES = tuple(
+    table for table in TENANT_OWNED_TABLES if table != "tenant_identity_bindings"
 )

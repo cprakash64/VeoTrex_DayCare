@@ -1,6 +1,6 @@
 # VeoTrex Childcare
 
-Production-oriented Stage 0 foundation for the VeoTrex childcare safety platform. This repository
+Production-oriented foundation for the VeoTrex childcare safety platform. This repository
 contains no camera integrations, computer vision, audio analysis, recording, alerts, attendance,
 or other operational safety features. It is not legal advice and does not guarantee compliance.
 
@@ -49,16 +49,27 @@ PostgreSQL with `make db-down`. `make db-down` preserves the named volume.
 - `infra/local`: development PostgreSQL only
 - `docs`: architecture and decision records
 
-See [system overview](docs/architecture/system-overview.md), [security boundaries](docs/architecture/security-boundaries.md), and [domain model](docs/architecture/domain-model.md).
+See [system overview](docs/architecture/system-overview.md),
+[security boundaries](docs/architecture/security-boundaries.md),
+[identity and access](docs/architecture/identity-and-access.md), and
+[domain model](docs/architecture/domain-model.md).
 
 ## Database and tenant context
 
 Alembic owns schema changes. Tenant-owned transactions must call
-`apply_tenant_to_transaction(session)` after binding an authenticated tenant. PostgreSQL RLS fails
-closed when `app.tenant_id` is absent. Production must use a non-superuser, non-table-owner runtime
-role; migration ownership and runtime access are intentionally separate deployment concerns.
+`apply_tenant_to_transaction(session)` after resolving an authenticated tenant through a trusted
+server-side binding. PostgreSQL RLS fails closed when `app.tenant_id` is absent. Production must use
+a non-superuser, non-table-owner, `NOBYPASSRLS` runtime role; migration ownership and runtime access
+are intentionally separate deployment concerns.
+
+## Identity bootstrap
+
+Auth0 performs external authentication; internal Tenant, Actor, role, and RLS records remain
+authoritative. Never put Auth0 secrets in source files. The privileged first-owner CLI, production
+MFA requirements, runtime database grants, and failure behavior are documented in
+[identity and access](docs/architecture/identity-and-access.md).
 
 ## Stage boundary
 
-Stage 1 is not authorized. Provider adapters (including Ring), streaming, inference, recording, and
-alerts are deliberately absent.
+Stage 1A introduces only identity and access. Provider adapters (including Ring), streaming,
+inference, recording, and alerts remain deliberately absent.

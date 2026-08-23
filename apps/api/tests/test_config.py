@@ -19,3 +19,23 @@ def test_database_url_is_secret() -> None:
     )
     assert "secret" not in repr(settings)
     assert settings.database_url.get_secret_value().endswith("@db/database")
+
+
+def test_identity_settings_reject_inexact_issuer_and_symmetric_algorithm() -> None:
+    with pytest.raises(ValidationError, match="OIDC issuer"):
+        Settings(
+            _env_file=None,
+            environment="test",
+            database_url="postgresql+psycopg://unused",
+            app_version="test",
+            oidc_issuer="http://unsafe.example",
+        )
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        database_url="postgresql+psycopg://unused",
+        app_version="test",
+        oidc_allowed_algorithms="HS256",
+    )
+    with pytest.raises(ValueError, match="asymmetric allowlist"):
+        _ = settings.oidc_algorithms

@@ -40,6 +40,14 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    env:
+      AUTH0_DOMAIN: https://ci-auth.invalid
+      AUTH0_CLIENT_ID: ci-placeholder-client
+      AUTH0_CLIENT_SECRET: ci-placeholder-not-a-secret
+      AUTH0_SECRET: ci-placeholder-session-key-with-more-than-32-characters
+      AUTH0_AUDIENCE: https://ci-api.invalid
+      APP_BASE_URL: http://localhost:3000
+      VEOTREX_API_BASE_URL: http://localhost:8000
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

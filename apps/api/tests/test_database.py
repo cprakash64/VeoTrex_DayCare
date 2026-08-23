@@ -55,6 +55,8 @@ async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -
                         "edge_nodes",
                         "camera_assignments",
                         "actors",
+                        "actor_identities",
+                        "role_assignments",
                         "audit_events",
                     ]
                 },
@@ -62,8 +64,8 @@ async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -
             policies = await connection.scalar(
                 text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_isolation'")
             )
-        assert enabled == 9
-        assert policies == 9
+        assert enabled == 11
+        assert policies == 11
     finally:
         await engine.dispose()
 
@@ -313,3 +315,162 @@ async def test_tenant_context_helper_is_transaction_local(settings: Settings) ->
                 )
     finally:
         await engine.dispose()
+
+
+async def test_identity_and_role_integrity_rejects_cross_tenant_links(settings: Settings) -> None:
+    engine = make_engine(settings)
+    tenant_a, tenant_b = uuid4(), uuid4()
+    actor_a, actor_b, facility_b = uuid4(), uuid4(), uuid4()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, status) VALUES "
+                    "(:tenant_a, 'Identity A', 'ACTIVE'), (:tenant_b, 'Identity B', 'ACTIVE')"
+                ),
+                {"tenant_a": tenant_a, "tenant_b": tenant_b},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO actors (id, tenant_id, display_name, status) VALUES "
+                    "(:actor_a, :tenant_a, 'Actor A', 'ACTIVE'), "
+                    "(:actor_b, :tenant_b, 'Actor B', 'ACTIVE')"
+                ),
+                {
+                    "actor_a": actor_a,
+                    "tenant_a": tenant_a,
+                    "actor_b": actor_b,
+                    "tenant_b": tenant_b,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO facilities "
+                    "(id, tenant_id, name, jurisdiction, timezone, status) VALUES "
+                    "(:id, :tenant_id, 'Facility B', 'US-AZ', 'America/Phoenix', 'ACTIVE')"
+                ),
+                {"id": facility_b, "tenant_id": tenant_b},
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                    {"tenant_id": str(tenant_a)},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO actor_identities "
+                        "(id, tenant_id, actor_id, provider, issuer, subject) VALUES "
+                        "(:id, :tenant_a, :actor_b, 'auth0', 'https://idp.example/', 'subject')"
+                    ),
+                    {"id": uuid4(), "tenant_a": tenant_a, "actor_b": actor_b},
+                )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                    {"tenant_id": str(tenant_a)},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO role_assignments "
+                        "(id, tenant_id, actor_id, role, facility_id) VALUES "
+                        "(:id, :tenant_a, :actor_a, 'FACILITY_ADMIN', :facility_b)"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "tenant_a": tenant_a,
+                        "actor_a": actor_a,
+                        "facility_b": facility_b,
+                    },
+                )
+    finally:
+        await engine.dispose()
+
+
+async def test_external_organization_resolution_is_exact_and_rls_fails_closed(
+    settings: Settings,
+) -> None:
+    admin_engine = make_engine(settings)
+    runtime_engine = create_async_engine(
+        settings.database_url.get_secret_value(), pool_size=1, max_overflow=0
+    )
+    role = "veotrex_identity_runtime_test"
+    tenant_a, tenant_b = uuid4(), uuid4()
+    organization_a = f"org_{uuid4().hex}"
+    organization_b = f"org_{uuid4().hex}"
+    try:
+        async with admin_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+            )
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+            await connection.execute(
+                text(
+                    f"GRANT EXECUTE ON FUNCTION "
+                    f"resolve_tenant_identity_binding(text, text, text) TO {role}"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, status) VALUES "
+                    "(:tenant_a, 'Resolver A', 'ACTIVE'), (:tenant_b, 'Resolver B', 'ACTIVE')"
+                ),
+                {"tenant_a": tenant_a, "tenant_b": tenant_b},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO tenant_identity_bindings "
+                    "(id, tenant_id, provider, issuer, external_organization_id) VALUES "
+                    "(:id_a, :tenant_a, 'auth0', 'https://idp.example/', :org_a), "
+                    "(:id_b, :tenant_b, 'auth0', 'https://idp.example/', :org_b)"
+                ),
+                {
+                    "id_a": uuid4(),
+                    "tenant_a": tenant_a,
+                    "org_a": organization_a,
+                    "id_b": uuid4(),
+                    "tenant_b": tenant_b,
+                    "org_b": organization_b,
+                },
+            )
+
+        async with runtime_engine.connect() as connection:
+            async with connection.begin():
+                await connection.execute(text(f"SET LOCAL ROLE {role}"))
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT resolve_tenant_identity_binding"
+                            "('auth0', 'https://idp.example/', :organization)"
+                        ),
+                        {"organization": organization_a},
+                    )
+                    == tenant_a
+                )
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT resolve_tenant_identity_binding"
+                            "('auth0', 'https://idp.example/', :organization)"
+                        ),
+                        {"organization": organization_a.upper()},
+                    )
+                    is None
+                )
+            with pytest.raises(DBAPIError):
+                async with connection.begin():
+                    await connection.execute(text(f"SET LOCAL ROLE {role}"))
+                    await connection.scalar(text("SELECT count(*) FROM tenant_identity_bindings"))
+    finally:
+        await runtime_engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        await admin_engine.dispose()

@@ -1,6 +1,14 @@
 from sqlalchemy import ForeignKeyConstraint
 
-from veotrex_api.models import TENANT_OWNED_TABLES, Area, AuditEvent, Camera
+from veotrex_api.models import (
+    RLS_TENANT_TABLES,
+    TENANT_OWNED_TABLES,
+    ActorIdentity,
+    Area,
+    AuditEvent,
+    Camera,
+    RoleAssignment,
+)
 
 
 def composite_foreign_keys(model: type[object]) -> list[ForeignKeyConstraint]:
@@ -22,7 +30,12 @@ def test_audit_actor_relationship_is_restrictive_and_tenant_scoped() -> None:
     assert constraints[0].ondelete == "RESTRICT"
 
 
-def test_all_expected_customer_tables_are_marked_for_rls() -> None:
+def test_identity_and_roles_have_composite_tenant_foreign_keys() -> None:
+    assert len(composite_foreign_keys(ActorIdentity)) == 1
+    assert len(composite_foreign_keys(RoleAssignment)) == 3
+
+
+def test_all_expected_customer_tables_are_tenant_owned() -> None:
     assert set(TENANT_OWNED_TABLES) == {
         "facilities",
         "areas",
@@ -32,5 +45,12 @@ def test_all_expected_customer_tables_are_marked_for_rls() -> None:
         "edge_nodes",
         "camera_assignments",
         "actors",
+        "tenant_identity_bindings",
+        "actor_identities",
+        "role_assignments",
         "audit_events",
     }
+
+
+def test_pre_context_binding_is_the_only_tenant_owned_table_outside_rls() -> None:
+    assert set(TENANT_OWNED_TABLES) - set(RLS_TENANT_TABLES) == {"tenant_identity_bindings"}
