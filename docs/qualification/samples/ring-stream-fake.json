@@ -1,0 +1,38 @@
+{
+  "cameras": [
+    {
+      "camera_id": "00000000-0000-0000-0000-000000000001",
+      "complete": true,
+      "decision": "CONDITIONAL",
+      "label": "camera-01",
+      "mode": "transport",
+      "session_class": "line_powered_60_seconds",
+      "continuity": {
+        "media_availability_percent": 99.75,
+        "p50_gap_ms": 180.0,
+        "p95_gap_ms": 920.0,
+        "p99_gap_ms": 1200.0,
+        "maximum_gap_ms": 1250.0,
+        "total_blind_time_seconds": 1.25
+      },
+      "failures": [],
+      "overlap": {
+        "attempted": false,
+        "supported_observed": "unknown"
+      }
+    }
+  ],
+  "environment": {
+    "architecture": "aarch64",
+    "gstreamer_version": "GStreamer 1.x (fake)",
+    "jetson_model": "Fake Jetson"
+  },
+  "incomplete": false,
+  "privacy": {
+    "audio_retained": false,
+    "video_retained": false
+  },
+  "qualification_only": true,
+  "schema_version": "1.0",
+  "stage": "1D-A"
+}

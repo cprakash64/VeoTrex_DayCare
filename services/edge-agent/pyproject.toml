@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 veotrex-edge-agent = "veotrex_edge_agent.main:main"
+veotrex-edge = "veotrex_edge_agent.qualification.cli:main"
 
 [build-system]
 requires = ["hatchling"]
