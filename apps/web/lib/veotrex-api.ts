@@ -59,3 +59,28 @@ export async function claimRingLink(nonce: string, time: number): Promise<Respon
     body: JSON.stringify({ nonce, time }),
   });
 }
+
+export type RingInventoryCamera = Readonly<{
+  camera_id: string;
+  connection_id: string;
+  display_name: string;
+  provider: "RING";
+  inventory_state: string;
+  provider_online: boolean | null;
+  capabilities: ReadonlyArray<string>;
+  assigned: boolean;
+  privacy_controls_configured: boolean;
+  last_synchronized_at: string | null;
+}>;
+
+export async function getRingInventory(): Promise<ReadonlyArray<RingInventoryCamera>> {
+  const response = await authorizedFetch("/v1/integrations/ring/devices");
+  if (!response.ok) throw new Error("Ring inventory is unavailable");
+  return (await response.json()) as ReadonlyArray<RingInventoryCamera>;
+}
+
+export async function syncRingConnection(connectionId: string): Promise<Response> {
+  return authorizedFetch(`/v1/integrations/ring/connections/${connectionId}/sync`, {
+    method: "POST",
+  });
+}

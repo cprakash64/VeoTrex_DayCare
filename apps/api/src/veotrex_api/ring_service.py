@@ -61,6 +61,11 @@ def _credential_context(owner_id: UUID) -> CredentialContext:
     return CredentialContext(provider="RING", owner_kind="ring_pending_link", owner_id=owner_id)
 
 
+def ring_credential_context(owner_id: UUID) -> CredentialContext:
+    """Return the context binding used by Stage 1B vault records."""
+    return _credential_context(owner_id)
+
+
 class RingLinkService:
     def __init__(
         self,
@@ -265,7 +270,9 @@ class RingLinkService:
         await self._activate(principal, connection_id, request_id)
         return ClaimResult(connection_id, ConnectionState.ACTIVE)
 
-    async def get_valid_access_token(self, tenant_id: UUID, connection_id: UUID) -> SecretStr:
+    async def get_valid_access_token(
+        self, tenant_id: UUID, connection_id: UUID, *, force_refresh: bool = False
+    ) -> SecretStr:
         failure: RingLinkError | None = None
         result: SecretStr | None = None
         async with self._factory() as session, session.begin():
@@ -310,7 +317,7 @@ class RingLinkService:
                 refresh_at = connection.access_expires_at - timedelta(
                     seconds=self._settings.ring_access_token_refresh_margin_seconds
                 )
-                if datetime.now(UTC) < refresh_at:
+                if datetime.now(UTC) < refresh_at and not force_refresh:
                     result = credential.material.access_token
                 else:
                     try:

@@ -53,6 +53,9 @@ async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -
                         "zones",
                         "camera_provider_connections",
                         "cameras",
+                        "camera_provider_devices",
+                        "camera_provider_components",
+                        "provider_events",
                         "edge_nodes",
                         "camera_assignments",
                         "actors",
@@ -65,8 +68,8 @@ async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -
             policies = await connection.scalar(
                 text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_isolation'")
             )
-        assert enabled == 11
-        assert policies == 11
+        assert enabled == 14
+        assert policies == 14
     finally:
         await engine.dispose()
 
@@ -149,6 +152,48 @@ async def test_pending_ring_table_requires_narrow_function_access(settings: Sett
             ).all() == []
             with pytest.raises(DBAPIError):
                 await connection.execute(text("SELECT * FROM ring_pending_links"))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        await engine.dispose()
+
+
+async def test_webhook_inbox_is_global_but_function_only(settings: Settings) -> None:
+    engine = make_engine(settings)
+    role = "veotrex_webhook_runtime_test"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+            )
+            await connection.execute(text(f"DROP OWNED BY {role}"))
+            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+            await connection.execute(
+                text(
+                    "GRANT EXECUTE ON FUNCTION "
+                    "ingest_ring_webhook(uuid,text,text,timestamptz,text,text,text,text,text,"
+                    f"bigint,text,json,json) TO {role}"
+                )
+            )
+        async with engine.begin() as connection:
+            assert not await connection.scalar(
+                text("SELECT has_table_privilege(:role, 'ring_webhook_inbox', 'SELECT')"),
+                {"role": role},
+            )
+            await connection.execute(text(f"SET LOCAL ROLE {role}"))
+            assert await connection.scalar(
+                text(
+                    "SELECT ingest_ring_webhook(:id, :request, '1.1', now(), 'account', "
+                    "'event', 'future_event', NULL, NULL, NULL, NULL, '[]'::json, '[]'::json)"
+                ),
+                {"id": uuid4(), "request": f"runtime-{uuid4()}"},
+            )
+            with pytest.raises(DBAPIError):
+                await connection.execute(text("SELECT * FROM ring_webhook_inbox"))
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f"DROP OWNED BY {role}"))

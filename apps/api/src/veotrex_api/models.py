@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     Date,
     DateTime,
@@ -127,6 +128,11 @@ class CameraProviderConnection(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
             name="ck_connections_integration_state",
         ),
         CheckConstraint("credential_generation >= 1", name="ck_connections_generation_positive"),
+        CheckConstraint(
+            "operational_health IN ('ACTIVE', 'AUTH_DEGRADED', 'REAUTH_REQUIRED', "
+            "'REMOTE_REMOVED', 'SYNC_DEGRADED')",
+            name="ck_connections_operational_health",
+        ),
         ForeignKeyConstraint(
             ["linked_by_actor_id", "tenant_id"],
             ["actors.id", "actors.tenant_id"],
@@ -163,6 +169,10 @@ class CameraProviderConnection(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     last_failure_category: Mapped[str | None] = mapped_column(String(128))
     disconnected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operational_health: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_sync_failure_category: Mapped[str | None] = mapped_column(String(128))
+    remote_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RingPendingLink(Base, IdMixin):
@@ -222,7 +232,8 @@ class Camera(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
             "tenant_id",
             "provider_connection_id",
             "provider_device_id",
-            name="uq_cameras_provider_device",
+            "provider_component_key",
+            name="uq_cameras_provider_component",
         ),
         ForeignKeyConstraint(
             ["zone_id", "tenant_id"],
@@ -236,14 +247,184 @@ class Camera(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
             ondelete="RESTRICT",
             name="fk_cameras_connection_tenant",
         ),
-        CheckConstraint("status IN ('ACTIVE', 'DISABLED', 'ARCHIVED')", name="ck_cameras_status"),
+        CheckConstraint(
+            "status IN ('DISCOVERED', 'ACTIVE', 'DISABLED', 'ARCHIVED')",
+            name="ck_cameras_status",
+        ),
     )
 
-    zone_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    zone_id: Mapped[UUID | None] = mapped_column(Uuid)
     provider_connection_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     provider_device_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    provider_component_id: Mapped[str | None] = mapped_column(String(512))
+    provider_component_key: Mapped[str] = mapped_column(String(512), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="DISCOVERED")
+
+
+class CameraProviderDevice(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    __tablename__ = "camera_provider_devices"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_provider_devices_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "provider_connection_id",
+            "provider_device_id",
+            name="uq_provider_devices_identity",
+        ),
+        ForeignKeyConstraint(
+            ["provider_connection_id", "tenant_id"],
+            ["camera_provider_connections.id", "camera_provider_connections.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_devices_connection_tenant",
+        ),
+        CheckConstraint(
+            "inventory_state IN ('ACTIVE', 'STALE', 'REMOVED', 'ARCHIVED')",
+            name="ck_provider_devices_inventory_state",
+        ),
+        CheckConstraint(
+            "sync_state IN ('HEALTHY', 'DEGRADED')",
+            name="ck_provider_devices_sync_state",
+        ),
+        Index(
+            "ix_provider_devices_connection_state",
+            "tenant_id",
+            "provider_connection_id",
+            "inventory_state",
+        ),
+    )
+
+    provider_connection_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    provider_device_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    inventory_state: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    sync_state: Mapped[str] = mapped_column(String(20), nullable=False, default="HEALTHY")
+    provider_online: Mapped[bool | None] = mapped_column()
+    status_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capabilities_sha256: Mapped[str | None] = mapped_column(String(64))
+    configuration_sha256: Mapped[str | None] = mapped_column(String(64))
+    location_country: Mapped[str | None] = mapped_column(String(2))
+    location_region: Mapped[str | None] = mapped_column(String(64))
+    last_failure_category: Mapped[str | None] = mapped_column(String(128))
+
+
+class CameraProviderComponent(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    __tablename__ = "camera_provider_components"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_provider_components_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "provider_device_record_id",
+            "component_key",
+            name="uq_provider_components_identity",
+        ),
+        UniqueConstraint("tenant_id", "camera_id", name="uq_provider_components_camera"),
+        ForeignKeyConstraint(
+            ["provider_device_record_id", "tenant_id"],
+            ["camera_provider_devices.id", "camera_provider_devices.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_components_device_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["camera_id", "tenant_id"],
+            ["cameras.id", "cameras.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_components_camera_tenant",
+        ),
+        CheckConstraint(
+            "inventory_state IN ('ACTIVE', 'REMOVED', 'ARCHIVED')",
+            name="ck_provider_components_inventory_state",
+        ),
+    )
+
+    provider_device_record_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    camera_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    component_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    provider_component_id: Mapped[str | None] = mapped_column(String(512))
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    inventory_state: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    capabilities: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    capability_details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    privacy_zones_configured: Mapped[bool] = mapped_column(nullable=False, default=False)
+    motion_zones_configured: Mapped[bool] = mapped_column(nullable=False, default=False)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProviderEvent(Base, IdMixin, TenantOwnedMixin):
+    __tablename__ = "provider_events"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_provider_events_id_tenant"),
+        UniqueConstraint("provider", "provider_request_id", name="uq_provider_events_request"),
+        ForeignKeyConstraint(
+            ["provider_connection_id", "tenant_id"],
+            ["camera_provider_connections.id", "camera_provider_connections.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_events_connection_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["provider_device_record_id", "tenant_id"],
+            ["camera_provider_devices.id", "camera_provider_devices.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_provider_events_device_tenant",
+        ),
+        Index("ix_provider_events_tenant_occurred", "tenant_id", "provider_occurred_at"),
+    )
+
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_connection_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    provider_device_record_id: Mapped[UUID | None] = mapped_column(Uuid)
+    provider_request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_sub_type: Mapped[str | None] = mapped_column(String(128))
+    component_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    provider_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RingWebhookInbox(Base, IdMixin):
+    __tablename__ = "ring_webhook_inbox"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_ring_webhook_request_id"),
+        CheckConstraint(
+            "state IN ('RECEIVED', 'PROCESSING', 'PROCESSED', "
+            "'FAILED_RETRYABLE', 'FAILED_PERMANENT')",
+            name="ck_ring_webhook_state",
+        ),
+        CheckConstraint("attempts >= 0 AND attempts <= 10", name="ck_ring_webhook_attempts"),
+        Index("ix_ring_webhook_ready", "state", "next_attempt_at", "received_at"),
+    )
+
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[str] = mapped_column(String(16), nullable=False)
+    envelope_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ring_account_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(512))
+    source_type: Mapped[str | None] = mapped_column(String(64))
+    event_timestamp_ms: Mapped[int | None] = mapped_column(BigInteger)
+    sub_type: Mapped[str | None] = mapped_column(String(128))
+    component_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    related_device_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="RECEIVED")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_failure_category: Mapped[str | None] = mapped_column(String(128))
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EdgeNode(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
@@ -495,7 +676,10 @@ TENANT_OWNED_TABLES = (
     "areas",
     "zones",
     "camera_provider_connections",
+    "camera_provider_devices",
+    "camera_provider_components",
     "cameras",
+    "provider_events",
     "edge_nodes",
     "camera_assignments",
     "actors",

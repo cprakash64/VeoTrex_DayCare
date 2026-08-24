@@ -24,6 +24,7 @@ export default async function ApplicationShell() {
         <h2 id="access-heading">Your access</h2>
         <p>{identity.roles.map(({ role }) => role.replaceAll("_", " ")).join(", ")}</p>
       </section>
+      <a className="primary" href="/app/integrations/ring/devices">View Ring device inventory</a>
     </main>
   );
 }

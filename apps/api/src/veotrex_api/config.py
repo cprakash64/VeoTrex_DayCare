@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     ring_max_response_bytes: int = Field(default=65536, ge=1024, le=1048576)
     ring_token_exchange_body_bytes: int = Field(default=1024, ge=128, le=8192)
     ring_token_exchange_rate_limit_per_minute: int = Field(default=30, ge=1, le=600)
+    ring_inventory_retry_attempts: int = Field(default=3, ge=1, le=5)
+    ring_inventory_max_pages: int = Field(default=10, ge=1, le=50)
+    ring_inventory_max_devices: int = Field(default=500, ge=1, le=5000)
+    ring_inventory_max_component_reads: int = Field(default=2000, ge=1, le=10000)
+    ring_inventory_backoff_max_seconds: float = Field(default=10.0, ge=0, le=60)
+    ring_webhook_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
 
     @field_validator("oidc_issuer")
     @classmethod

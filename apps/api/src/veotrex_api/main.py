@@ -26,7 +26,9 @@ from veotrex_api.db import make_engine, make_session_factory
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientError
+from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
+from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
 from veotrex_api.secrets import EnvironmentSecretResolver, SecretResolver
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
@@ -74,6 +76,31 @@ class RingLinkContextResponse(BaseModel):
     eligible: bool
 
 
+class RingSyncResponse(BaseModel):
+    connection_id: str
+    devices_seen: int
+    cameras_created: int
+    synchronized_at: str
+
+
+class RingInventoryCameraResponse(BaseModel):
+    camera_id: str
+    connection_id: str
+    display_name: str
+    provider: str = "RING"
+    inventory_state: str
+    provider_online: bool | None
+    capabilities: list[str]
+    assigned: bool
+    privacy_controls_configured: bool
+    last_synchronized_at: str | None
+
+
+class RingWebhookResponse(BaseModel):
+    accepted: bool
+    duplicate: bool
+
+
 def create_app(
     settings: Settings | None = None,
     engine: AsyncEngine | None = None,
@@ -103,6 +130,14 @@ def create_app(
         resolved_ring_client,
         resolved_secrets,
     )
+    inventory_service = RingInventoryService(resolved_factory, ring_service, resolved_ring_client)
+    webhook_service = RingWebhookService(
+        resolved_factory,
+        resolved_secrets,
+        resolved_settings.ring_hmac_signing_key_ref,
+        resolved_vault,
+        inventory_service,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -123,6 +158,8 @@ def create_app(
     app.state.identity_verifier = identity_verifier or Auth0IdentityVerifier(resolved_settings)
     app.state.session_factory = resolved_factory
     app.state.ring_service = ring_service
+    app.state.ring_inventory_service = inventory_service
+    app.state.ring_webhook_service = webhook_service
     app.state.ring_token_exchange_limiter = AuthenticationFailureLogLimiter(
         limit=resolved_settings.ring_token_exchange_rate_limit_per_minute,
         window_seconds=60,
@@ -135,7 +172,12 @@ def create_app(
         request_id = request.headers.get("x-request-id", str(uuid4()))[:128]
         structlog.contextvars.bind_contextvars(request_id=request_id)
         try:
+            body_limit: int | None = None
             if request.url.path == "/v1/integrations/ring/token-exchange":
+                body_limit = resolved_settings.ring_token_exchange_body_bytes
+            elif request.url.path == "/v1/providers/ring/webhooks":
+                body_limit = resolved_settings.ring_webhook_body_bytes
+            if body_limit is not None:
                 if request.method != "POST":
                     return Response(status_code=status.HTTP_405_METHOD_NOT_ALLOWED)
                 content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
@@ -149,12 +191,12 @@ def create_app(
                         return Response(status_code=status.HTTP_400_BAD_REQUEST)
                     if declared_length < 0:
                         return Response(status_code=status.HTTP_400_BAD_REQUEST)
-                    if declared_length > resolved_settings.ring_token_exchange_body_bytes:
+                    if declared_length > body_limit:
                         return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
                 bounded_body = bytearray()
                 async for chunk in request.stream():
                     bounded_body.extend(chunk)
-                    if len(bounded_body) > resolved_settings.ring_token_exchange_body_bytes:
+                    if len(bounded_body) > body_limit:
                         return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
                 request._body = bytes(bounded_body)
             response = await call_next(request)
@@ -298,6 +340,81 @@ def create_app(
         except RingLinkError:
             raise HTTPException(status_code=404, detail="Ring connection not found") from None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get(
+        "/v1/integrations/ring/devices",
+        response_model=list[RingInventoryCameraResponse],
+    )
+    async def ring_devices(
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_read_operational)],
+    ) -> list[RingInventoryCameraResponse]:
+        service: RingInventoryService = request.app.state.ring_inventory_service
+        values = await service.list_inventory(context.principal)
+        return [
+            RingInventoryCameraResponse(
+                camera_id=str(value.camera_id),
+                connection_id=str(value.connection_id),
+                display_name=value.display_name,
+                inventory_state=value.inventory_state,
+                provider_online=value.provider_online,
+                capabilities=list(value.capabilities),
+                assigned=value.assigned,
+                privacy_controls_configured=value.privacy_controls_configured,
+                last_synchronized_at=(
+                    value.last_synchronized_at.isoformat()
+                    if value.last_synchronized_at is not None
+                    else None
+                ),
+            )
+            for value in values
+        ]
+
+    @app.post(
+        "/v1/integrations/ring/connections/{connection_id}/sync",
+        response_model=RingSyncResponse,
+    )
+    async def ring_sync(
+        connection_id: UUID,
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_manage_integrations)],
+    ) -> RingSyncResponse:
+        service: RingInventoryService = request.app.state.ring_inventory_service
+        try:
+            result = await service.sync_connection(context.principal, connection_id)
+        except RingInventoryError as exc:
+            code = 404 if exc.category == "connection_unavailable" else 502
+            raise HTTPException(
+                status_code=code, detail="Ring synchronization unavailable"
+            ) from None
+        return RingSyncResponse(
+            connection_id=str(result.connection_id),
+            devices_seen=result.devices_seen,
+            cameras_created=result.cameras_created,
+            synchronized_at=result.synchronized_at.isoformat(),
+        )
+
+    @app.post("/v1/providers/ring/webhooks", response_model=RingWebhookResponse)
+    async def ring_webhook(request: Request) -> RingWebhookResponse:
+        service: RingWebhookService = request.app.state.ring_webhook_service
+        try:
+            inserted = await service.ingest(
+                await request.body(), request.headers.get("x-signature")
+            )
+        except RingWebhookError as exc:
+            code = 503 if exc.category == "verification_unavailable" else 401
+            if exc.category in {
+                "malformed_envelope",
+                "malformed_component_ids",
+                "malformed_event_timestamp",
+                "malformed_sub_type",
+                "malformed_source",
+            }:
+                code = 400
+            elif exc.category == "unsupported_version":
+                code = 422
+            raise HTTPException(status_code=code, detail="Ring webhook rejected") from None
+        return RingWebhookResponse(accepted=True, duplicate=not inserted)
 
     return app
 
