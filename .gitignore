@@ -1,5 +1,10 @@
 .DS_Store
-.env
+.env*
+!.env.example
+!**/.env.example
+credentials/
+*.pem
+*.key
 .venv/
 __pycache__/
 *.py[cod]
@@ -14,5 +19,14 @@ node_modules/
 *.tsbuildinfo
 coverage/
 reports/qualification/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.engine
+*.plan
+*.trt
+recordings/
+temporary-clips/
 dist/
 *.egg-info/
