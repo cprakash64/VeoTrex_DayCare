@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+from uuid import uuid4
+
+import structlog
+
+from veotrex_edge_agent.gpu_worker.metrics import GpuWorkerMetrics
+from veotrex_edge_agent.gpu_worker.protocol import (
+    COMMANDS,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    receive_message,
+    request,
+    send_message,
+)
+
+SYSTEM_PYTHON = Path("/usr/bin/python3")
+EXPECTED_TENSORRT_PREFIX = "10.16.2"
+EXPECTED_CUDA_RUNTIME = 13_020
+_SAFE_ENV = MappingProxyType({"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+_SAFE_WORKER_ERRORS = frozenset(
+    {"malformed_message", "message_too_large", "protocol_version_mismatch", "unknown_command"}
+)
+
+
+class SupervisorState(StrEnum):
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    READY = "READY"
+    DEGRADED = "DEGRADED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class RestartPolicy:
+    max_attempts: int = 3
+    window_seconds: float = 60.0
+    initial_backoff_seconds: float = 0.1
+    maximum_backoff_seconds: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerConfig:
+    startup_timeout_seconds: float = 30.0
+    health_timeout_seconds: float = 2.0
+    shutdown_timeout_seconds: float = 2.0
+    restart: RestartPolicy = RestartPolicy()
+
+
+class WorkerFailure(RuntimeError):
+    """Safe parent-side worker failure category."""
+
+
+class GpuWorkerSupervisor:
+    def __init__(
+        self,
+        config: WorkerConfig | None = None,
+        *,
+        worker_path: Path | None = None,
+        executable: Path = SYSTEM_PYTHON,
+        expected_root: Path | None = None,
+        clock: Any = time.monotonic,
+        sleeper: Any = time.sleep,
+    ) -> None:
+        self.config = config or WorkerConfig()
+        self._worker_path = worker_path or Path(__file__).with_name("worker.py")
+        self._executable = executable
+        self._expected_root = expected_root or Path(__file__).parents[2]
+        self._clock = clock
+        self._sleep = sleeper
+        self._process: subprocess.Popen[bytes] | None = None
+        self._socket: socket.socket | None = None
+        self._state = SupervisorState.STOPPED
+        self._details: dict[str, Any] | None = None
+        self._restart_times: list[float] = []
+        self.metrics = GpuWorkerMetrics()
+        self._logger = structlog.get_logger()
+
+    @property
+    def state(self) -> SupervisorState:
+        if (
+            self._state is SupervisorState.READY
+            and self._process
+            and self._process.poll() is not None
+        ):
+            self._transition(SupervisorState.DEGRADED, "worker_exited")
+        return self._state
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process and self._process.poll() is None else None
+
+    @property
+    def sanitized_environment(self) -> dict[str, str]:
+        return dict(_SAFE_ENV)
+
+    def _transition(self, state: SupervisorState, category: str) -> None:
+        previous = self._state
+        self._state = state
+        self._logger.info(
+            "gpu_worker_state_changed",
+            previous=previous.value,
+            state=state.value,
+            category=category,
+            worker_pid=self.pid,
+            protocol_version=PROTOCOL_VERSION,
+            tensorrt_version=(self._details or {}).get("tensorrt_version"),
+            cuda_runtime_version=(self._details or {}).get("cuda_runtime_version"),
+            cuda_device_count=(self._details or {}).get("cuda_device_count"),
+        )
+
+    def _validate_paths(self) -> tuple[Path, Path]:
+        executable = self._executable.resolve(strict=True)
+        worker = self._worker_path.resolve(strict=True)
+        root = self._expected_root.resolve(strict=True)
+        if executable != SYSTEM_PYTHON.resolve(strict=True):
+            raise WorkerFailure("invalid_worker_executable")
+        if not worker.is_file() or not worker.is_relative_to(root):
+            raise WorkerFailure("invalid_worker_path")
+        if self._worker_path.is_symlink():
+            raise WorkerFailure("invalid_worker_path")
+        return executable, worker
+
+    def start(self) -> dict[str, Any]:
+        if self.state is SupervisorState.READY:
+            return dict(self._details or {})
+        if self._process is not None:
+            self.stop()
+        self._transition(SupervisorState.STARTING, "start_requested")
+        try:
+            executable, worker = self._validate_paths()
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            parent.settimeout(self.config.startup_timeout_seconds)
+            os.set_inheritable(child.fileno(), True)
+            self._process = subprocess.Popen(  # noqa: S603 - executable and worker are validated
+                [str(executable), "-I", str(worker), "--fd", str(child.fileno())],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                pass_fds=(child.fileno(),),
+                env=self.sanitized_environment,
+                start_new_session=True,
+            )
+            child.close()
+            self._socket = parent
+            details = self._call("HELLO", timeout=self.config.startup_timeout_seconds)
+            self._validate_capabilities(details)
+        except Exception as exc:
+            self.metrics.handshake_failures_total += 1
+            self._cleanup_process(force=True)
+            self._transition(SupervisorState.FAILED, self._safe_category(exc))
+            raise WorkerFailure(self._safe_category(exc)) from None
+        self._details = details
+        self._transition(SupervisorState.READY, "handshake_succeeded")
+        return dict(details)
+
+    def _validate_capabilities(self, details: dict[str, Any]) -> None:
+        if details.get("protocol_version") != PROTOCOL_VERSION:
+            raise WorkerFailure("protocol_version_mismatch")
+        if details.get("architecture") != "aarch64":
+            raise WorkerFailure("architecture_mismatch")
+        if not str(details.get("tensorrt_version", "")).startswith(EXPECTED_TENSORRT_PREFIX):
+            raise WorkerFailure("tensorrt_version_mismatch")
+        if details.get("cuda_runtime_version") != EXPECTED_CUDA_RUNTIME:
+            raise WorkerFailure("cuda_runtime_version_mismatch")
+        if (
+            not isinstance(details.get("cuda_device_count"), int)
+            or details["cuda_device_count"] < 1
+        ):
+            raise WorkerFailure("cuda_device_unavailable")
+        if details.get("status") != "READY":
+            raise WorkerFailure("worker_unhealthy")
+
+    def _call(self, command: str, *, timeout: float) -> dict[str, Any]:
+        if command not in COMMANDS or self._socket is None:
+            raise WorkerFailure("invalid_command")
+        request_id = uuid4().hex
+        self._socket.settimeout(timeout)
+        try:
+            send_message(self._socket, request(request_id, command))
+            response = receive_message(self._socket)
+        except (OSError, ProtocolError) as exc:
+            self.metrics.protocol_errors_total += 1
+            raise WorkerFailure(self._safe_category(exc)) from None
+        expected = {"error", "ok", "protocol_version", "request_id", "result"}
+        if set(response) != expected:
+            raise WorkerFailure("invalid_response_envelope")
+        if response.get("protocol_version") != PROTOCOL_VERSION:
+            raise WorkerFailure("protocol_version_mismatch")
+        if response.get("request_id") != request_id:
+            raise WorkerFailure("request_id_mismatch")
+        if response.get("ok") is not True or not isinstance(response.get("result"), dict):
+            error = response.get("error")
+            category = error if error in _SAFE_WORKER_ERRORS else "worker_error"
+            raise WorkerFailure(category)
+        result = response["result"]
+        assert isinstance(result, dict)
+        return result
+
+    def health(self) -> dict[str, Any]:
+        if self.state is not SupervisorState.READY:
+            raise WorkerFailure("worker_not_ready")
+        try:
+            result = self._call("HEALTH", timeout=self.config.health_timeout_seconds)
+            self._validate_capabilities(result)
+        except WorkerFailure:
+            self.metrics.health_failures_total += 1
+            self._transition(SupervisorState.DEGRADED, "health_failed")
+            raise
+        self.metrics.last_successful_health_monotonic = self._clock()
+        self._details = result
+        return result
+
+    def recover(self) -> dict[str, Any]:
+        now = self._clock()
+        window = self.config.restart.window_seconds
+        self._restart_times = [value for value in self._restart_times if now - value <= window]
+        if len(self._restart_times) >= self.config.restart.max_attempts:
+            self._transition(SupervisorState.FAILED, "restart_circuit_open")
+            raise WorkerFailure("restart_circuit_open")
+        attempt = len(self._restart_times)
+        delay = min(
+            self.config.restart.initial_backoff_seconds * (2**attempt),
+            self.config.restart.maximum_backoff_seconds,
+        )
+        self._restart_times.append(now)
+        self.metrics.restarts_total += 1
+        self.stop()
+        self._sleep(delay)
+        return self.start()
+
+    def stop(self) -> None:
+        if self._process is None:
+            self._transition(SupervisorState.STOPPED, "already_stopped")
+            return
+        if self._process.poll() is None and self._socket is not None:
+            try:
+                self._call("SHUTDOWN", timeout=self.config.shutdown_timeout_seconds)
+                self._process.wait(timeout=self.config.shutdown_timeout_seconds)
+            except (WorkerFailure, subprocess.TimeoutExpired):
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=self.config.shutdown_timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=self.config.shutdown_timeout_seconds)
+        self._cleanup_process(force=False)
+        self._transition(SupervisorState.STOPPED, "stop_complete")
+
+    def _cleanup_process(self, *, force: bool) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+        if self._process is not None and self._process.poll() is None and force:
+            self._process.kill()
+            self._process.wait(timeout=self.config.shutdown_timeout_seconds)
+        self._process = None
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "worker_pid": self.pid,
+            "worker_uptime_seconds": (self._details or {}).get("worker_uptime_seconds"),
+            "restart_count": self.metrics.restarts_total,
+            "metrics": self.metrics.snapshot(
+                up=self.state is SupervisorState.READY, details=self._details
+            ),
+        }
+
+    @staticmethod
+    def _safe_category(exc: BaseException) -> str:
+        if isinstance(exc, socket.timeout | TimeoutError):
+            return "worker_timeout"
+        if isinstance(exc, FileNotFoundError):
+            return "worker_file_missing"
+        if isinstance(exc, ProtocolError):
+            return str(exc)[:64]
+        if isinstance(exc, WorkerFailure):
+            return str(exc)[:64]
+        return type(exc).__name__.lower()[:64]

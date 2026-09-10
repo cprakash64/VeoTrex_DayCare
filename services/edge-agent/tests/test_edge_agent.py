@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from veotrex_edge_agent.agent import EdgeAgent
 from veotrex_edge_agent.config import EdgeSettings
+from veotrex_edge_agent.gpu_worker import WorkerFailure
 
 
 def edge_settings() -> EdgeSettings:
@@ -31,3 +32,23 @@ async def test_agent_lifecycle_stops_gracefully() -> None:
     agent.request_shutdown()
     await asyncio.wait_for(task, timeout=1)
     assert agent.stopping
+
+
+async def test_gpu_worker_failure_does_not_crash_agent() -> None:
+    class FailingWorker:
+        stopped = False
+
+        def start(self) -> None:
+            raise WorkerFailure("worker_timeout")
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    worker = FailingWorker()
+    agent = EdgeAgent(edge_settings(), worker)  # type: ignore[arg-type]
+    task = asyncio.create_task(agent.run())
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    agent.request_shutdown()
+    await asyncio.wait_for(task, timeout=1)
+    assert worker.stopped

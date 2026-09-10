@@ -7,6 +7,7 @@ import structlog
 
 from veotrex_edge_agent.agent import EdgeAgent
 from veotrex_edge_agent.config import EdgeSettings
+from veotrex_edge_agent.gpu_worker import GpuWorkerSupervisor
 
 
 def configure_logging(settings: EdgeSettings) -> None:
@@ -23,7 +24,7 @@ def configure_logging(settings: EdgeSettings) -> None:
 
 async def run_agent(settings: EdgeSettings) -> None:
     configure_logging(settings)
-    agent = EdgeAgent(settings)
+    agent = EdgeAgent(settings, GpuWorkerSupervisor())
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, agent.request_shutdown)
