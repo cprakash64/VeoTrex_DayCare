@@ -15,6 +15,7 @@ from veotrex_edge_agent.gpu_worker.protocol import (
     receive_message,
     request,
 )
+from veotrex_edge_agent.gpu_worker.runtime import INPUT_BYTES
 from veotrex_edge_agent.gpu_worker.supervisor import (
     GpuWorkerSupervisor,
     RestartPolicy,
@@ -278,3 +279,33 @@ def test_worker_error_text_is_redacted(tmp_path: Path) -> None:
     with pytest.raises(WorkerFailure, match="^worker_error$") as captured:
         supervisor(tmp_path, "error_secret").start()
     assert "sensitive-test-marker" not in str(captured.value)
+
+
+def test_inference_backpressure_is_immediate_and_bounded(tmp_path: Path) -> None:
+    subject = supervisor(tmp_path)
+    subject.start()
+    subject._inference_lane.acquire()
+    try:
+        with pytest.raises(WorkerFailure, match="worker_busy"):
+            subject.infer_tensor(bytes(INPUT_BYTES), frame_id="busy")
+        assert subject.metrics.backpressure_drops_total == 1
+    finally:
+        subject._inference_lane.release()
+        subject.stop()
+
+
+def test_expired_inference_is_rejected_before_fd_creation(tmp_path: Path) -> None:
+    subject = supervisor(tmp_path)
+    subject.start()
+    with pytest.raises(WorkerFailure, match="request_expired"):
+        subject.infer_tensor(bytes(INPUT_BYTES), frame_id="expired", deadline_monotonic_ns=1)
+    assert subject.metrics.expired_frames_total == 1
+    subject.stop()
+
+
+def test_wrong_tensor_size_is_rejected_before_transport(tmp_path: Path) -> None:
+    subject = supervisor(tmp_path)
+    subject.start()
+    with pytest.raises(WorkerFailure, match="invalid_tensor_size"):
+        subject.infer_tensor(b"too-short", frame_id="bad")
+    subject.stop()

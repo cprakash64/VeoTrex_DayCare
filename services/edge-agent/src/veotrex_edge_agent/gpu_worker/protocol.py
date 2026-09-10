@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Iterable
 from typing import Any
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 65_536
-COMMANDS = frozenset({"HELLO", "HEALTH", "SHUTDOWN"})
+COMMANDS = frozenset(
+    {"HELLO", "HEALTH", "SHUTDOWN", "LOAD_MODEL", "MODEL_STATUS", "INFER_TENSOR", "UNLOAD_MODEL"}
+)
 
 
 class ProtocolError(RuntimeError):
@@ -20,8 +23,10 @@ def encode_message(value: dict[str, Any]) -> bytes:
     return data
 
 
-def send_message(sock: socket.socket, value: dict[str, Any]) -> None:
-    sock.sendall(encode_message(value))
+def send_message(sock: socket.socket, value: dict[str, Any], fds: Iterable[int] = ()) -> None:
+    from veotrex_edge_agent.gpu_worker.fd_transport import send_packet
+
+    send_packet(sock, encode_message(value), fds)
 
 
 def receive_message(sock: socket.socket) -> dict[str, Any]:
@@ -39,10 +44,10 @@ def receive_message(sock: socket.socket) -> dict[str, Any]:
     return value
 
 
-def request(request_id: str, command: str) -> dict[str, Any]:
+def request(request_id: str, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "command": command,
-        "payload": {},
+        "payload": payload or {},
         "protocol_version": PROTOCOL_VERSION,
         "request_id": request_id,
     }

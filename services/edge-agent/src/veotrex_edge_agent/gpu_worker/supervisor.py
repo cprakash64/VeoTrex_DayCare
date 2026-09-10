@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 import structlog
 
+from veotrex_edge_agent.gpu_worker.fd_transport import create_sealed_memfd
 from veotrex_edge_agent.gpu_worker.metrics import GpuWorkerMetrics
 from veotrex_edge_agent.gpu_worker.protocol import (
     COMMANDS,
@@ -22,13 +24,52 @@ from veotrex_edge_agent.gpu_worker.protocol import (
     request,
     send_message,
 )
+from veotrex_edge_agent.gpu_worker.runtime import INPUT_BYTES, INPUT_SHAPE, MODEL_ID
 
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 EXPECTED_TENSORRT_PREFIX = "10.16.2"
 EXPECTED_CUDA_RUNTIME = 13_020
 _SAFE_ENV = MappingProxyType({"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
 _SAFE_WORKER_ERRORS = frozenset(
-    {"malformed_message", "message_too_large", "protocol_version_mismatch", "unknown_command"}
+    {
+        "malformed_message",
+        "message_too_large",
+        "protocol_version_mismatch",
+        "unknown_command",
+        "unknown_model_id",
+        "invalid_fd_count",
+        "unexpected_fd",
+        "invalid_tensor_metadata",
+        "invalid_tensor_contract",
+        "invalid_tensor_size",
+        "mutable_tensor_rejected",
+        "request_expired",
+        "model_not_ready",
+        "model_load_failed",
+        "artifact_unavailable",
+        "artifact_hash_mismatch",
+        "artifact_size_mismatch",
+        "artifact_symlink_rejected",
+        "manifest_contract_mismatch",
+        "platform_incompatible",
+        "tensorrt_version_mismatch",
+        "engine_deserialize_failed",
+        "engine_tensor_contract_mismatch",
+        "context_create_failed",
+        "cuda_device_error",
+        "cuda_stream_create_failed",
+        "cuda_input_allocate_failed",
+        "cuda_output_allocate_failed",
+        "input_address_failed",
+        "output_address_failed",
+        "cuda_h2d_failed",
+        "cuda_d2h_failed",
+        "cuda_sync_failed",
+        "tensorrt_execute_failed",
+        "inference_failed",
+        "tensor_map_failed",
+        "invalid_payload",
+    }
 )
 
 
@@ -53,6 +94,8 @@ class WorkerConfig:
     startup_timeout_seconds: float = 30.0
     health_timeout_seconds: float = 2.0
     shutdown_timeout_seconds: float = 2.0
+    model_timeout_seconds: float = 30.0
+    inference_timeout_seconds: float = 5.0
     restart: RestartPolicy = RestartPolicy()
 
 
@@ -84,6 +127,8 @@ class GpuWorkerSupervisor:
         self._restart_times: list[float] = []
         self.metrics = GpuWorkerMetrics()
         self._logger = structlog.get_logger()
+        self._inference_lane = threading.Lock()
+        self._rpc_lock = threading.Lock()
 
     @property
     def state(self) -> SupervisorState:
@@ -181,17 +226,25 @@ class GpuWorkerSupervisor:
         if details.get("status") != "READY":
             raise WorkerFailure("worker_unhealthy")
 
-    def _call(self, command: str, *, timeout: float) -> dict[str, Any]:
+    def _call(
+        self,
+        command: str,
+        *,
+        timeout: float,
+        payload: dict[str, Any] | None = None,
+        fds: tuple[int, ...] = (),
+    ) -> dict[str, Any]:
         if command not in COMMANDS or self._socket is None:
             raise WorkerFailure("invalid_command")
         request_id = uuid4().hex
-        self._socket.settimeout(timeout)
-        try:
-            send_message(self._socket, request(request_id, command))
-            response = receive_message(self._socket)
-        except (OSError, ProtocolError) as exc:
-            self.metrics.protocol_errors_total += 1
-            raise WorkerFailure(self._safe_category(exc)) from None
+        with self._rpc_lock:
+            self._socket.settimeout(timeout)
+            try:
+                send_message(self._socket, request(request_id, command, payload), fds)
+                response = receive_message(self._socket)
+            except (OSError, ProtocolError) as exc:
+                self.metrics.protocol_errors_total += 1
+                raise WorkerFailure(self._safe_category(exc)) from None
         expected = {"error", "ok", "protocol_version", "request_id", "result"}
         if set(response) != expected:
             raise WorkerFailure("invalid_response_envelope")
@@ -206,6 +259,80 @@ class GpuWorkerSupervisor:
         result = response["result"]
         assert isinstance(result, dict)
         return result
+
+    def load_model(self, model_id: str = MODEL_ID) -> dict[str, Any]:
+        if self.state is not SupervisorState.READY:
+            raise WorkerFailure("worker_not_ready")
+        result = self._call(
+            "LOAD_MODEL", timeout=self.config.model_timeout_seconds, payload={"model_id": model_id}
+        )
+        self._details = {**(self._details or {}), **result}
+        return result
+
+    def model_status(self) -> dict[str, Any]:
+        if self.state is not SupervisorState.READY:
+            raise WorkerFailure("worker_not_ready")
+        return self._call("MODEL_STATUS", timeout=self.config.health_timeout_seconds)
+
+    def unload_model(self) -> dict[str, Any]:
+        if self.state is not SupervisorState.READY:
+            raise WorkerFailure("worker_not_ready")
+        result = self._call("UNLOAD_MODEL", timeout=self.config.model_timeout_seconds)
+        self._details = {**(self._details or {}), **result}
+        return result
+
+    def infer_tensor(
+        self,
+        tensor: bytes | bytearray | memoryview,
+        *,
+        frame_id: str,
+        capture_monotonic_ns: int | None = None,
+        deadline_monotonic_ns: int | None = None,
+        qualification_digest: bool = False,
+    ) -> dict[str, Any]:
+        if self.state is not SupervisorState.READY:
+            raise WorkerFailure("worker_not_ready")
+        if len(tensor) != INPUT_BYTES:
+            raise WorkerFailure("invalid_tensor_size")
+        if deadline_monotonic_ns is not None and self._clock() * 1e9 >= deadline_monotonic_ns:
+            self.metrics.expired_frames_total += 1
+            raise WorkerFailure("request_expired")
+        if not self._inference_lane.acquire(blocking=False):
+            self.metrics.backpressure_drops_total += 1
+            raise WorkerFailure("worker_busy")
+        self.metrics.inference_requests_total += 1
+        descriptor = -1
+        started = time.perf_counter_ns()
+        try:
+            descriptor = create_sealed_memfd(tensor)
+            payload = {
+                "frame_id": frame_id,
+                "dtype": "float32",
+                "shape": list(INPUT_SHAPE),
+                "layout": "NCHW",
+                "byte_order": "little",
+                "capture_monotonic_ns": capture_monotonic_ns,
+                "deadline_monotonic_ns": deadline_monotonic_ns,
+                "qualification_digest": qualification_digest,
+            }
+            result = self._call(
+                "INFER_TENSOR",
+                timeout=self.config.inference_timeout_seconds,
+                payload=payload,
+                fds=(descriptor,),
+            )
+            self.metrics.inference_successes_total += 1
+            return result
+        except WorkerFailure as exc:
+            self.metrics.inference_failures_total += 1
+            if str(exc) == "request_expired":
+                self.metrics.expired_frames_total += 1
+            raise
+        finally:
+            self.metrics.parent_rpc_roundtrip_ms = (time.perf_counter_ns() - started) / 1e6
+            if descriptor >= 0:
+                os.close(descriptor)
+            self._inference_lane.release()
 
     def health(self) -> dict[str, Any]:
         if self.state is not SupervisorState.READY:
