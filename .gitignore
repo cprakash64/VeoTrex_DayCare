@@ -29,5 +29,6 @@ reports/qualification/
 *.trt
 recordings/
 temporary-clips/
+artifacts/models/candidates/
 dist/
 *.egg-info/
