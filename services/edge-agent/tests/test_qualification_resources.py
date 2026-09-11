@@ -4,7 +4,7 @@ from veotrex_edge_agent.qualification.resources import ResourceCollector, parse_
 
 def test_tegrastats_parser_is_bounded_to_safe_resource_fields() -> None:
     value = parse_tegrastats(
-        "RAM 1024/7900MB CPU [12%@729,off] GR3D_FREQ 42% " "cpu@48.5C POM_5V_IN 4500/5000"
+        "RAM 1024/7900MB CPU [12%@729,off] GR3D_FREQ 42% cpu@48.5C POM_5V_IN 4500/5000"
     )
     assert value["available"] is True
     assert value["gpu"] == "42%"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict
+from enum import StrEnum
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,11 @@ from numpy.typing import NDArray
 
 from veotrex_edge_agent.gpu_worker import GpuWorkerSupervisor
 from veotrex_edge_agent.image_pipeline import PixelFormat, add_source_coordinates, preprocess_image
+
+
+class DetectionProfile(StrEnum):
+    NORMAL = "NORMAL"
+    TRACKING_HIGH_RECALL = "TRACKING_HIGH_RECALL"
 
 
 class ReferenceImageDetector:
@@ -23,19 +29,18 @@ class ReferenceImageDetector:
         *,
         pixel_format: PixelFormat,
         frame_id: str,
-        candidate_score_threshold: float = 0.25,
-        nms_iou_threshold: float = 0.45,
-        qualification_candidates: bool = False,
+        profile: DetectionProfile = DetectionProfile.NORMAL,
     ) -> dict[str, Any]:
         started = time.perf_counter_ns()
         prepared = preprocess_image(image, pixel_format=pixel_format)
         inference_started = time.perf_counter_ns()
+        threshold = 0.05 if profile is DetectionProfile.TRACKING_HIGH_RECALL else 0.25
         result = self._supervisor.infer_tensor(
             prepared.tensor.tobytes(),
             frame_id=frame_id,
-            candidate_score_threshold=candidate_score_threshold,
-            nms_iou_threshold=nms_iou_threshold,
-            qualification_candidates=qualification_candidates,
+            candidate_score_threshold=threshold,
+            nms_iou_threshold=0.45,
+            qualification_candidates=False,
         )
         source_started = time.perf_counter_ns()
         result["detections"] = add_source_coordinates(result["detections"], prepared.transform)

@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     oidc_jwks_forced_refresh_cooldown_seconds: int = Field(default=10, ge=1, le=300)
     oidc_http_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     oidc_clock_skew_seconds: int = Field(default=30, ge=0, le=300)
-    ring_oauth_token_url: str = "https://oauth.ring.com/oauth/token"
+    ring_oauth_token_url: str = "https://oauth.ring.com/oauth/token"  # noqa: S105 (public URL)
     ring_api_base_url: str = "https://api.amazonvision.com"
     ring_client_id: str = "replace-with-ring-client-id"
     ring_client_secret_ref: str = Field(default="env:RING_CLIENT_SECRET", repr=False)

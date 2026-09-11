@@ -271,9 +271,7 @@ def main() -> int:
     successful = [
         record
         for record in records
-        if record["truth_objects"]
-        and rank(record, "fn") == 0
-        and rank(record, "fp") == 0
+        if record["truth_objects"] and rank(record, "fn") == 0 and rank(record, "fp") == 0
     ]
 
     def select(predicate: Any, chosen: list[dict[str, Any]]) -> None:
