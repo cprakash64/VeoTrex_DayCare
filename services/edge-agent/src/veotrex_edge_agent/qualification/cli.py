@@ -32,6 +32,10 @@ from veotrex_edge_agent.qualification.reporting import (
     write_json_report,
 )
 from veotrex_edge_agent.qualification.resources import ResourceCollector
+from veotrex_edge_agent.qualification.transport_qualification import (
+    SCENARIOS,
+    run_transport_cli,
+)
 
 
 class ManualPromptTokenProvider:
@@ -67,6 +71,17 @@ def parser() -> argparse.ArgumentParser:
     qualify.add_argument("--ramp-seconds", type=float, default=1.0)
     qualify.add_argument("--overlap-lead", type=float)
     qualify.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
+    transport = commands.add_parser(
+        "qualify-transport",
+        help="R5A transport qualification on a synthetic loopback fixture; retains no media",
+    )
+    transport.add_argument("--scenario", choices=SCENARIOS, required=True)
+    transport.add_argument("--codec", choices=("h264", "h265"), default="h264")
+    transport.add_argument("--width", type=int, choices=(640, 1280, 1920), default=1920)
+    transport.add_argument("--height", type=int, choices=(360, 720, 1080), default=1080)
+    transport.add_argument("--fps", type=int, choices=(10, 15, 20, 25, 30), default=15)
+    transport.add_argument("--duration", type=float)
+    transport.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
     return root
 
 
@@ -186,6 +201,8 @@ def main() -> None:  # pragma: no cover - console wrapper verified by smoke comm
     if arguments.command == "qualify-env":
         print(environment_json())
         return
+    if arguments.command == "qualify-transport":
+        raise SystemExit(run_transport_cli(arguments))
     try:
         raise SystemExit(asyncio.run(_run_qualification(arguments)))
     except QualificationEnvironmentError as exc:

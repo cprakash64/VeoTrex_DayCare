@@ -47,10 +47,25 @@ def _run_safe(command: list[str], timeout: float = 3.0) -> str | None:
     return output[:4096] if output else None
 
 
+def element_present(gst_inspect: str, name: str, timeout: float = 2.0) -> bool:
+    """gst-inspect exits non-zero for a missing element; its error text is not presence."""
+    try:
+        result = subprocess.run(  # noqa: S603 - executable resolved from PATH; fixed element names
+            [gst_inspect, name],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env={"PATH": os.environ.get("PATH", "")},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def inspect_environment() -> dict[str, Any]:
     gst = shutil.which("gst-inspect-1.0")
     gst_launch = shutil.which("gst-launch-1.0")
-    plugins = {name: bool(gst and _run_safe([gst, name], timeout=2.0)) for name in GST_PLUGINS}
+    plugins = {name: bool(gst) and element_present(str(gst), name) for name in GST_PLUGINS}
     interfaces: list[str] = []
     try:
         interfaces = sorted(name for _, name in __import__("socket").if_nameindex())

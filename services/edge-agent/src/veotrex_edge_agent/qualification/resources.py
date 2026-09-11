@@ -74,10 +74,12 @@ def parse_tegrastats(line: str) -> dict[str, str | float | int | bool | None]:
             safe["memory"] = next_value
         elif field == "GR3D_FREQ" and next_value:
             safe["gpu"] = next_value
-        elif field == "POM_5V_IN" and next_value:
+        elif field in {"POM_5V_IN", "VDD_IN"} and next_value:
             safe["power"] = next_value
         elif field == "CPU" and next_value:
             safe["cpu_frequencies_utilization"] = next_value
+        elif field in {"NVDEC", "NVENC", "NVJPG", "VIC"} and next_value:
+            safe[field.lower()] = next_value
         elif "@" in field and field.endswith("C"):
             name, value = field.split("@", 1)
             safe[f"temperature_{name.lower()}"] = value

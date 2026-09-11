@@ -1,4 +1,6 @@
-from veotrex_edge_agent.qualification.environment import inspect_environment
+from pathlib import Path
+
+from veotrex_edge_agent.qualification.environment import element_present, inspect_environment
 from veotrex_edge_agent.qualification.resources import ResourceCollector, parse_tegrastats
 
 
@@ -26,3 +28,17 @@ def test_environment_inspection_is_read_only_and_reports_plugins() -> None:
     assert result["architecture"]
     assert "rtspsrc" in result["gstreamer_plugins"]
     assert "nvv4l2decoder" in result["gstreamer_plugins"]
+    assert all(isinstance(value, bool) for value in result["gstreamer_plugins"].values())
+
+
+def test_missing_element_error_text_is_not_reported_as_present(tmp_path: Path) -> None:
+    # gst-inspect prints "No such element" and exits non-zero; only the exit status counts.
+    assert element_present("/bin/true", "rtspsrc") is True
+    assert element_present("/bin/false", "avdec_h264") is False
+    assert element_present(str(tmp_path / "missing-gst-inspect"), "rtspsrc") is False
+
+
+def test_tegrastats_parser_reads_orin_power_and_media_engines() -> None:
+    value = parse_tegrastats("RAM 4545/7485MB GR3D_FREQ 38% VDD_IN 6130mW/6130mW NVDEC 115")
+    assert value["power"] == "6130mW/6130mW"
+    assert value["nvdec"] == "115"

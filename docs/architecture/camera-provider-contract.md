@@ -19,6 +19,10 @@ without changing camera domain entities. An adapter owns authentication, secret 
 limits, transport negotiation, retries, and provider error mapping. General logs and metadata must
 not expose URLs containing credentials or provider secrets.
 
-Open questions include transport-specific stream descriptors, backpressure, recording streaming,
-clock alignment, capability refresh, provider error taxonomy, retry budgets, and adapter conformance
-tests. No provider adapter exists in Stage 0.
+R5A (ADR 0013) resolved the live-transport questions at the edge: the opaque `StreamHandle.endpoint`
+string is superseded by an immutable, policy-validated `LiveSessionDescriptor` whose credential is
+held separately in a `SessionCredential`; a fixed transport error taxonomy, a bounded reconnect
+budget, overlap renewal with session generations, and an explicit media timestamp contract are
+implemented in `veotrex_edge_agent.camera_transport`. Open questions remain for backpressure into
+inference, recording streaming, clock alignment across cameras, capability refresh, and conformance
+tests against a real provider adapter.
