@@ -30,5 +30,6 @@ reports/qualification/
 recordings/
 temporary-clips/
 artifacts/models/candidates/
+artifacts/validation/
 dist/
 *.egg-info/

@@ -289,6 +289,9 @@ class GpuWorkerSupervisor:
         capture_monotonic_ns: int | None = None,
         deadline_monotonic_ns: int | None = None,
         qualification_digest: bool = False,
+        candidate_score_threshold: float = 0.25,
+        nms_iou_threshold: float = 0.45,
+        qualification_candidates: bool = False,
     ) -> dict[str, Any]:
         if self.state is not SupervisorState.READY:
             raise WorkerFailure("worker_not_ready")
@@ -305,6 +308,7 @@ class GpuWorkerSupervisor:
         started = time.perf_counter_ns()
         try:
             descriptor = create_sealed_memfd(tensor)
+            memfd_ms = (time.perf_counter_ns() - started) / 1e6
             payload = {
                 "frame_id": frame_id,
                 "dtype": "float32",
@@ -314,13 +318,21 @@ class GpuWorkerSupervisor:
                 "capture_monotonic_ns": capture_monotonic_ns,
                 "deadline_monotonic_ns": deadline_monotonic_ns,
                 "qualification_digest": qualification_digest,
+                "candidate_score_threshold": candidate_score_threshold,
+                "nms_iou_threshold": nms_iou_threshold,
+                "qualification_candidates": qualification_candidates,
             }
+            rpc_started = time.perf_counter_ns()
             result = self._call(
                 "INFER_TENSOR",
                 timeout=self.config.inference_timeout_seconds,
                 payload=payload,
                 fds=(descriptor,),
             )
+            result["parent_timing"] = {
+                "memfd_prepare_ms": memfd_ms,
+                "rpc_roundtrip_ms": (time.perf_counter_ns() - rpc_started) / 1e6,
+            }
             self.metrics.inference_successes_total += 1
             return result
         except WorkerFailure as exc:

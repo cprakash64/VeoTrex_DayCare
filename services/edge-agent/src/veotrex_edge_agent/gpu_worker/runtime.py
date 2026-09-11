@@ -255,8 +255,12 @@ class TensorRtRuntime:
             self._cuda_check(self.cuda.cudaStreamSynchronize(self.stream), "cuda_sync_failed")
             d2h_ms = (time.perf_counter_ns() - stage) / 1e6
             stage = time.perf_counter_ns()
+            detection_config = decoder_module.DetectionConfig(
+                candidate_score_threshold=float(metadata["candidate_score_threshold"]),
+                nms_iou_threshold=float(metadata["nms_iou_threshold"]),
+            )
             detections, anomalies = decoder_module.person_detections(
-                cast(Sequence[float], self.host_output)
+                cast(Sequence[float], self.host_output), detection_config
             )
             postprocess_ms = (time.perf_counter_ns() - stage) / 1e6
             self.sequence += 1
@@ -280,6 +284,14 @@ class TensorRtRuntime:
                     "worker_total_ms": (time.perf_counter_ns() - started) / 1e6,
                 },
             }
+            if metadata.get("qualification_candidates") is True:
+                candidates, _ = decoder_module.decode_person_candidates(
+                    cast(Sequence[float], self.host_output), detection_config
+                )
+                result["qualification_candidates"] = [
+                    [item.x1, item.y1, item.x2, item.y2, item.score, item.source_index]
+                    for item in candidates
+                ]
             if metadata.get("qualification_digest") is True:
                 result["raw_output_sha256"] = hashlib.sha256(output_bytes).hexdigest()
                 floats = self.host_output

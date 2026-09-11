@@ -142,6 +142,9 @@ def validate_infer_payload(payload: dict[str, Any]) -> None:
         "capture_monotonic_ns",
         "deadline_monotonic_ns",
         "qualification_digest",
+        "candidate_score_threshold",
+        "nms_iou_threshold",
+        "qualification_candidates",
     }
     if (
         set(payload) != required
@@ -163,6 +166,12 @@ def validate_infer_payload(payload: dict[str, Any]) -> None:
         raise RuntimeFailure("invalid_tensor_metadata")
     if not isinstance(payload["qualification_digest"], bool):
         raise RuntimeFailure("invalid_tensor_metadata")
+    if not isinstance(payload["qualification_candidates"], bool):
+        raise RuntimeFailure("invalid_tensor_metadata")
+    for field in ("candidate_score_threshold", "nms_iou_threshold"):
+        value = payload[field]
+        if not isinstance(value, int | float) or isinstance(value, bool) or not 0.0 <= value <= 1.0:
+            raise RuntimeFailure("invalid_tensor_metadata")
 
 
 def serve(fd: int) -> int:
