@@ -27,6 +27,22 @@ class TransportErrorCategory(StrEnum):
     CAMERA_OFFLINE = "CAMERA_OFFLINE"
     WORKER_EXITED = "WORKER_EXITED"
     INTERNAL_TRANSPORT_ERROR = "INTERNAL_TRANSPORT_ERROR"
+    # WHEP control plane (HTTP/SDP session management).
+    WHEP_OFFER_FAILED = "WHEP_OFFER_FAILED"
+    WHEP_HTTP_UNAUTHORIZED = "WHEP_HTTP_UNAUTHORIZED"
+    WHEP_HTTP_FORBIDDEN = "WHEP_HTTP_FORBIDDEN"
+    WHEP_HTTP_RATE_LIMITED = "WHEP_HTTP_RATE_LIMITED"
+    WHEP_HTTP_SERVER_ERROR = "WHEP_HTTP_SERVER_ERROR"
+    WHEP_INVALID_ANSWER = "WHEP_INVALID_ANSWER"
+    WHEP_INVALID_LOCATION = "WHEP_INVALID_LOCATION"
+    WHEP_TEARDOWN_FAILED = "WHEP_TEARDOWN_FAILED"
+    # WebRTC media plane.
+    WEBRTC_RUNTIME_UNAVAILABLE = "WEBRTC_RUNTIME_UNAVAILABLE"
+    WEBRTC_NEGOTIATION_FAILED = "WEBRTC_NEGOTIATION_FAILED"
+    WEBRTC_ICE_FAILED = "WEBRTC_ICE_FAILED"
+    WEBRTC_CONNECTION_FAILED = "WEBRTC_CONNECTION_FAILED"
+    WEBRTC_CODEC_UNSUPPORTED = "WEBRTC_CODEC_UNSUPPORTED"
+    WEBRTC_MEDIA_STALLED = "WEBRTC_MEDIA_STALLED"
 
 
 # Retrying these cannot succeed without operator/provider action; retrying authorization failures
@@ -39,6 +55,13 @@ TERMINAL_CATEGORIES = frozenset(
         TransportErrorCategory.INVALID_ENDPOINT,
         TransportErrorCategory.CODEC_UNSUPPORTED,
         TransportErrorCategory.PROVIDER_NOT_CONFIGURED,
+        TransportErrorCategory.WHEP_HTTP_UNAUTHORIZED,
+        TransportErrorCategory.WHEP_HTTP_FORBIDDEN,
+        TransportErrorCategory.WHEP_INVALID_LOCATION,
+        TransportErrorCategory.WEBRTC_CODEC_UNSUPPORTED,
+        # The host lacks the libnice/webrtcice elements webrtcbin requires; retrying cannot help
+        # and installing them is an explicit separate gate.
+        TransportErrorCategory.WEBRTC_RUNTIME_UNAVAILABLE,
     }
 )
 

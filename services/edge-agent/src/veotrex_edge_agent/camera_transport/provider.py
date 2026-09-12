@@ -116,13 +116,20 @@ class StaticRtspSessionProvider:
         return LiveSessionLease(descriptor, credential)
 
 
-class RingLiveSessionProvider:
-    """Ring Partner API RTSPS session source through the existing Stage 1D-A contract.
+# R5A-R1: current official Ring material documents WHEP as the live-video method and still leaves
+# the RTSPS authentication convention and session limits unstated, so this path stays for
+# reference only and must never be selected implicitly.
+RING_RTSPS_STATUS = "LEGACY_UNVERIFIED"
 
-    It reuses the Stage 1D-A URL builder and the injected Stage 1B access-token boundary. The
-    credential convention (token as RTSP password) is inherited from Stage 1D-A and has not been
-    verified against a live Ring session. Without an injected token provider it fails closed with
-    PROVIDER_NOT_CONFIGURED; there is no fallback credential path.
+
+class RingLiveSessionProvider:
+    """LEGACY, UNVERIFIED Ring RTSPS session source (Stage 1D-A assumptions).
+
+    Ring still documents an RTSPS endpoint, but not how an access token is presented to RTSP, nor
+    any session lifetime; the 30 s/60 s session classes and the token-as-password convention come
+    from Stage 1D-A and were NOT re-verified in R5A-R1. Construction therefore requires an explicit
+    ``acknowledge_unverified=True`` so this can never become the default Ring path by accident.
+    Use `RingWhepSessionProvider` for official Ring live video.
     """
 
     def __init__(
@@ -132,7 +139,10 @@ class RingLiveSessionProvider:
         session_class: SessionClass,
         *,
         renewal_lead_seconds: float = 5.0,
+        acknowledge_unverified: bool = False,
     ) -> None:
+        if not acknowledge_unverified:
+            raise TransportError(TransportErrorCategory.TRANSPORT_PROTOCOL_UNSUPPORTED)
         self._target = target
         self._tokens = tokens
         self._session_class = session_class

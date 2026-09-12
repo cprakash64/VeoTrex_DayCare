@@ -14,7 +14,8 @@ from veotrex_edge_agent.camera_transport.errors import TransportError, Transport
 
 MAX_ENDPOINT_LENGTH = 2048
 MAX_SESSION_LIFETIME_SECONDS = 86_400.0
-_DEFAULT_PORTS = {"rtsp": 554, "rtsps": 322}
+# https is accepted only for WHEP control endpoints, which are HTTP APIs rather than media URLs.
+_DEFAULT_PORTS = {"rtsp": 554, "rtsps": 322, "https": 443}
 _HOST_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 _PATH = re.compile(r"^(/[A-Za-z0-9._~%=+,:-]*)*$")
 _QUERY = re.compile(r"^[A-Za-z0-9._~%=&+,:-]*$")
@@ -31,6 +32,8 @@ class ProviderKind(StrEnum):
 class TransportProtocol(StrEnum):
     RTSP = "RTSP"
     RTSPS = "RTSPS"
+    # WHEP: an HTTPS control endpoint that negotiates WebRTC media (official Ring live video).
+    WHEP = "WHEP"
 
 
 class VideoCodec(StrEnum):
@@ -41,6 +44,7 @@ class VideoCodec(StrEnum):
 class CredentialMode(StrEnum):
     NONE = "NONE"
     RTSP_USER_PASSWORD = "RTSP_USER_PASSWORD"  # noqa: S105 - mode name, not a credential
+    BEARER = "BEARER"  # HTTP Authorization header only; never a URL, argv, or log field
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +115,8 @@ class ValidatedEndpoint:
 
     @property
     def protocol(self) -> TransportProtocol:
+        if self.scheme == "https":
+            return TransportProtocol.WHEP
         return TransportProtocol.RTSPS if self.scheme == "rtsps" else TransportProtocol.RTSP
 
     @property
@@ -210,6 +216,12 @@ class SessionCredential:
     secret: SecretStr = field(default_factory=lambda: SecretStr(""))
 
     def __post_init__(self) -> None:
+        if self.mode is CredentialMode.BEARER:
+            token = self.secret.get_secret_value()
+            if self.username or not token or len(token) > 8_192:
+                raise TransportError(TransportErrorCategory.PROVIDER_NOT_CONFIGURED)
+            if any(not 32 < ord(character) < 127 for character in token):
+                raise TransportError(TransportErrorCategory.PROVIDER_NOT_CONFIGURED)
         if self.mode is CredentialMode.RTSP_USER_PASSWORD:
             if not self.username or not self.secret.get_secret_value():
                 raise TransportError(TransportErrorCategory.PROVIDER_NOT_CONFIGURED)

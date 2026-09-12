@@ -37,7 +37,6 @@ from veotrex_edge_agent.camera_transport.errors import TransportError, Transport
 from veotrex_edge_agent.camera_transport.health import StallPolicy
 from veotrex_edge_agent.camera_transport.provider import (
     CredentialSource,
-    RingLiveSessionProvider,
     SessionLifetime,
     StaticRtspSessionProvider,
 )
@@ -49,7 +48,7 @@ from veotrex_edge_agent.camera_transport.worker_backend import (
     WorkerMediaBackend,
 )
 from veotrex_edge_agent.qualification.metrics import percentile
-from veotrex_edge_agent.qualification.models import CameraTarget, SessionClass
+from veotrex_edge_agent.qualification.models import CameraTarget
 from veotrex_edge_agent.qualification.resources import read_tegrastats_once
 
 SYSTEM_PYTHON = Path("/usr/bin/python3")
@@ -845,7 +844,13 @@ async def ring_gate() -> dict[str, Any]:
         label="ring-gate-probe",
         provider_device_id="synthetic-probe-device",
     )
-    provider = RingLiveSessionProvider(target, None, SessionClass.LINE_POWERED_60_SECONDS)
+    from veotrex_edge_agent.camera_transport.webrtc_media import probe_webrtc_runtime
+    from veotrex_edge_agent.camera_transport.whep_provider import RingWhepSessionProvider
+
+    # R5A-R1: the official live-video path is WHEP; the legacy RTSPS provider is unverified and
+    # cannot be constructed without an explicit acknowledgement, so it is not probed here.
+    runtime = probe_webrtc_runtime()
+    provider = RingWhepSessionProvider(target, None)
     try:
         await provider.acquire(target.camera_id, 1, time.monotonic())
         probe = "UNEXPECTED_SUCCESS"
@@ -865,6 +870,18 @@ async def ring_gate() -> dict[str, Any]:
         "sub_gate": "BLOCKED_RING_ACCOUNT_NOT_AVAILABLE" if not configured else "CONFIGURED",
         "ring_live_media_decision": "NOT_CONFIGURED" if not configured else "UNVERIFIED",
         "expected_probe": TransportErrorCategory.PROVIDER_NOT_CONFIGURED.value,
+        "evidence_date": "2026-09-11",
+        "portal_readiness_report": "reports/qualification/r5a_r1_ring_portal_setup.md",
+        "whep": {
+            "documented_endpoint": "POST /v1/devices/{device_id}/media/streaming/whep/sessions",
+            "control_plane_implemented": True,
+            "media_plane_available": runtime.available,
+            "webrtc_runtime": runtime.as_dict(),
+            "decision": "QUALIFIED_SYNTHETIC"
+            if not runtime.available
+            else "READY_FOR_REAL_CREDENTIALS",
+        },
+        "legacy_rtsps": "LEGACY_UNVERIFIED (not probed; requires explicit acknowledgement)",
     }
 
 
