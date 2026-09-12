@@ -95,20 +95,33 @@ class WhepMediaBackend:
         generation: int,
         *,
         probe: Callable[[], WebRtcRuntimeReport] = probe_webrtc_runtime,
+        exchange: Any = None,
+        config: Any = None,
     ) -> None:
         self.generation = generation
         self._probe = probe
+        self._exchange = exchange
+        self._config = config
         self.report: WebRtcRuntimeReport | None = None
+        self.delegate: Any = None
 
     @property
     def pid(self) -> int | None:
-        return None
+        return self.delegate.pid if self.delegate is not None else None
 
     def start(self, lease: LiveSessionLease, emit: Callable[[BackendEvent], None]) -> None:
+        # Runtime capability is checked first so an unusable host fails before any credential use.
         self.report = self._probe()
         if not self.report.available:
             raise TransportError(TransportErrorCategory.WEBRTC_RUNTIME_UNAVAILABLE)
-        raise TransportError(TransportErrorCategory.WEBRTC_RUNTIME_UNAVAILABLE)
+        if self._exchange is None:
+            # No offer/answer exchange configured (Ring WHEP client or local qualification peer).
+            raise TransportError(TransportErrorCategory.PROVIDER_NOT_CONFIGURED)
+        from veotrex_edge_agent.camera_transport.webrtc_backend import WebRtcMediaBackend
+
+        self.delegate = WebRtcMediaBackend(self.generation, self._exchange, self._config)
+        self.delegate.start(lease, emit)
 
     def stop(self) -> None:
-        return None
+        if self.delegate is not None:
+            self.delegate.stop()

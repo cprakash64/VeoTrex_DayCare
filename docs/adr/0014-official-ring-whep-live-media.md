@@ -1,7 +1,7 @@
 # ADR 0014: Official Ring WHEP live media
 
-- Status: Accepted (R5A-R1), media plane blocked on a platform gate
-- Date: 2026-09-11
+- Status: Accepted (R5A-R1); WebRTC media runtime enabled and locally qualified in R5A-R2
+- Date: 2026-09-11, updated 2026-09-12 (R5A-R2)
 
 ## Context
 
@@ -64,16 +64,19 @@ timestamps, reconnect policy and metrics — there is no separate Ring streaming
 documents no WHEP session lifetime, the descriptor carries no expiry, so the controller never
 schedules a renewal it cannot justify.
 
-**Media plane is gated.** `webrtcbin` is installed, but GStreamer's ICE agent lives in the libnice
-elements from the Ubuntu package `gstreamer1.0-nice`, which is **not installed**. Measured on this
-host: `webrtcbin` fails to reach PLAYING ("libnice elements are not available") and `create-offer`
-returns an empty promise, so no SDP offer can be produced at all. `webrtc_media.probe_webrtc_runtime`
-therefore fails closed with `WEBRTC_RUNTIME_UNAVAILABLE`, and the provider runs that probe
-**before** requesting any token, so an unusable host never touches a Ring credential. The
-webrtcbin pipeline (recvonly video-only -> depay -> parse -> `nvv4l2decoder` -> `fakesink`, fixed
-application-controlled topology, no `parse_launch` on provider data, hardware decode only) is
-specified here but deliberately not shipped unverified; installing the package is an explicit
-separate gate.
+**Media plane** (gated in R5A-R1, enabled in R5A-R2). `webrtcbin` ships with
+`gstreamer1.0-plugins-bad`, but GStreamer's ICE agent lives in the libnice elements from
+`gstreamer1.0-nice`. With only the `libnice10` C library installed, `webrtcbin` failed to reach
+PLAYING ("libnice elements are not available") and `create-offer` returned an empty promise, so no
+SDP offer could be produced at all. `webrtc_media.probe_webrtc_runtime` fails closed with
+`WEBRTC_RUNTIME_UNAVAILABLE`, and `RingWhepSessionProvider` runs that probe **before** requesting a
+token, so an unusable host never touches a Ring credential — that ordering remains in force.
+R5A-R2 installed the reviewed one-package closure and the receive path is now implemented and
+locally qualified: `webrtcbin` (recvonly, video-only) -> depay -> parse -> `nvv4l2decoder` ->
+`fakesink`, a fixed application-controlled topology with no `parse_launch` on provider data and no
+silent software fallback. The media worker is a separate `/usr/bin/python3 -I` process that never
+receives the Bearer token: it emits the complete SDP offer upward, the parent performs the
+authenticated exchange, and only the answer comes back down.
 
 **State mapping.** WebRTC states map onto the R5A machine: HTTP 201, SDP exchange, or ICE
 connected are never `STREAMING`; only decoded-buffer progression is, exactly as for RTSP.
@@ -84,8 +87,59 @@ session URL is written to disk, logs or reports.
 
 ## Consequences
 
-VeoTrex can obtain and tear down official Ring WHEP sessions safely today, and the control plane is
-qualified against a synthetic endpoint. Ring live media remains impossible on this Jetson until
-`gstreamer1.0-nice` is installed under its own gate, and remains untested until developer
-credentials, a linked test account and an HTTPS callback host exist. The unverified RTSPS path must
-not be revived without independent current documentation of its authentication and session limits.
+VeoTrex can obtain and tear down official Ring WHEP sessions safely today, the control plane is
+qualified against a synthetic endpoint, and since R5A-R2 the WebRTC media runtime works end to end
+on synthetic local media. Ring live video remains **untested and unqualified**: it still requires
+developer credentials, a linked test account, a public HTTPS callback host, and a managed
+credential vault. The unverified RTSPS path must not be revived without independent current
+documentation of its authentication and session limits.
+
+## R5A-R2: WebRTC runtime enablement and local media qualification (2026-09-12)
+
+**Why one package was required.** Only `libnice10` (the C library) was present; the GStreamer
+integration elements `nicesrc`/`nicesink` come from `gstreamer1.0-nice`. Without them webrtcbin
+cannot build an ICE agent, which is why R5A-R1 reported `WEBRTC_RUNTIME_UNAVAILABLE`.
+
+**Installed closure — exactly one package.** `gstreamer1.0-nice 0.1.21-2build3` (arm64, Ubuntu
+noble/universe, `.deb` SHA-256 `1e82a717…b06dbbc4`). The simulated and actual transactions were
+identical: 1 newly installed, 0 upgraded, 0 removed, 0 downgraded; all four declared dependencies
+(`libc6`, `libglib2.0-0t64`, `libgstreamer1.0-0`, `libnice10`) were already satisfied. The operator
+ran the command; Claude executed nothing privileged. Post-install the package diff against the
+2083-entry baseline contains only that one line, `dpkg --audit` is empty, the six protected plugin
+SHA-256 values are unchanged, and L4T 39.2.0 / kernel 6.8.12-1021-tegra / CUDA 13.2 / TensorRT
+10.16.2.10 / GStreamer 1.24.2 / OpenCV / Docker / 25 W power mode are untouched.
+
+**Runtime and ICE.** `nicesrc`, `nicesink` and `webrtcbin` all inspect (`libgstnice.so` 0.1.21);
+the R5A-R1 probe now reports available. A recvonly video-only peer creates an offer, reaches ICE
+gathering `complete`, and the offer re-serialized after gathering carries 6 **host** candidates
+with fingerprint and ice-ufrag — WHEP requires a complete offer, so the implementation waits for
+gathering rather than trickling. No STUN or TURN is configured: Ring documents no ICE contract, and
+the sample's public STUN server is not treated as a requirement.
+
+**Local media and hardware decode.** A synthetic sender (`videotestsrc` -> x264 -> RTP payloader ->
+webrtcbin) negotiates with the production receive worker over deterministic in-process signaling.
+Decoded output is `nvv4l2decoder` with `memory:NVMM` at 1280x720, first decoded buffer 2.3-2.8 s
+after session start. Encode is software x264 because this Orin Nano has no NVENC.
+
+**Measured results.** 15-minute soak: 13,498 decoded buffers at 15.037 FPS over a 897.6 s window;
+inter-buffer gaps p50 66.66, p95 68.64, p99 70.31, max 95.45 ms; zero timestamp regressions, zero
+stalls, zero dropped worker samples. Steady-state drift after the start-up ramp (78 samples):
+worker RSS +36 KB, worker FDs 0, worker threads 0, edge-agent RSS +0.83 MB; process FDs returned to
+baseline, no zombies, no child leak, worker exited rc 0, Tj <= 51.8 C with no throttling. Five
+connect/disconnect cycles and three controlled receiver-worker kills all recovered (exit detected
+in 0.02-0.04 s, first decoded again in 1.85-2.45 s) with zero stale-generation batches. The
+negative matrix passes 7/7: malformed, empty, audio-bearing and unsupported-codec answers, a silent
+sender, an injected absent-runtime probe, and a sender that disappears mid-stream. The WHEP
+scenario drives the real control client into real media: POST then DELETE, Bearer in the
+`Authorization` header only, validated session resource, successful teardown.
+
+Two measurement defects found and fixed rather than tuned away: the qualification harness retained
+every backend event (~110k objects, +14 MB over 15 minutes) and now folds events into bounded
+counters; and the soak's growth check compared against a cold-start sample taken before the decode
+chain exists, so it measured start-up ramp rather than drift and now measures post-ramp drift while
+still reporting the raw ramp.
+
+**Limits of this evidence.** Everything is synthetic `videotestsrc` media over loopback with host
+candidates: it proves the runtime, the receive route, hardware decode and resource behaviour, but
+says nothing about Ring's servers, real camera encoders, WAN latency, NAT traversal, TURN, or
+session lifetime. These figures must never be quoted as Ring performance.

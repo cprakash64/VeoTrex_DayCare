@@ -36,6 +36,12 @@ from veotrex_edge_agent.qualification.transport_qualification import (
     SCENARIOS,
     run_transport_cli,
 )
+from veotrex_edge_agent.qualification.webrtc_qualification import (
+    SCENARIOS as WEBRTC_SCENARIOS,
+)
+from veotrex_edge_agent.qualification.webrtc_qualification import (
+    run_webrtc_cli,
+)
 
 
 class ManualPromptTokenProvider:
@@ -82,6 +88,17 @@ def parser() -> argparse.ArgumentParser:
     transport.add_argument("--fps", type=int, choices=(10, 15, 20, 25, 30), default=15)
     transport.add_argument("--duration", type=float)
     transport.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
+    webrtc = commands.add_parser(
+        "qualify-webrtc",
+        help="R5A-R2 local WebRTC media qualification; synthetic media only, retains nothing",
+    )
+    webrtc.add_argument("--scenario", choices=WEBRTC_SCENARIOS, required=True)
+    webrtc.add_argument("--codec", choices=("H264", "H265"), default="H264")
+    webrtc.add_argument("--width", type=int, choices=(320, 640, 1280, 1920), default=1280)
+    webrtc.add_argument("--height", type=int, choices=(240, 360, 720, 1080), default=720)
+    webrtc.add_argument("--fps", type=int, choices=(5, 10, 15, 20, 25, 30), default=15)
+    webrtc.add_argument("--duration", type=float)
+    webrtc.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
     return root
 
 
@@ -203,6 +220,8 @@ def main() -> None:  # pragma: no cover - console wrapper verified by smoke comm
         return
     if arguments.command == "qualify-transport":
         raise SystemExit(run_transport_cli(arguments))
+    if arguments.command == "qualify-webrtc":
+        raise SystemExit(run_webrtc_cli(arguments))
     try:
         raise SystemExit(asyncio.run(_run_qualification(arguments)))
     except QualificationEnvironmentError as exc:
