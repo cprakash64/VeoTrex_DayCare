@@ -4,12 +4,15 @@ title = "VeoTrex secret scanning"
 useDefault = true
 
 [allowlist]
-description = "Documented local-only credential and generated artifacts"
+description = "Generated artifacts and placeholder-only example configuration"
 regexTarget = "line"
-regexes = ['''veotrex_local_only''']
+# No credential regex is allowlisted. The previous entry pinned a literal development database
+# password, which both preserved that value in a public repository and would have suppressed
+# detection of it. The password was removed from source (compose now reads POSTGRES_PASSWORD_FILE
+# from a git-ignored local secret), and infra/local/compose.yaml is deliberately no longer
+# path-allowlisted so a re-added literal is reported rather than excused.
 paths = [
   '''(^|/)\.env\.example$''',
-  '''infra/local/compose\.ya?ml$''',
   '''(^|/)\.next/''',
   '''(^|/)node_modules/''',
   '''(^|/)\.venv/''',

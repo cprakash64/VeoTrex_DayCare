@@ -1,13 +1,33 @@
 name: veotrex-childcare
+
+# Two deliberately separate PostgreSQL clusters.
+#
+#   postgres        persistent local development data, default profile
+#   postgres-test   disposable automated-test cluster, "test" profile only
+#
+# They must never be merged into one server. The database suite performs CLUSTER-SCOPED
+# operations (CREATE ROLE, DROP ROLE, DROP OWNED) and deletes rows. PostgreSQL roles are
+# cluster-wide, so a second *database* inside the development server would NOT isolate them:
+# a destructive test would still be able to drop roles the development database depends on.
+#
+# Neither service carries a password in source. Each reads POSTGRES_PASSWORD_FILE from a
+# git-ignored local secret file; a missing file fails the service closed rather than falling
+# back to a default. See docs/adr/0016-local-and-test-database-isolation.md.
+
 services:
   postgres:
     image: postgres:17.6-alpine
     environment:
       POSTGRES_DB: veotrex
       POSTGRES_USER: veotrex
-      POSTGRES_PASSWORD: veotrex_local_only
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
     ports:
-      - "${VEOTREX_POSTGRES_PORT:-5432}:5432"
+      # Loopback only. A bare "5432:5432" publishes on 0.0.0.0 and reaches the LAN, and
+      # Docker's published-port DNAT rules bypass host firewall INPUT filtering, so the
+      # firewall is not the boundary here - the bind address is.
+      - "127.0.0.1:${VEOTREX_POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U veotrex -d veotrex"]
       interval: 2s
@@ -16,5 +36,35 @@ services:
     volumes:
       - veotrex-postgres:/var/lib/postgresql/data
 
+  postgres-test:
+    image: postgres:17.6-alpine
+    # Behind a profile so "db-up" can never start it by accident, and so the test cluster
+    # can be started on its own without bringing up development data.
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: veotrex_test
+      POSTGRES_USER: veotrex_test
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_test_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - postgres_test_password
+    ports:
+      - "127.0.0.1:${VEOTREX_TEST_POSTGRES_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veotrex_test -d veotrex_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    tmpfs:
+      # Disposable storage: initdb runs on every start and nothing survives a restart.
+      # This cluster shares no data directory and no named volume with development.
+      - /var/lib/postgresql/data
+
 volumes:
   veotrex-postgres:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  postgres_test_password:
+    file: ./secrets/postgres_test_password

@@ -1,8 +1,9 @@
 """Production AEAD credential vault: context binding, tampering, CAS rotation, redaction.
 
-Database-backed cases are skipped when PostgreSQL is unavailable; they are never faked with
-SQLite because the rotation semantics depend on PostgreSQL row locking. All token values here are
-obviously synthetic.
+Database-backed cases run only against the isolated test cluster named by
+``VEOTREX_TEST_DATABASE_URL``; they skip when it is not configured and never fall back to the
+development database. They are never faked with SQLite either, because the rotation semantics
+depend on PostgreSQL row locking. All token values here are obviously synthetic.
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from veotrex_api.credential_vault import (
     CredentialVaultError,
     CredentialVersionConflict,
 )
+from veotrex_api.database_targets import resolve_test_database_url
 from veotrex_api.encrypted_vault import (
     KEY_BYTES,
     SECRET_REF_PREFIX,
@@ -104,9 +106,9 @@ def test_context_fields_containing_the_separator_are_rejected() -> None:
 
 
 # --------------------------------------------------------------------- database-backed
-DATABASE_URL = os.environ.get(
-    "VEOTREX_DATABASE_URL", "postgresql+psycopg://veotrex:veotrex_local_only@localhost:5432/veotrex"
-)
+# Only the isolated test cluster is ever used; this never falls back to the development
+# database, and an unsafe configured target raises rather than being silently accepted.
+DATABASE_URL = resolve_test_database_url()
 
 
 def _database_available() -> bool:
@@ -115,14 +117,14 @@ def _database_available() -> bool:
 
     parts = urlsplit(DATABASE_URL.replace("postgresql+psycopg://", "postgresql://"))
     try:
-        with socket.create_connection((parts.hostname or "localhost", parts.port or 5432), 1.0):
+        with socket.create_connection((parts.hostname or "127.0.0.1", parts.port or 5432), 1.0):
             return True
     except OSError:
         return False
 
 
 pytestmark_db = pytest.mark.skipif(
-    not _database_available(), reason="PostgreSQL is unavailable on this host"
+    not _database_available(), reason="isolated PostgreSQL test cluster is not configured"
 )
 
 

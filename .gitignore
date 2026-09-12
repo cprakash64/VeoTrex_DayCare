@@ -4,6 +4,9 @@
 !.env.example
 !**/.env.example
 credentials/
+# Local PostgreSQL secret files read by compose through POSTGRES_PASSWORD_FILE. These are
+# created by the operator on the host and must never be committed.
+infra/local/secrets/
 *.pem
 *.key
 .venv/

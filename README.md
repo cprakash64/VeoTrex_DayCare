@@ -12,6 +12,21 @@ or other operational safety features. It is not legal advice and does not guaran
 
 ## Local setup
 
+Create the two local database secrets first. No database password is committed, so the containers
+fail to start until these files exist. Generate them on your own machine; never commit them, never
+paste them into a chat tool, and never pass them as command-line arguments:
+
+```bash
+mkdir -p infra/local/secrets && chmod 700 infra/local/secrets
+umask 077
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" > infra/local/secrets/postgres_password
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" > infra/local/secrets/postgres_test_password
+chmod 600 infra/local/secrets/postgres_password infra/local/secrets/postgres_test_password
+```
+
+Then copy `.env.example` to `.env` and replace each `REPLACE_WITH_*` placeholder with the matching
+value you just generated. `infra/local/secrets/` and `.env` are both git-ignored.
+
 ```bash
 cp .env.example .env
 make bootstrap
@@ -19,14 +34,15 @@ make db-up
 make migrate
 ```
 
-The `.env.example` values are local-only. Replace them through the deployment secret manager in
-every non-local environment; never commit `.env`.
+The `.env.example` values are placeholders only. Replace them through the deployment secret manager
+in every non-local environment; never commit `.env`.
 
-If port 5432 is already occupied, start PostgreSQL on another host port and update the database URL:
+Both clusters publish on loopback only. Override either host port if it is already occupied, and
+update the matching URL before running migrations or the API:
 
 ```bash
 VEOTREX_POSTGRES_PORT=55432 make db-up
-# set VEOTREX_DATABASE_URL to use localhost:55432 before running migrations or the API
+# set VEOTREX_DATABASE_URL to use 127.0.0.1:55432
 ```
 
 Run each service in its own terminal:
@@ -39,6 +55,33 @@ make edge  # stop with SIGINT/SIGTERM
 
 Run the full local quality gate with `make check`. Run migrations with `make migrate`, and stop
 PostgreSQL with `make db-down`. `make db-down` preserves the named volume.
+
+### Development and test databases are separate clusters
+
+Development data lives in the `postgres` service (persistent named volume, port 5432). Automated
+database tests use `postgres-test`: a **separate PostgreSQL server** behind the `test` profile, on
+port 55433, with disposable `tmpfs` storage and its own credential.
+
+They are two servers rather than two databases because the database suite performs cluster-scoped
+operations — `CREATE ROLE`, `DROP ROLE`, `DROP OWNED`. PostgreSQL roles are cluster-wide, so a
+`veotrex_test` database inside the development server would still let a test drop roles the
+development database depends on.
+
+```bash
+make db-test-up      # start only the disposable test cluster
+make migrate-test    # migrate it, after validating the target
+make db-test         # run the database suite against it
+make db-test-down    # discard it
+```
+
+Destructive tests read `VEOTREX_TEST_DATABASE_URL` and never inherit `VEOTREX_DATABASE_URL`. The
+target is refused unless it names a database ending in `_test`, on a loopback host, on a cluster
+distinct from development. With nothing configured the suite gets an unreachable target and simply
+fails to connect, so it can never reach development data.
+
+Always invoke uv as `uv run --all-packages`. `uv run --package <member>` re-synchronises the shared
+workspace virtualenv down to one member and uninstalls the other member's dependencies; recover
+with `uv sync --frozen --all-packages --group qualification`.
 
 ## Repository boundaries
 
