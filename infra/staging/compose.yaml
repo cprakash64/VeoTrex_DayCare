@@ -1,0 +1,158 @@
+name: veotrex-staging
+
+# Public staging control plane. One canonical HTTPS origin fronts two applications:
+#
+#   https://<VEOTREX_STAGING_HOST>/v1/*  -> api  (FastAPI: token exchange, webhooks)
+#   https://<VEOTREX_STAGING_HOST>/*     -> web  (Next.js: account link, devices)
+#
+# The Jetson is NOT part of this deployment. It stays on the private LAN with no inbound
+# exposure; Ring callbacks terminate here, never on the edge.
+#
+# Only `proxy` publishes ports. PostgreSQL has no published port at all and is reachable
+# solely on an internal network. No secret value appears in this file - see infra/staging/
+# README for the bootstrap procedure.
+
+networks:
+  # proxy <-> web/api, and the proxy's outbound access for ACME certificate issuance.
+  edge:
+  # api <-> postgres only. internal: true means no route to or from the Internet.
+  data:
+    internal: true
+
+services:
+  proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    # The only publicly bound ports in the entire deployment. 80 exists for the HTTPS
+    # redirect and ACME HTTP-01 challenge.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      VEOTREX_STAGING_HOST: ${VEOTREX_STAGING_HOST:?VEOTREX_STAGING_HOST must be set}
+      VEOTREX_ACME_EMAIL: ${VEOTREX_ACME_EMAIL:?VEOTREX_ACME_EMAIL must be set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge]
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/staging/Dockerfile.web
+    restart: unless-stopped
+    # No published ports: reachable only through the proxy.
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      APP_BASE_URL: https://${VEOTREX_STAGING_HOST:?VEOTREX_STAGING_HOST must be set}
+      # Server-side call into the API over the internal network, never the public origin.
+      VEOTREX_API_BASE_URL: http://api:8000
+    # Auth0 values are read by the Next.js SDK from the process environment, so they come
+    # from a root-owned 0600 file outside the repository. Never committed.
+    env_file:
+      - ${VEOTREX_STAGING_WEB_ENV:?VEOTREX_STAGING_WEB_ENV must point at the root-owned web env file}
+    networks: [edge]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      # The single authority for Ring callback URLs. Never derived from request headers.
+      VEOTREX_PUBLIC_ORIGIN: https://${VEOTREX_STAGING_HOST:?VEOTREX_STAGING_HOST must be set}
+      # Secret *references*, not values. Resolved by FileSecretResolver from the mounts below,
+      # which keeps them out of the process environment and out of `docker inspect`.
+      VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
+      VEOTREX_RING_CLIENT_SECRET_REF: file:/run/secrets/ring_client_secret
+      VEOTREX_RING_HMAC_SIGNING_KEY_REF: file:/run/secrets/ring_hmac_signing_key
+      VEOTREX_RING_CLIENT_ID: ${VEOTREX_RING_CLIENT_ID:-replace-with-ring-client-id}
+    # VEOTREX_DATABASE_URL is read directly as a setting and has no file-reference support,
+    # so it comes from a root-owned 0600 env file outside the repository.
+    env_file:
+      - ${VEOTREX_STAGING_API_ENV:?VEOTREX_STAGING_API_ENV must point at the root-owned api env file}
+    secrets:
+      - vault_master_key
+      - ring_client_secret
+      - ring_hmac_signing_key
+    networks: [edge, data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    # No `ports:` key at all. The database is reachable only from `api` on the internal
+    # network; publishing 5432 would put a database on the public Internet.
+    environment:
+      POSTGRES_DB: veotrex
+      POSTGRES_USER: veotrex
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      # Durable named volume. Staging is NOT the disposable tmpfs test cluster.
+      - veotrex-staging-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veotrex -d veotrex"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [data]
+
+  # One-shot migration job, behind a profile so ordinary `up` never starts it and API
+  # replicas can never race `alembic upgrade head`. Run it explicitly between steps 2 and 4
+  # of the deployment order documented in infra/staging/README.md.
+  migrate:
+    profiles: ["migrate"]
+    build:
+      context: ../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: "no"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      VEOTREX_PUBLIC_ORIGIN: https://${VEOTREX_STAGING_HOST:?VEOTREX_STAGING_HOST must be set}
+      VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
+    env_file:
+      - ${VEOTREX_STAGING_API_ENV:?VEOTREX_STAGING_API_ENV must point at the root-owned api env file}
+    secrets:
+      - vault_master_key
+    command: ["alembic", "-c", "apps/api/alembic.ini", "upgrade", "head"]
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+secrets:
+  # Root-owned files outside the repository, mode 0600 in a 0700 directory.
+  # The Ring slots may legitimately be EMPTY before the Ring portal gate: the file must exist
+  # for compose to start, and FileSecretResolver then reports the secret as unavailable, so
+  # readiness shows "missing" instead of the deployment failing.
+  postgres_password:
+    file: ${VEOTREX_STAGING_SECRETS_DIR:?VEOTREX_STAGING_SECRETS_DIR must be set}/postgres_password
+  vault_master_key:
+    file: ${VEOTREX_STAGING_SECRETS_DIR:?VEOTREX_STAGING_SECRETS_DIR must be set}/vault_master_key
+  ring_client_secret:
+    file: ${VEOTREX_STAGING_SECRETS_DIR:?VEOTREX_STAGING_SECRETS_DIR must be set}/ring_client_secret
+  ring_hmac_signing_key:
+    file: ${VEOTREX_STAGING_SECRETS_DIR:?VEOTREX_STAGING_SECRETS_DIR must be set}/ring_hmac_signing_key
+
+volumes:
+  veotrex-staging-postgres:
+  caddy-data:
+  caddy-config:

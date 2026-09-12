@@ -1,0 +1,50 @@
+# Build-context exclusions for the staging control-plane images.
+#
+# macOS AppleDouble sidecars are excluded first and deliberately: this checkout contains
+# thousands of them, they are binary, and Alembic's "*.py" version discovery loads
+# "._0001_....py" and dies on its NUL bytes. They must never reach a build context.
+._*
+.DS_Store
+
+# Secrets and local state must never enter an image layer.
+.env
+.env.*
+!.env.example
+infra/local/secrets/
+credentials/
+*.pem
+*.key
+reports/
+
+# Local toolchain and caches: dependencies are installed inside the image from lockfiles.
+.venv/
+node_modules/
+**/node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
+.next/
+**/.next/
+*.tsbuildinfo
+dist/
+*.egg-info/
+.pnpm-store/
+
+# History and CI metadata are not needed to build or run.
+.git/
+.github/
+
+# Edge-only artifacts. The public control plane is CPU-only and never carries models,
+# recordings, or the camera/inference stack.
+artifacts/
+recordings/
+temporary-clips/
+*.engine
+*.plan
+*.trt
+*.onnx

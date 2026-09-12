@@ -1,0 +1,88 @@
+# Staging reverse proxy for the single canonical Ring origin.
+#
+#   https://<STAGING_HOST>/v1/*  -> FastAPI   (token exchange, webhooks, API)
+#   https://<STAGING_HOST>/*     -> Next.js   (account link page, devices page)
+#
+# STAGING_HOST is supplied by the environment at deploy time. It is NOT baked in, and no
+# hostname is invented here; the deployment refuses to start without it.
+#
+# Caddy obtains and renews a publicly trusted certificate automatically and redirects
+# HTTP to HTTPS by default. Port 80 exists only for that redirect and for ACME.
+
+{
+	# Fail loudly rather than silently serving on an unexpected name.
+	email {$VEOTREX_ACME_EMAIL}
+	# Only the two ports below are ever bound; no admin API is exposed to the network.
+	admin off
+}
+
+{$VEOTREX_STAGING_HOST} {
+	# --- security headers -------------------------------------------------------------
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# --- forwarding-header normalisation ----------------------------------------------
+	# An Internet client must never be able to influence how the application sees its own
+	# origin. Ring callback URLs are derived from VEOTREX_PUBLIC_ORIGIN server-side, but
+	# these headers are still overwritten so no inbound value survives to the upstream.
+	request_header X-Forwarded-Host {host}
+	request_header X-Forwarded-Proto https
+	request_header -Forwarded
+	request_header -X-Original-URL
+	request_header -X-Rewrite-URL
+
+	# --- API: server-to-server Ring endpoints and the authenticated API ----------------
+	@api path /v1/*
+	handle @api {
+		# Bounded request body. The application also enforces its own per-endpoint limits
+		# (webhook 65536 bytes, token exchange 1024); this is the outer boundary.
+		request_body {
+			max_size 128KB
+		}
+		reverse_proxy api:8000 {
+			# Ring expects a webhook response well inside its timeout budget.
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 10s
+				read_timeout 20s
+				write_timeout 20s
+			}
+		}
+	}
+
+	# --- everything else: the Next.js control-plane UI ---------------------------------
+	# Includes /integrations/ring/link (Account Link) and
+	# /app/integrations/ring/devices (Default Redirect).
+	handle {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy web:3000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 15s
+				read_timeout 30s
+				write_timeout 30s
+			}
+		}
+	}
+
+	# Health endpoints are deliberately NOT routed publicly. /health/ready touches the
+	# database and both endpoints echo service/version/environment; Ring needs neither.
+	# Container healthchecks reach them on the internal network instead.
+	@health path /health/*
+	respond @health 404
+
+	log {
+		output stderr
+		format json
+		# Request URIs are logged; Ring nonces arrive as query parameters on the account
+		# link page, so that path is excluded from URI logging.
+		level INFO
+	}
+}

@@ -33,7 +33,7 @@ from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientE
 from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
-from veotrex_api.secrets import EnvironmentSecretResolver, SecretResolver
+from veotrex_api.secrets import DefaultSecretResolver, SecretResolver
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
 require_manage_integrations = require_permission(Permission.MANAGE_INTEGRATIONS)
@@ -139,7 +139,7 @@ def create_app(
     logger = structlog.get_logger()
 
     resolved_factory = session_factory or make_session_factory(resolved_engine)
-    resolved_secrets = secret_resolver or EnvironmentSecretResolver()
+    resolved_secrets = secret_resolver or DefaultSecretResolver()
     resolved_vault = credential_vault or _default_vault(
         resolved_settings, resolved_factory, resolved_secrets
     )

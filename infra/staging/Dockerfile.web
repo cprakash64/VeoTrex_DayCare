@@ -1,0 +1,51 @@
+# Staging control-plane web image (Next.js). Build context is the repository root.
+#
+# Node and pnpm versions are pinned to the versions the repository already declares:
+# packageManager "pnpm@11.19.0" and CI's node-version 22.
+
+FROM node:22-bookworm-slim AS builder
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    NEXT_TELEMETRY_DISABLED=1
+
+RUN corepack enable && corepack prepare pnpm@11.19.0 --activate
+
+WORKDIR /build
+
+# Dependency layer first, from lockfiles only.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/web/package.json apps/web/
+RUN --mount=type=cache,target=/pnpm/store \
+    pnpm install --frozen-lockfile
+
+COPY apps/web/ apps/web/
+
+# Auth0 configuration is runtime-only. Nothing secret is available at build time, and no
+# secret is ever baked into an image layer.
+RUN pnpm --dir apps/web build
+
+
+FROM node:22-bookworm-slim AS runtime
+
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+RUN groupadd --system --gid 10002 veotrex \
+ && useradd --system --uid 10002 --gid veotrex --home /app --shell /usr/sbin/nologin veotrex
+
+WORKDIR /app
+
+# Standalone output: server plus traced dependencies only.
+COPY --from=builder --chown=root:root /build/apps/web/.next/standalone ./
+COPY --from=builder --chown=root:root /build/apps/web/.next/static ./apps/web/.next/static
+
+USER veotrex
+EXPOSE 3000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD ["node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+
+CMD ["node", "apps/web/server.js"]
