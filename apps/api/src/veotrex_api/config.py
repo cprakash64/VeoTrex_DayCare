@@ -43,6 +43,24 @@ class Settings(BaseSettings):
     ring_inventory_max_component_reads: int = Field(default=2000, ge=1, le=10000)
     ring_inventory_backoff_max_seconds: float = Field(default=10.0, ge=0, le=60)
     ring_webhook_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    # Externally reachable HTTPS origin of the control plane. Ring callback URLs are derived from
+    # this configured value and never from an incoming Host/X-Forwarded-Host header. Empty until a
+    # real deployment hostname exists; readiness then reports it as missing rather than guessing.
+    public_origin: str = ""
+    # Reference (never the value) to the vault AEAD master key, resolved through SecretResolver.
+    vault_master_key_ref: str = Field(default="env:VEOTREX_VAULT_MASTER_KEY", repr=False)
+
+    @field_validator("public_origin")
+    @classmethod
+    def public_origin_must_be_a_bare_https_origin(cls, value: str) -> str:
+        if not value:
+            return value
+        from veotrex_api.public_origin import InvalidPublicOrigin, validate_public_origin
+
+        try:
+            return validate_public_origin(value).origin
+        except InvalidPublicOrigin as exc:
+            raise ValueError(str(exc)) from None
 
     @field_validator("oidc_issuer")
     @classmethod

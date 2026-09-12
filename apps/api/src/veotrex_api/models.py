@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     String,
     UniqueConstraint,
     Uuid,
@@ -173,6 +174,36 @@ class CameraProviderConnection(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_sync_failure_category: Mapped[str | None] = mapped_column(String(128))
     remote_removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class EncryptedCredential(Base, IdMixin, TimestampMixin):
+    """AEAD-sealed provider credential.
+
+    Not tenant-scoped by design: the CredentialVault contract binds a credential to
+    (provider, owner_kind, owner_id), and Ring one-way linking creates credentials before any
+    tenant exists. Only ciphertext and non-secret context are stored; no column ever holds a
+    plaintext token.
+    """
+
+    __tablename__ = "encrypted_credentials"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_encrypted_credentials_version_positive"),
+        CheckConstraint("schema_version >= 1", name="ck_encrypted_credentials_schema_positive"),
+        CheckConstraint("octet_length(nonce) = 12", name="ck_encrypted_credentials_nonce_len"),
+        CheckConstraint(
+            "octet_length(ciphertext) BETWEEN 16 AND 65536",
+            name="ck_encrypted_credentials_ciphertext_len",
+        ),
+        Index("ix_encrypted_credentials_owner", "provider", "owner_kind", "owner_id"),
+    )
+
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
 
 class RingPendingLink(Base, IdMixin):

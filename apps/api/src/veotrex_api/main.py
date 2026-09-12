@@ -23,6 +23,10 @@ from veotrex_api.credential_vault import (
     UnavailableCredentialVault,
 )
 from veotrex_api.db import make_engine, make_session_factory
+from veotrex_api.encrypted_vault import (
+    EncryptedCredentialVault,
+    VaultKeyProvider,
+)
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientError
@@ -101,6 +105,25 @@ class RingWebhookResponse(BaseModel):
     duplicate: bool
 
 
+def _default_vault(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    secrets: SecretResolver,
+) -> CredentialVault:
+    """Select the credential vault for this environment.
+
+    Tests and local development keep the isolated in-memory adapter. Everywhere else the
+    PostgreSQL-backed AEAD vault is used, and it stays fail-closed: without a usable master key the
+    unavailable adapter is returned rather than starting with unprotected credential storage.
+    """
+    if settings.environment.lower() in {"test", "development", "local"}:
+        return InMemoryCredentialVault()
+    key_provider = VaultKeyProvider(secrets, settings.vault_master_key_ref)
+    if not key_provider.available():
+        return UnavailableCredentialVault()
+    return EncryptedCredentialVault(session_factory, key_provider)
+
+
 def create_app(
     settings: Settings | None = None,
     engine: AsyncEngine | None = None,
@@ -117,10 +140,8 @@ def create_app(
 
     resolved_factory = session_factory or make_session_factory(resolved_engine)
     resolved_secrets = secret_resolver or EnvironmentSecretResolver()
-    resolved_vault = credential_vault or (
-        InMemoryCredentialVault()
-        if resolved_settings.environment.lower() in {"test", "development", "local"}
-        else UnavailableCredentialVault()
+    resolved_vault = credential_vault or _default_vault(
+        resolved_settings, resolved_factory, resolved_secrets
     )
     resolved_ring_client = ring_client or RingClient(resolved_settings, resolved_secrets)
     ring_service = RingLinkService(
