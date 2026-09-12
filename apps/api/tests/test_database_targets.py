@@ -144,3 +144,22 @@ def test_resolution_returns_a_configured_isolated_target() -> None:
         )
         == ISOLATED_TEST
     )
+
+
+def test_resolution_is_single_application_and_refuses_self_comparison() -> None:
+    """Resolution must be applied once, by conftest; a second pass compares the target to itself.
+
+    conftest places the validated test URL into VEOTREX_DATABASE_URL. Calling resolution again in
+    that state used to abort collection of the database-backed vault tests, because the guard
+    correctly saw one cluster on both sides. The guard stays strict - relaxing "development equals
+    test" would let both variables point at the development cluster - so callers consume the
+    already-validated value instead of re-resolving.
+    """
+    environ = {"VEOTREX_TEST_DATABASE_URL": ISOLATED_TEST, "VEOTREX_DATABASE_URL": DEVELOPMENT}
+    resolved = resolve_test_database_url(environ)
+    assert resolved == ISOLATED_TEST
+
+    # Simulate conftest having mapped the validated target into the application setting.
+    environ["VEOTREX_DATABASE_URL"] = resolved
+    with pytest.raises(UnsafeTestDatabase, match="cluster"):
+        resolve_test_database_url(environ)

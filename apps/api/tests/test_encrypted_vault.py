@@ -20,7 +20,6 @@ from veotrex_api.credential_vault import (
     CredentialVaultError,
     CredentialVersionConflict,
 )
-from veotrex_api.database_targets import resolve_test_database_url
 from veotrex_api.encrypted_vault import (
     KEY_BYTES,
     SECRET_REF_PREFIX,
@@ -106,9 +105,10 @@ def test_context_fields_containing_the_separator_are_rejected() -> None:
 
 
 # --------------------------------------------------------------------- database-backed
-# Only the isolated test cluster is ever used; this never falls back to the development
-# database, and an unsafe configured target raises rather than being silently accepted.
-DATABASE_URL = resolve_test_database_url()
+# conftest.py has already resolved and validated the isolated test target and placed it in
+# VEOTREX_DATABASE_URL. Re-resolving here would compare that value against itself and be
+# refused as "shares the development cluster", so the validated value is consumed directly.
+DATABASE_URL = os.environ["VEOTREX_DATABASE_URL"]
 
 
 def _database_available() -> bool:
