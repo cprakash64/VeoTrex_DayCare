@@ -1,6 +1,7 @@
 from functools import lru_cache
+from typing import Any
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +13,10 @@ class Settings(BaseSettings):
     environment: str = Field(min_length=1)
     log_level: str = "INFO"
     database_url: SecretStr
+    # Alternative to supplying the URL directly: a reference resolved through SecretResolver,
+    # so a deployment can mount the DSN as a file instead of exposing it in the process
+    # environment, where `docker inspect` and /proc/<pid>/environ would reveal it.
+    database_url_ref: str = Field(default="", repr=False)
     app_version: str = Field(min_length=1)
     service_name: str = "veotrex-api"
     oidc_issuer: str = "https://auth.example.invalid/"
@@ -49,6 +54,32 @@ class Settings(BaseSettings):
     public_origin: str = ""
     # Reference (never the value) to the vault AEAD master key, resolved through SecretResolver.
     vault_master_key_ref: str = Field(default="env:VEOTREX_VAULT_MASTER_KEY", repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_database_url_reference(cls, data: Any) -> Any:
+        """Populate ``database_url`` from ``database_url_ref`` when a reference is configured.
+
+        Runs before field validation so ``database_url`` stays a required ``SecretStr`` and every
+        consumer is unchanged. Configuring both is refused rather than silently preferring one,
+        and configuring neither still fails as a missing required field.
+        """
+        if not isinstance(data, dict):
+            return data
+        reference = str(data.get("database_url_ref") or "").strip()
+        if not reference:
+            return data
+        if data.get("database_url"):
+            raise ValueError("configure either database_url or database_url_ref, never both")
+        from veotrex_api.secrets import DefaultSecretResolver, SecretResolutionError
+
+        try:
+            resolved = DefaultSecretResolver().resolve(reference)
+        except SecretResolutionError as exc:
+            # The resolver's messages never contain the secret value.
+            raise ValueError(f"database_url_ref is unusable: {exc}") from None
+        data["database_url"] = resolved.get_secret_value()
+        return data
 
     @field_validator("public_origin")
     @classmethod

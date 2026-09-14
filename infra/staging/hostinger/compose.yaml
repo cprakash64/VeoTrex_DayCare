@@ -1,0 +1,144 @@
+name: veotrex-daycare
+
+# Hostinger VPS deployment (178.16.143.10) - a SHARED host that already runs other sites.
+#
+# There is deliberately NO proxy service here. nginx 1.24.0 already owns :80 and :443 on this
+# host and fronts spendwize, thecadviewer, xpertapply and fixcad. Starting Caddy (as the generic
+# infra/staging/compose.yaml does, for an empty host) would collide with nginx and take those
+# sites down. The host nginx proxies to the loopback bindings below instead; templates for that
+# live in infra/staging/hostinger/nginx/.
+#
+# Every published port is bound to 127.0.0.1 explicitly. That matters more than the firewall:
+# Docker's published-port DNAT rules bypass UFW's INPUT chain, so a 0.0.0.0 binding here would be
+# publicly reachable despite `ufw default deny incoming`. The existing xpertapply project uses the
+# same loopback-publish pattern.
+#
+# PostgreSQL publishes nothing at all. The host already runs its own PostgreSQL 16 on
+# 127.0.0.1:5432, which must remain untouched; this database is reachable only from the API over
+# a private Docker network.
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    # No `ports:` key. Not "empty ports" - absent entirely.
+    environment:
+      POSTGRES_DB: veotrex
+      POSTGRES_USER: veotrex
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      # Durable and project-namespaced: veotrex-daycare_veotrex-daycare-postgres. Cannot collide
+      # with xpertapply_postgres_data or the luna-ai-v1_* volumes already on this host.
+      - veotrex-daycare-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veotrex -d veotrex"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [data]
+
+  # One-shot migration. Behind a profile so `docker compose up` never triggers it and API
+  # replicas can never race `alembic upgrade head`.
+  migrate:
+    profiles: ["migrate"]
+    build:
+      context: ../../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: "no"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      VEOTREX_PUBLIC_ORIGIN: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      # Database URL arrives as a secret reference, never as a plaintext environment value.
+      VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
+      VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
+    secrets:
+      - database_url
+      - vault_master_key
+    command: ["alembic", "-c", "apps/api/alembic.ini", "upgrade", "head"]
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: unless-stopped
+    ports:
+      # Loopback only. Host nginx proxies /v1/* here.
+      - "127.0.0.1:8100:8000"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      # Single authority for Ring callback URLs; never derived from request headers.
+      VEOTREX_PUBLIC_ORIGIN: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
+      VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
+      VEOTREX_RING_CLIENT_SECRET_REF: file:/run/secrets/ring_client_secret
+      VEOTREX_RING_HMAC_SIGNING_KEY_REF: file:/run/secrets/ring_hmac_signing_key
+      VEOTREX_RING_CLIENT_ID: ${VEOTREX_RING_CLIENT_ID:-replace-with-ring-client-id}
+    secrets:
+      - database_url
+      - vault_master_key
+      - ring_client_secret
+      - ring_hmac_signing_key
+    # `app` provides outbound Internet access (Ring OAuth, api.amazonvision.com); `data` reaches
+    # PostgreSQL. Making `app` internal would break Ring entirely.
+    networks: [app, data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../../..
+      dockerfile: infra/staging/Dockerfile.web
+    restart: unless-stopped
+    ports:
+      # Loopback only. Host nginx proxies everything except /v1/* here.
+      - "127.0.0.1:3100:3000"
+    environment:
+      NODE_ENV: production
+      APP_BASE_URL: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      # Server-side call over the private Docker network, not the public origin.
+      VEOTREX_API_BASE_URL: http://api:8000
+    # Auth0 values are read by the Next.js SDK from the process environment; they come from a
+    # root-owned 0600 file outside the repository. Never committed.
+    env_file:
+      - ${VEOTREX_HOSTINGER_WEB_ENV:?VEOTREX_HOSTINGER_WEB_ENV must point at the root-owned web env file}
+    # `app` for outbound Auth0 reachability; `data` so it can call the API by service name.
+    networks: [app, data]
+    depends_on:
+      api:
+        condition: service_healthy
+
+networks:
+  # Outbound-capable bridge. Required: the API talks to Ring's OAuth and device APIs, and the
+  # web container talks to Auth0. Marking this internal would silently break both.
+  app:
+  # Private. No route to or from the Internet; carries only api/web <-> postgres traffic.
+  data:
+    internal: true
+
+secrets:
+  # Root-owned files outside the repository, 0600 in a 0700 directory, created on the host.
+  # The Ring slots may legitimately be EMPTY before the Ring portal gate: the file must exist for
+  # compose to start, and the resolver then reports the secret as unavailable, so readiness shows
+  # "missing" rather than the deployment failing.
+  database_url:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/database_url
+  postgres_password:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/postgres_password
+  vault_master_key:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/vault_master_key
+  ring_client_secret:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/ring_client_secret
+  ring_hmac_signing_key:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/ring_hmac_signing_key
+
+volumes:
+  veotrex-daycare-postgres:
