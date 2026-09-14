@@ -18,15 +18,19 @@ and does not pretend to be a Jetson. It runs only the architecture-independent p
 transport worker: that the session credential never reaches `/proc/<pid>/cmdline` or
 `/proc/<pid>/environ`, that the worker's environment is the fixed three-variable `PATH`/`LANG`/
 `LC_ALL` set, that worker path and generation are validated, that untrusted event shapes are
-rejected, and that stopping releases every descriptor and reaps the child. On a host without a
-usable GStreamer runtime the worker reports `DECODER_START_FAILED` and waits for the parent to
-finish the HELLO/START handshake before exiting, so those properties are exercised against the
-real supervisor and the real subprocess rather than a mock.
+rejected, and that stopping releases every descriptor and reaps the child. Those cases spawn the
+real worker and drive teardown through `stop()`, so they hold against the real supervisor and the
+real subprocess on any host. They deliberately do not wait on a transport event: *which* event an
+unreachable endpoint produces, and how quickly, is a property of the installed media stack, and
+making the isolation cases depend on it is what made them non-portable. On a host without a usable
+GStreamer runtime the worker announces `DECODER_START_FAILED` and waits for the parent to finish
+the HELLO/START handshake before exiting; whatever the bring-up failure, the parent is always told,
+so it never blocks on an event that will not come.
 
 Everything that needs real media stays here, on the Jetson, and is gated on the GStreamer
-RTSP/NVIDIA decode stack being present: RTSP negotiation, `nvv4l2decoder` and `memory:NVMM`
-output, redirect and cross-origin refusal, authorization failure, libnice/WebRTC, WHEP, and the
-soak runs. The same split applies to the GPU runtime: CI qualifies the trusted-artifact contract
+RTSP/NVIDIA decode stack being present: that an unreachable endpoint is a `TRANSPORT_CONNECT_FAILED`
+rather than a decoder failure, RTSP negotiation, `nvv4l2decoder` and `memory:NVMM` output, redirect
+and cross-origin refusal, authorization failure, libnice/WebRTC, WHEP, and the soak runs. The same split applies to the GPU runtime: CI qualifies the trusted-artifact contract
 (path, manifest, hash, size, model metadata, declared platform compatibility) and proves that a
 non-`aarch64` runtime is refused with `platform_incompatible`, while TensorRT engine execution is
 qualified only on this hardware. `verify_engine()` is never relaxed for CI - a test pins the

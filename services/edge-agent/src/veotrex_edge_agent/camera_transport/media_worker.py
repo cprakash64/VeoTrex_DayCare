@@ -147,6 +147,44 @@ def validate_start(message: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+def announce_runtime(channel: Channel) -> bool:
+    """Bring up GStreamer and send HELLO; report the runtime unusable and return False if not.
+
+    Every failure to bring the media runtime up is the same condition to the parent, and the
+    exception types a partial GStreamer install can raise are not enumerable: a missing typelib
+    raises ImportError, a version mismatch ValueError, and a broken plugin registry raises out
+    of GLib. Narrowing this to a hand-listed pair is what let the worker die unannounced on a
+    host without the stack, leaving the parent waiting on an event that never came.
+    """
+    try:
+        gst, _rtsp, _glib = load_gstreamer()
+        plugins = {
+            name: gst.ElementFactory.find(name) is not None
+            for name in (
+                "rtspsrc",
+                "rtph264depay",
+                "rtph265depay",
+                "h264parse",
+                "h265parse",
+                HARDWARE_DECODER,
+            )
+        }
+        version = gst.version_string()
+    except Exception:
+        report_unusable_runtime(channel)
+        return False
+    channel.send(
+        {
+            "type": "HELLO",
+            "protocol_version": PROTOCOL_VERSION,
+            "worker_pid": os.getpid(),
+            "gstreamer_version": version,
+            "plugins": plugins,
+        }
+    )
+    return True
+
+
 def report_unusable_runtime(channel: Channel) -> int:
     """Announce a missing GStreamer runtime, then let the parent finish its handshake.
 
@@ -489,33 +527,14 @@ def main() -> int:
     channel = Channel(sock)
     signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
     try:
-        try:
-            gst, _rtsp, _glib = load_gstreamer()
-            plugins = {
-                name: gst.ElementFactory.find(name) is not None
-                for name in (
-                    "rtspsrc",
-                    "rtph264depay",
-                    "rtph265depay",
-                    "h264parse",
-                    "h265parse",
-                    HARDWARE_DECODER,
-                )
-            }
-            channel.send(
-                {
-                    "type": "HELLO",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "worker_pid": os.getpid(),
-                    "gstreamer_version": gst.version_string(),
-                    "plugins": plugins,
-                }
-            )
-        except (ImportError, ValueError):
-            return report_unusable_runtime(channel)
+        if not announce_runtime(channel):
+            return 3
         try:
             start = channel.receive(START_TIMEOUT_SECONDS)
             if start is None:
+                channel.send(
+                    {"type": "FAILED", "generation": 0, "category": "INTERNAL_TRANSPORT_ERROR"}
+                )
                 return 4
             start = validate_start(start)
         except (EOFError, OSError, ValueError, UnicodeError):
@@ -547,6 +566,15 @@ def main() -> int:
             )
         channel.send({"type": "STOPPED", "generation": generation, "at_ns": time.monotonic_ns()})
         return 0
+    except Exception:
+        # Fail closed and audibly. The parent waits on events, so an unannounced exit strands it
+        # until its own timeout with no cause recorded. Anything that escapes the handlers above
+        # still leaves exactly one terminal event behind.
+        with contextlib.suppress(Exception):
+            channel.send(
+                {"type": "FAILED", "generation": 0, "category": "INTERNAL_TRANSPORT_ERROR"}
+            )
+        return 70
     finally:
         with contextlib.suppress(OSError):
             sock.close()

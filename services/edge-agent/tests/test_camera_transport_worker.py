@@ -13,6 +13,7 @@ import pytest
 from pydantic import SecretStr
 
 import veotrex_edge_agent.qualification as qualification_package
+from veotrex_edge_agent.camera_transport import media_worker
 from veotrex_edge_agent.camera_transport.backend import (
     BackendEvent,
     BackendFailed,
@@ -115,6 +116,14 @@ def _assert_reaped(pid: int) -> None:
 
 
 def test_worker_secret_never_in_argv_or_environment_and_resources_are_released() -> None:
+    """Isolation and cleanup, driven by stop() so no media runtime is required.
+
+    The credential and endpoint must stay out of the child's argv and environment, and stopping
+    must release every descriptor and reap the child. None of that depends on GStreamer, so the
+    teardown is driven by stop() rather than by waiting for a transport event: which event an
+    unreachable endpoint produces, and how long it takes, is a property of the installed media
+    stack and is qualified on the Jetson by the GST_MEDIA-gated case below.
+    """
     secret = "synthetic-" + secrets.token_hex(16)
     before = _fds()
     collector = Collector()
@@ -131,16 +140,33 @@ def test_worker_secret_never_in_argv_or_environment_and_resources_are_released()
         b"LANG=C.UTF-8",
         b"LC_ALL=C.UTF-8",
     }
-    assert collector.wait_for(
-        lambda events: any(isinstance(e, BackendFailed) for e in events), timeout=30
-    )
-    failure = next(e for e in collector.events if isinstance(e, BackendFailed))
-    expected = C.TRANSPORT_CONNECT_FAILED if GST_MEDIA else C.DECODER_START_FAILED
-    assert failure.category is expected
+    # The worker announced a protocol-compatible HELLO before any credential was sent.
+    assert backend.hello is not None and backend.hello["worker_pid"] == pid
     backend.stop()
     assert backend.pid is None and backend.returncode is not None
     _assert_reaped(pid)
     assert _fds() == before
+    # Whatever the runtime, the credential never appears in an event delivered to the parent.
+    assert secret not in repr(collector.events)
+
+
+@pytest.mark.skipif(not GST_MEDIA, reason="GStreamer RTSP/NVIDIA decode stack unavailable")
+def test_unreachable_endpoint_is_reported_as_a_transport_connect_failure() -> None:
+    """With a real media stack, a closed port is a connect failure, not a decoder failure."""
+    collector = Collector()
+    backend = WorkerMediaBackend(1, WorkerBackendConfig(tcp_timeout_ms=2000))
+    backend.start(_lease(_closed_port(), "synthetic-" + secrets.token_hex(16)), collector)
+    pid = backend.pid
+    assert pid is not None
+    try:
+        assert collector.wait_for(
+            lambda events: any(isinstance(e, BackendFailed) for e in events), timeout=30
+        ), f"no failure event; worker hello={backend.hello} events={collector.events}"
+        failure = next(e for e in collector.events if isinstance(e, BackendFailed))
+        assert failure.category is C.TRANSPORT_CONNECT_FAILED
+    finally:
+        backend.stop()
+    _assert_reaped(pid)
 
 
 def test_stop_during_connecting_kills_and_reaps_without_leaks() -> None:
@@ -242,6 +268,40 @@ def test_missing_gstreamer_runtime_waits_for_the_parent_handshake() -> None:
         assert not worker.is_alive() and returned == [3]
         # The credential-bearing START is left unread: waiting is a select, never a recv.
         assert child.recv(65_536) == b'{"type":"START"}'
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ImportError("no gi"),  # typelib or python3-gi absent
+        ValueError("Namespace GstRtsp not available"),  # gi.require_version on a partial install
+        RuntimeError("broken plugin registry"),  # raised out of GLib, not an ImportError
+        AttributeError("gi has no require_version"),
+    ],
+)
+def test_any_runtime_bring_up_failure_is_announced_to_the_parent(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """Whatever a partial GStreamer install raises, the parent is told - it never just waits.
+
+    Listing only ImportError and ValueError left every other failure unannounced: the worker
+    exited without a terminal event and the parent blocked until its own timeout with no cause.
+    """
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with parent, child:
+        # Queued first so the handshake wait inside the report returns without blocking.
+        parent.send(b'{"type":"START"}')
+
+        def raise_failure() -> tuple[object, object, object]:
+            raise failure
+
+        monkeypatch.setattr(media_worker, "load_gstreamer", raise_failure)
+        assert media_worker.announce_runtime(Channel(child)) is False
+        hello = json.loads(parent.recv(65_536))
+        reported = json.loads(parent.recv(65_536))
+        assert hello["type"] == "HELLO" and hello["protocol_version"] == 1
+        assert reported["type"] == "FAILED"
+        assert reported["category"] == "DECODER_START_FAILED"
 
 
 def test_worker_that_dies_before_hello_fails_closed_as_a_transport_error(
