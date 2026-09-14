@@ -72,6 +72,24 @@ def test_no_builder_only_path_survives_into_the_runtime_stage(dockerfile: str) -
             assert "/build" not in instruction, instruction
 
 
+def test_the_project_is_installed_non_editable(dockerfile: str) -> None:
+    """An editable install records the BUILDER's source path and cannot resolve at runtime.
+
+    uv writes that path into _editable_impl_veotrex_api.pth. It shipped once: `import veotrex_api`
+    failed under uvicorn, while alembic kept working because alembic.ini sets prepend_sys_path,
+    which masked the broken install and made the image look half-functional.
+    """
+    syncs = [i for i in _instructions(dockerfile) if "uv sync" in i]
+    assert syncs, "expected the image to install dependencies with uv sync"
+    installing = [i for i in syncs if "--no-install-project" not in i]
+    assert installing, "expected one uv sync that installs the project itself"
+    for instruction in installing:
+        assert "--no-editable" in instruction, (
+            "the project must be installed non-editable; an editable install bakes the builder "
+            f"source path into a .pth that does not exist at runtime: {instruction}"
+        )
+
+
 def test_entry_points_the_deployment_relies_on_are_console_scripts(dockerfile: str) -> None:
     """CMD and the migration command both exec console scripts, which is why the shebang matters."""
     assert '"uvicorn"' in dockerfile

@@ -34,8 +34,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY apps/api/ apps/api/
 COPY services/edge-agent/pyproject.toml services/edge-agent/
 
+# --no-editable installs the project into site-packages. An editable install writes the
+# BUILDER's absolute source path into _editable_impl_veotrex_api.pth, which does not exist
+# in the runtime stage, so `import veotrex_api` fails everywhere except under alembic -
+# alembic.ini sets prepend_sys_path and silently masked the broken install.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --package veotrex-api
+    uv sync --frozen --no-dev --no-editable --package veotrex-api
 
 
 FROM python:3.12-slim-bookworm AS runtime

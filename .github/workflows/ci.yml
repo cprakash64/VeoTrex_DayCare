@@ -48,6 +48,42 @@ jobs:
           VEOTREX_DATABASE_URL: ${{ env.VEOTREX_TEST_DATABASE_URL }}
       - run: uv run --all-packages pytest --cov=veotrex_api --cov=veotrex_edge_agent --cov-report=term-missing
 
+  # The unit suite runs under `uv run` on the runner and never executes the deployed image, so a
+  # virtualenv whose absolute paths point at the BUILDER stage passed every check and still could
+  # not start: console-script shebangs named /build/.venv/bin/python, and the editable install
+  # recorded /build/apps/api/src. Both were found during the first real deployment, not by CI.
+  # This job builds the control-plane image and runs things inside it.
+  image-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f infra/staging/Dockerfile.api -t veotrex-api-smoke .
+      - name: Console scripts exec and the ASGI app imports, inside the runtime image
+        env:
+          # Synthetic, non-secret: Settings requires these at import time. The placeholder follows
+          # the repository REPLACE_WITH_* convention so the credential scan still passes.
+          SMOKE_DSN: postgresql+psycopg://veotrex:REPLACE_WITH_SMOKE_PASSWORD@postgres:5432/veotrex
+        run: |
+          docker run --rm --entrypoint sh \
+            -e VEOTREX_ENVIRONMENT=ci \
+            -e VEOTREX_APP_VERSION=0.0.0-smoke \
+            -e VEOTREX_DATABASE_URL="$SMOKE_DSN" \
+            veotrex-api-smoke -c '
+            set -eu
+            alembic --version
+            uvicorn --version
+            command -v veotrex-ring-readiness
+            command -v veotrex-provision
+            python -c "import veotrex_api, veotrex_api.main"
+            if grep -rl "/build" /app/.venv/lib/python3.12/site-packages/*.pth 2>/dev/null; then
+              echo "builder-only path leaked into the virtualenv"; exit 1
+            fi
+            if head -1 /app/.venv/bin/alembic | grep -q "/build"; then
+              echo "console-script shebang points at the builder stage"; exit 1
+            fi
+          '
+      - run: docker build -f infra/staging/Dockerfile.web -t veotrex-web-smoke .
+
   frontend:
     runs-on: ubuntu-latest
     env:
