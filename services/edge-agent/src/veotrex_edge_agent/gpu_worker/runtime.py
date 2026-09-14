@@ -38,6 +38,18 @@ INPUT_BYTES = 4_915_200
 OUTPUT_BYTES = 2_856_000
 EXPECTED_TRT = "10.16.2.10"
 EXPECTED_L4T = "39.2.0"
+EXPECTED_ARCHITECTURE = "aarch64"
+L4T_RELEASE_PATH = Path("/etc/nv_tegra_release")
+L4T_RELEASE_MARKER = "# R39 (release), REVISION: 2.0"
+
+
+def _machine() -> str:
+    """The architecture this process is running on.
+
+    Indirected so a test can pin the platform it is qualifying a manifest against. The check that
+    consumes it is unconditional: nothing here lets a non-Jetson host load the engine.
+    """
+    return platform.machine()
 
 
 class RuntimeFailure(RuntimeError):
@@ -87,13 +99,13 @@ def verify_engine(model_id: str, *, root: Path | None = None) -> tuple[Path, dic
         validate_compatibility(manifest, expected)
     except ArtifactValidationError:
         raise RuntimeFailure("platform_incompatible") from None
-    if platform.machine() != "aarch64":
+    if _machine() != EXPECTED_ARCHITECTURE:
         raise RuntimeFailure("platform_incompatible")
     try:
-        l4t_release = Path("/etc/nv_tegra_release").read_text(encoding="utf-8")
+        l4t_release = L4T_RELEASE_PATH.read_text(encoding="utf-8")
     except OSError:
         raise RuntimeFailure("platform_incompatible") from None
-    if "# R39 (release), REVISION: 2.0" not in l4t_release:
+    if L4T_RELEASE_MARKER not in l4t_release:
         raise RuntimeFailure("platform_incompatible")
     return resolved, {key: getattr(manifest, key) for key in required}
 

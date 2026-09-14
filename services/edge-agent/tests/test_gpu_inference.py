@@ -172,6 +172,20 @@ def test_input_contract_byte_size_is_exact() -> None:
     assert INPUT_BYTES == 1 * 3 * 640 * 640 * 4
 
 
+def pin_jetson_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Present the qualified Jetson runtime identity to verify_engine().
+
+    Only the two platform-identity boundaries are pinned, and only inside a test: the architecture
+    and L4T gates in verify_engine() still execute and still decide. Production is never patched,
+    so an x86 host continues to be refused. Real engine execution - TensorRT, CUDA, NVDEC - is
+    qualified on the Jetson, never here.
+    """
+    release = tmp_path / "nv_tegra_release"
+    release.write_text(f"{runtime_module.L4T_RELEASE_MARKER}, GCID: 0, BOARD: generic\n")
+    monkeypatch.setattr(runtime_module, "_machine", lambda: runtime_module.EXPECTED_ARCHITECTURE)
+    monkeypatch.setattr(runtime_module, "L4T_RELEASE_PATH", release)
+
+
 def trusted_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     engine = tmp_path / "yolox-s" / "engines" / "yolox_s_fp16_a.plan"
     engine.parent.mkdir(parents=True)
@@ -214,8 +228,36 @@ def trusted_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
 def test_valid_locally_approved_manifest_and_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The trusted-artifact contract: path, manifest, hash, size, metadata, declared platform."""
     engine, _ = trusted_store(tmp_path, monkeypatch)
+    pin_jetson_platform(tmp_path, monkeypatch)
     assert verify_engine("yolox-s-fp16", root=tmp_path)[0] == engine
+
+
+# ------------------------------------------------------- the runtime gates the manifest cannot
+def test_non_aarch64_runtime_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The engine is qualified for the Jetson stack; no x86 host may classify it as executable."""
+    trusted_store(tmp_path, monkeypatch)
+    pin_jetson_platform(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime_module, "_machine", lambda: "x86_64")
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+def test_absent_or_wrong_l4t_release_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest declaring aarch64 is not evidence the host runs the qualified L4T release."""
+    trusted_store(tmp_path, monkeypatch)
+    pin_jetson_platform(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime_module, "L4T_RELEASE_PATH", tmp_path / "absent")
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+    wrong = tmp_path / "wrong_release"
+    wrong.write_text("# R36 (release), REVISION: 4.0\n")
+    monkeypatch.setattr(runtime_module, "L4T_RELEASE_PATH", wrong)
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
 
 
 def test_wrong_engine_hash_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

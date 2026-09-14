@@ -105,6 +105,25 @@ def test_continuous_integration_sources_its_password_from_a_secret() -> None:
 _CREDENTIAL_URL = re.compile(r"postgresql(?:\+psycopg)?://[A-Za-z0-9_]+:([^@/\s\"']+)@")
 # Synthetic tokens used by existing unit tests. Deliberately short, obviously fake values.
 _ALLOWED_PLACEHOLDERS = frozenset({"p", "pw", "placeholder", "password", "secret", "unused"})
+# A value that is *entirely* an interpolation field is template syntax, not a stored credential:
+# the real value is substituted at run time and never reaches the tree. Only a bare identifier in
+# the host language's substitution syntax qualifies, so a literal password can never match.
+_INTERPOLATION = re.compile(
+    r"\A(?:"
+    r"\{[A-Za-z_][A-Za-z0-9_]*\}"  # {pw} - Python format field / f-string
+    r"|\$\{[A-Za-z_][A-Za-z0-9_]*\}"  # ${PGPASSWORD} - shell and compose expansion
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"  # $PGPASSWORD - shell expansion
+    r")\Z"
+)
+
+
+def is_secret_reference(secret: str) -> bool:
+    """True when the captured value names a secret instead of being one."""
+    return (
+        secret.startswith("${{")  # ${{ secrets.NAME }} - GitHub Actions
+        or secret.startswith("REPLACE_WITH")  # documented .env.example convention
+        or _INTERPOLATION.match(secret) is not None
+    )
 
 
 def _tracked_files() -> list[Path]:
@@ -131,11 +150,37 @@ def test_no_tracked_file_contains_a_real_database_password() -> None:
         except (UnicodeDecodeError, OSError):
             continue
         for secret in _CREDENTIAL_URL.findall(content):
-            if secret.startswith("${{") or secret.startswith("REPLACE_WITH"):
+            if is_secret_reference(secret):
                 continue
             if secret.lower() not in _ALLOWED_PLACEHOLDERS:
                 offenders.append(str(path.relative_to(REPOSITORY)))
     assert not offenders, f"non-placeholder database credentials in: {sorted(set(offenders))}"
+
+
+@pytest.mark.parametrize(
+    "value", ["{pw}", "${PGPASSWORD}", "$PGPASSWORD", "REPLACE_WITH_LOCAL_PASSWORD", "${{"]
+)
+def test_secret_references_are_recognised_as_references(value: str) -> None:
+    assert is_secret_reference(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "synthetic-not-real",  # the literal this policy previously admitted by accident
+        "hunter2",
+        "{pw}x",  # an interpolation must be the whole value, never a prefix
+        "x{pw}",
+        "{pw }",
+        "{}",
+        "$",
+        "REPLACE",
+    ],
+)
+def test_literal_credentials_are_never_mistaken_for_references(value: str) -> None:
+    """The interpolation rule admits template syntax only; a stored value still fails the scan."""
+    assert not is_secret_reference(value)
+    assert value.lower() not in _ALLOWED_PLACEHOLDERS
 
 
 def test_secret_scanning_does_not_allowlist_a_credential() -> None:

@@ -188,7 +188,9 @@ class WorkerMediaBackend:
                 parent.send(data)
                 del data
                 parent.settimeout(None)
-            except (OSError, ValueError, TimeoutError):
+            # EOFError included: a worker that dies before HELLO must fail closed as a transport
+            # error, not escape start() as an unhandled exception type the controller cannot map.
+            except (OSError, ValueError, TimeoutError, EOFError):
                 self._terminate_locked()
                 raise TransportError(TransportErrorCategory.INTERNAL_TRANSPORT_ERROR) from None
             self._reader = threading.Thread(

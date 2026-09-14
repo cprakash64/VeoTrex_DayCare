@@ -11,6 +11,27 @@ R5A qualifies transport and hardware decode only. Decoded buffers terminate in `
 reaches YOLOX or the tracker. Platform, CUDA, TensorRT, GStreamer, NVIDIA multimedia packages,
 Docker, and power mode were not modified. No package operation occurred.
 
+## Continuous integration boundary
+
+Generic CI (GitHub `ubuntu-latest`, x86_64, no NVIDIA stack) is not a substitute for this record
+and does not pretend to be a Jetson. It runs only the architecture-independent properties of the
+transport worker: that the session credential never reaches `/proc/<pid>/cmdline` or
+`/proc/<pid>/environ`, that the worker's environment is the fixed three-variable `PATH`/`LANG`/
+`LC_ALL` set, that worker path and generation are validated, that untrusted event shapes are
+rejected, and that stopping releases every descriptor and reaps the child. On a host without a
+usable GStreamer runtime the worker reports `DECODER_START_FAILED` and waits for the parent to
+finish the HELLO/START handshake before exiting, so those properties are exercised against the
+real supervisor and the real subprocess rather than a mock.
+
+Everything that needs real media stays here, on the Jetson, and is gated on the GStreamer
+RTSP/NVIDIA decode stack being present: RTSP negotiation, `nvv4l2decoder` and `memory:NVMM`
+output, redirect and cross-origin refusal, authorization failure, libnice/WebRTC, WHEP, and the
+soak runs. The same split applies to the GPU runtime: CI qualifies the trusted-artifact contract
+(path, manifest, hash, size, model metadata, declared platform compatibility) and proves that a
+non-`aarch64` runtime is refused with `platform_incompatible`, while TensorRT engine execution is
+qualified only on this hardware. `verify_engine()` is never relaxed for CI - a test pins the
+platform identity it evaluates; production reads the real architecture and `/etc/nv_tegra_release`.
+
 ## Method
 
 `veotrex-edge qualify-transport --scenario <name>` runs the production path (controller, runner,

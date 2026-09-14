@@ -75,6 +75,16 @@ class Channel:
             except OSError:
                 self.closed = True
 
+    def await_peer(self, timeout: float) -> None:
+        """Block until the parent's next message is queued, without reading it.
+
+        The degraded-runtime path exits before START is ever processed. Returning here only once
+        the parent's send has landed keeps the parent's handshake from racing this process's exit,
+        while the credential inside that message is still never read into this address space.
+        """
+        with contextlib.suppress(OSError, ValueError):
+            select.select([self.sock], [], [], timeout)
+
     def receive(self, timeout: float) -> dict[str, Any] | None:
         ready, _, _ = select.select([self.sock], [], [], timeout)
         if not ready:
@@ -135,6 +145,21 @@ def validate_start(message: dict[str, Any]) -> dict[str, Any]:
     if message.get("decoder") not in DECODER_MODES:
         raise ValueError("invalid_decoder_mode")
     return message
+
+
+def report_unusable_runtime(channel: Channel) -> int:
+    """Announce a missing GStreamer runtime, then let the parent finish its handshake.
+
+    The parent is still mid-handshake here and owes this process a START. Exiting as soon as the
+    failure is queued closes the socket underneath that send, so the parent reports an opaque
+    INTERNAL_TRANSPORT_ERROR instead of the DECODER_START_FAILED cause announced just above - a
+    race that only appears off the Jetson, where the GStreamer import is what fails. Waiting for
+    the parent's message to land removes the race without ever reading the credential it carries.
+    """
+    channel.send({"type": "HELLO", "protocol_version": PROTOCOL_VERSION, "worker_pid": os.getpid()})
+    channel.send({"type": "FAILED", "generation": 0, "category": "DECODER_START_FAILED"})
+    channel.await_peer(START_TIMEOUT_SECONDS)
+    return 3
 
 
 def load_gstreamer() -> tuple[Any, Any, Any]:
@@ -487,11 +512,7 @@ def main() -> int:
                 }
             )
         except (ImportError, ValueError):
-            channel.send(
-                {"type": "HELLO", "protocol_version": PROTOCOL_VERSION, "worker_pid": os.getpid()}
-            )
-            channel.send({"type": "FAILED", "generation": 0, "category": "DECODER_START_FAILED"})
-            return 3
+            return report_unusable_runtime(channel)
         try:
             start = channel.receive(START_TIMEOUT_SECONDS)
             if start is None:

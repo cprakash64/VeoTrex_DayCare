@@ -31,6 +31,7 @@ from veotrex_edge_agent.camera_transport.descriptor import (
 )
 from veotrex_edge_agent.camera_transport.errors import TransportError
 from veotrex_edge_agent.camera_transport.errors import TransportErrorCategory as C
+from veotrex_edge_agent.camera_transport.media_worker import Channel, report_unusable_runtime
 from veotrex_edge_agent.camera_transport.worker_backend import (
     WorkerBackendConfig,
     WorkerMediaBackend,
@@ -215,6 +216,53 @@ def test_worker_event_translation_rejects_untrusted_shapes() -> None:
     ):
         with pytest.raises((ValueError, TypeError, KeyError)):
             backend.translate(bad)
+
+
+# ------------------------------------------------------------- degraded runtime (no GStreamer)
+# Reached on any host without a usable GStreamer runtime, which is every generic CI runner. The
+# real media qualification - RTSP, NVIDIA decode, WebRTC, libnice, WHEP, soak - stays on the
+# Jetson under the GST_MEDIA-gated cases below; these two properties are architecture-independent.
+def test_missing_gstreamer_runtime_waits_for_the_parent_handshake() -> None:
+    """Exiting before START lands would race the parent and mask the real failure category."""
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    returned: list[int] = []
+    with parent, child:
+        worker = threading.Thread(
+            target=lambda: returned.append(report_unusable_runtime(Channel(child))), daemon=True
+        )
+        worker.start()
+        hello = json.loads(parent.recv(65_536))
+        failure = json.loads(parent.recv(65_536))
+        assert hello["type"] == "HELLO" and hello["protocol_version"] == 1
+        assert failure["type"] == "FAILED" and failure["category"] == "DECODER_START_FAILED"
+        worker.join(timeout=0.5)
+        assert worker.is_alive(), "worker exited before the parent could send START"
+        parent.send(b'{"type":"START"}')
+        worker.join(timeout=10)
+        assert not worker.is_alive() and returned == [3]
+        # The credential-bearing START is left unread: waiting is a select, never a recv.
+        assert child.recv(65_536) == b'{"type":"START"}'
+
+
+def test_worker_that_dies_before_hello_fails_closed_as_a_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that dies before HELLO must surface as TransportError, never a bare EOFError.
+
+    A real worker only dies this early on a broken host, so the EOF is injected at the receive
+    boundary; the spawn, teardown and reap around it are the production paths.
+    """
+
+    def eof(_sock: socket.socket) -> dict[str, object]:
+        raise EOFError
+
+    monkeypatch.setattr(WorkerMediaBackend, "_receive", staticmethod(eof))
+    before = _fds()
+    backend = WorkerMediaBackend(1, WorkerBackendConfig(hello_timeout_seconds=5))
+    with pytest.raises(TransportError):
+        backend.start(_lease(_closed_port(), "synthetic-secret-abcdef"), Collector())
+    assert backend.pid is None
+    assert _fds() == before
 
 
 # --------------------------------------------------------------------- loopback integration

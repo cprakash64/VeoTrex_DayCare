@@ -14,7 +14,10 @@ from pydantic import ValidationError
 from veotrex_api.config import Settings
 from veotrex_api.secrets import FileSecretResolver
 
-SYNTHETIC_DSN = "postgresql+psycopg://veotrex:synthetic-not-real@postgres:5432/veotrex"
+# The repository-wide placeholder convention (README.md, .env.example). Spelled out rather
+# than interpolated so the committed literal is what the credential scanner sees and admits.
+SYNTHETIC_PLACEHOLDER = "REPLACE_WITH_SYNTHETIC_PASSWORD"
+SYNTHETIC_DSN = "postgresql+psycopg://veotrex:REPLACE_WITH_SYNTHETIC_PASSWORD@postgres:5432/veotrex"
 BASE = {"_env_file": None, "environment": "test", "app_version": "0.0.0-test"}
 
 
@@ -29,11 +32,17 @@ def settings(**overrides: object) -> Settings:
     return Settings(**{**BASE, **overrides})  # type: ignore[arg-type]
 
 
+# --------------------------------------------------------------------- placeholder wiring
+def test_the_placeholder_is_the_credential_in_the_synthetic_dsn() -> None:
+    """Without this the "secret never rendered" assertions below could pass vacuously."""
+    assert SYNTHETIC_DSN.split("://", 1)[1].split("@", 1)[0] == f"veotrex:{SYNTHETIC_PLACEHOLDER}"
+
+
 # --------------------------------------------------------------------- direct value
 def test_direct_url_still_works_unchanged() -> None:
     resolved = settings(database_url=SYNTHETIC_DSN)
     assert resolved.database_url.get_secret_value() == SYNTHETIC_DSN
-    assert "synthetic-not-real" not in repr(resolved)
+    assert SYNTHETIC_PLACEHOLDER not in repr(resolved)
 
 
 def test_neither_source_configured_still_fails() -> None:
@@ -49,7 +58,7 @@ def test_file_reference_supplies_the_url(tmp_path: Path) -> None:
     resolved = settings(database_url_ref=f"file:{path}")
     assert resolved.database_url.get_secret_value() == SYNTHETIC_DSN
     # The reference itself is not secret, but the resolved value must never be rendered.
-    assert "synthetic-not-real" not in repr(resolved)
+    assert SYNTHETIC_PLACEHOLDER not in repr(resolved)
 
 
 def test_reference_is_usable_by_every_consumer(tmp_path: Path) -> None:
@@ -114,5 +123,5 @@ def test_failure_messages_never_contain_the_secret(tmp_path: Path) -> None:
     with pytest.raises(ValidationError) as caught:
         settings(database_url_ref=f"file:{path}")
     rendered = str(caught.value)
-    assert "synthetic-not-real" not in rendered
+    assert SYNTHETIC_PLACEHOLDER not in rendered
     assert "postgresql+psycopg" not in rendered
