@@ -1,0 +1,21 @@
+# Installed to /etc/systemd/system/. Triggered by veotrex-daycare-backup.timer; also safe to
+# start by hand for qualification, which is how the scheduled path is proven without waiting
+# for a natural firing.
+[Unit]
+Description=VeoTrex Childcare staging database backup (encrypted)
+Documentation=file:///srv/veotrex-daycare/repo/infra/staging/hostinger/README.md
+# Docker owns the database container; without it the dump cannot run.
+Requires=snap.docker.dockerd.service
+After=snap.docker.dockerd.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/veotrex-daycare-backup
+# The script writes only under /var/backups/veotrex-daycare and reads root-owned config.
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/var/backups/veotrex-daycare /var/lock
+NoNewPrivileges=yes
+PrivateTmp=yes
+# A dump that cannot finish in an hour is a fault, not a slow disk.
+TimeoutStartSec=3600

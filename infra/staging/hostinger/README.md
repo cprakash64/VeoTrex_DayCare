@@ -122,16 +122,60 @@ have both renewed since thecadviewer started failing.
 
 ## 5. Backups
 
-VPS snapshots are not enough - they are not consistent for a running database, and a restored
-database is unreadable without the vault master key. Back that key up separately, in a password
-manager, never beside the dump.
+Automated, encrypted, and retention-bounded. The logic lives in `backup/` in this repository;
+installation copies it to a root-owned path:
+
+| Component | Path |
+| --- | --- |
+| Script (source of truth) | `infra/staging/hostinger/backup/veotrex-daycare-backup.sh` |
+| Installed as | `/usr/local/sbin/veotrex-daycare-backup` (root:root 0700) |
+| Units | `/etc/systemd/system/veotrex-daycare-backup.{service,timer}` |
+| Archives | `/var/backups/veotrex-daycare/veotrex-daycare-<UTC>.dump.age` (0600) |
+| Public recipient | `/etc/veotrex-daycare/backup-age-recipient.txt` |
+| Schedule | twice daily, 03:00 and 15:00 UTC, `Persistent=true` |
+| Retention | 28 generations (14 days at two per day) |
+
+The script is executed from `/usr/local/sbin`, never from the checkout: `/srv/veotrex-daycare`
+is owned by the unprivileged `veotrex` user, and a root unit running a file that user can edit
+would be a privilege-escalation path. After changing the script in Git, reinstall it.
+
+`pg_dump --format=custom` runs inside the `postgres` container over its local socket, so no DSN,
+`-W` or `PGPASSWORD` ever appears in argv, the environment, or the journal.
+
+### Encryption
+
+Archives are encrypted with [age](https://age-encryption.org) to a **public recipient**. The host
+can create a backup and cannot read one back: the private identity lives off-host with the
+operator and is never generated on, copied to, or stored on the VPS. A host compromise already
+exposes the live database - it must not also expose the backup history.
+
+### Restoring
+
+**A backup alone is not sufficient to recover this system.** Ring credentials are stored as
+AEAD ciphertext, so a restored database is unreadable - the rows are present but every credential
+is undecryptable - without the matching `vault_master_key`. Recovery requires **both**:
+
+1. an encrypted archive from `/var/backups/veotrex-daycare`, and
+2. the vault master key that was current when that archive was taken.
+
+Back the vault master key up separately from the dumps, in a password manager. Rotating it
+invalidates every archive taken before the rotation; treat rotation as a migration, not a setting.
+
+To restore, decrypt with the off-host identity and load into a **scratch** instance first - never
+into the live database:
 
 ```bash
-docker compose --env-file "$ENVFILE" exec -T postgres \
-  pg_dump -U veotrex -d veotrex --format=custom > /var/backups/veotrex-daycare/$(date +%F).dump
+age -d -i <operator identity> /var/backups/veotrex-daycare/<archive>.dump.age > /tmp/restore.dump
+pg_restore --list /tmp/restore.dump          # verify before trusting it
 ```
 
 **Test the restore before relying on it.** An untested backup is not a backup.
+
+### Off-host copies
+
+`/var/backups` is on the same disk as the database (`/dev/sda1`). These archives protect against
+logical loss - a bad migration, an accidental `DROP` - and **not** against disk failure or loss of
+the VPS. Off-host copies are a separate control and must be verified, not assumed.
 
 ## Do not
 

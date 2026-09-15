@@ -1,0 +1,16 @@
+# Twice daily. The dump is small (tens of KB) so the cost is negligible, and two generations a
+# day bounds worst-case data loss to roughly twelve hours instead of a full day.
+[Unit]
+Description=Twice-daily VeoTrex Childcare staging database backup
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00 UTC
+# A missed firing (host powered off, reboot) runs on next boot rather than being skipped.
+Persistent=true
+# Avoids every timer on the host waking simultaneously.
+RandomizedDelaySec=1800
+AccuracySec=1min
+Unit=veotrex-daycare-backup.service
+
+[Install]
+WantedBy=timers.target
