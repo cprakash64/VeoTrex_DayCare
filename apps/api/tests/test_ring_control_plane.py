@@ -20,7 +20,13 @@ from veotrex_api.ring_nonce import (
     ring_nonce_matches,
     validate_ring_timestamp,
 )
-from veotrex_api.ring_readiness import build_report, readiness_blockers
+from veotrex_api.ring_readiness import (
+    account_link_blockers,
+    build_report,
+    portal_configuration_blockers,
+    prerequisite_blockers,
+    readiness_blockers,
+)
 from veotrex_api.ring_webhook import RingWebhookError, parse_webhook, verify_signature
 from veotrex_api.secrets import SecretResolutionError
 
@@ -114,6 +120,82 @@ def test_readiness_default_resolver_still_reports_a_missing_file(tmp_path: Path)
     assert empty["vault_master_key_source"] == "missing"
 
 
+def test_portal_readiness_is_not_circular(tmp_path: Path) -> None:
+    """Absent Ring credentials must not block *beginning* Ring portal configuration.
+
+    The portal step is where the client id, client secret and HMAC key come FROM. Treating them
+    as prerequisites made the verdict self-referential: every deployment was reported unready to
+    start the step, for the sole reason that it had not finished the step. An operator reading
+    that cannot tell a genuinely broken deployment from a correctly prepared one.
+    """
+    key = tmp_path / "vault_master_key"
+    key.write_text(SYNTHETIC_MASTER_KEY)
+    report = build_report(
+        settings(
+            public_origin=ORIGIN,
+            vault_master_key_ref=f"file:{key}",
+            oidc_issuer="https://tenant.example.test/",
+            oidc_audience="https://ring.example.test/api",
+        )
+    )
+    # Ring values are all absent - exactly the state before the portal step.
+    assert report["ring_client_id"] == "missing"
+    assert report["ring_client_secret"] == "missing"  # noqa: S105 - a status word, not a secret
+    assert report["ring_hmac_key"] == "missing"
+    assert report["ring_account"] == "not linked"
+
+    assert prerequisite_blockers(report) == [], "prerequisites are met; the portal step may begin"
+    assert portal_configuration_blockers(report), "the portal step itself is genuinely outstanding"
+    assert account_link_blockers(report) == ["no Ring account is linked"]
+    # The union still reports everything outstanding, in dependency order.
+    assert readiness_blockers(report) == [
+        *portal_configuration_blockers(report),
+        "no Ring account is linked",
+    ]
+
+
+def test_prerequisites_never_mention_portal_outputs(tmp_path: Path) -> None:
+    """Guards the defect class, not the instance.
+
+    No output of the Ring portal step may gate beginning that step.
+    """
+    key = tmp_path / "vault_master_key"
+    key.write_text(SYNTHETIC_MASTER_KEY)
+    report = build_report(
+        settings(
+            public_origin=ORIGIN,
+            vault_master_key_ref=f"file:{key}",
+            oidc_issuer="https://tenant.example.test/",
+            oidc_audience="https://ring.example.test/api",
+        )
+    )
+    for outcome in ("ring_client_id", "ring_client_secret", "ring_hmac_key", "ring_account"):
+        report_with_gap = dict(report)
+        report_with_gap[outcome] = "missing"
+        assert prerequisite_blockers(report_with_gap) == [], (
+            f"{outcome} is produced by the portal step and must never gate beginning it"
+        )
+
+
+def test_real_prerequisites_do_block_beginning_portal_configuration(tmp_path: Path) -> None:
+    """The counterpart: a deployment that genuinely cannot host Ring must say so."""
+    key = tmp_path / "vault_master_key"
+    key.write_text(SYNTHETIC_MASTER_KEY)
+    base = dict(
+        public_origin=ORIGIN,
+        vault_master_key_ref=f"file:{key}",
+        oidc_issuer="https://tenant.example.test/",
+        oidc_audience="https://ring.example.test/api",
+    )
+    assert prerequisite_blockers(build_report(settings(**base))) == []
+    # A placeholder OIDC authority verifies tokens against nothing and must block.
+    placeholder = build_report(settings(**{**base, "oidc_issuer": "https://auth.example.invalid/"}))
+    assert "oidc_issuer is not configured" in prerequisite_blockers(placeholder)
+    # No public origin means no derivable Ring callback URLs at all.
+    no_origin = build_report(settings(**{**base, "public_origin": ""}))
+    assert prerequisite_blockers(no_origin)
+
+
 def test_readiness_reports_missing_configuration_without_secrets() -> None:
     report = build_report(settings(), StubResolver({}))
     assert report["public_https_origin"] == "missing"
@@ -137,7 +219,13 @@ def test_readiness_reports_configured_state_and_never_prints_a_secret() -> None:
         }
     )
     report = build_report(
-        settings(public_origin=ORIGIN, ring_client_id="synthetic-client-id"), resolver
+        settings(
+            public_origin=ORIGIN,
+            ring_client_id="synthetic-client-id",
+            oidc_issuer="https://tenant.example.test/",
+            oidc_audience="https://ring.example.test/api",
+        ),
+        resolver,
     )
     assert report["public_https_origin"] == ORIGIN
     assert report["account_link_url"] == f"{ORIGIN}/integrations/ring/link"
@@ -172,7 +260,7 @@ def test_invalid_configured_origin_is_reported_not_raised(
         get_settings.cache_clear()
         assert main([]) == 2  # reported, not raised
         printed = capsys.readouterr().out
-        assert "READY_FOR_PORTAL_CONFIGURATION: no" in printed
+        assert "READY_TO_BEGIN_RING_PORTAL_CONFIGURATION: no" in printed
         assert "invalid" in printed.lower()
         assert "Traceback" not in printed
     get_settings.cache_clear()
