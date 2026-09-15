@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
@@ -82,6 +83,37 @@ def signature_for(body: bytes, key: str = SYNTHETIC_HMAC_KEY) -> str:
 
 
 # --------------------------------------------------------------------- readiness reporting
+def test_readiness_default_resolver_reads_file_backed_secrets(tmp_path: Path) -> None:
+    """The DEFAULT resolver must understand every reference scheme Settings can carry.
+
+    Deployed environments mount secrets as files and use `file:` references. build_report()
+    previously defaulted to an env-only resolver, so a correctly configured deployment was
+    reported as entirely unconfigured: the staging host had a working vault - proven by a real
+    encrypt/decrypt round-trip against its database - while this command printed
+    `vault_master_key_source: missing` and `credential_vault: unavailable`.
+
+    Every other case here injects a StubResolver, so the default path was never exercised. This
+    one deliberately passes no resolver.
+    """
+    key = tmp_path / "vault_master_key"
+    key.write_text(SYNTHETIC_MASTER_KEY)
+    report = build_report(settings(vault_master_key_ref=f"file:{key}"))
+    assert report["vault_master_key_source"] == "configured"
+    assert report["credential_vault"] == "ready"
+    assert "credential vault master key is not configured" not in readiness_blockers(report)
+
+
+def test_readiness_default_resolver_still_reports_a_missing_file(tmp_path: Path) -> None:
+    """Fail-closed is preserved: an absent or empty reference is still reported missing."""
+    absent = build_report(settings(vault_master_key_ref=f"file:{tmp_path / 'absent'}"))
+    assert absent["vault_master_key_source"] == "missing"
+    assert absent["credential_vault"] == "unavailable"
+    empty_file = tmp_path / "empty"
+    empty_file.write_text("")
+    empty = build_report(settings(vault_master_key_ref=f"file:{empty_file}"))
+    assert empty["vault_master_key_source"] == "missing"
+
+
 def test_readiness_reports_missing_configuration_without_secrets() -> None:
     report = build_report(settings(), StubResolver({}))
     assert report["public_https_origin"] == "missing"

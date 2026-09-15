@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from veotrex_api.config import Settings, get_settings
 from veotrex_api.encrypted_vault import VaultKeyProvider
 from veotrex_api.public_origin import InvalidPublicOrigin, validate_public_origin
-from veotrex_api.secrets import EnvironmentSecretResolver, SecretResolutionError, SecretResolver
+from veotrex_api.secrets import DefaultSecretResolver, SecretResolutionError, SecretResolver
 
 PLACEHOLDER_CLIENT_ID = "replace-with-ring-client-id"
 
@@ -36,7 +36,11 @@ def build_report(
     settings: Settings | None = None, resolver: SecretResolver | None = None
 ) -> dict[str, Any]:
     resolved = settings or get_settings()
-    secrets = resolver or EnvironmentSecretResolver()
+    # DefaultSecretResolver, not EnvironmentSecretResolver: deployed environments carry
+    # `file:` references (orchestrator secret mounts), and an env-only resolver reports every
+    # one of them as missing however well configured it is. This tool gates the Ring portal
+    # step, so a false 'missing' here is worse than no report at all.
+    secrets = resolver or DefaultSecretResolver()
     report: dict[str, Any] = {
         "public_https_origin": "missing",
         "account_link_url": None,
