@@ -76,6 +76,11 @@ services:
       VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
       # Single authority for Ring callback URLs; never derived from request headers.
       VEOTREX_PUBLIC_ORIGIN: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      # Bearer-token verification. Both default to *.example.invalid, so leaving them unset does
+      # not fail loudly - it silently verifies every access token against an authority that does
+      # not exist. Required here so a misconfigured deployment refuses to start instead.
+      VEOTREX_OIDC_ISSUER: ${VEOTREX_OIDC_ISSUER:?VEOTREX_OIDC_ISSUER must be set}
+      VEOTREX_OIDC_AUDIENCE: ${VEOTREX_OIDC_AUDIENCE:?VEOTREX_OIDC_AUDIENCE must be set}
       VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
       VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
       VEOTREX_RING_CLIENT_SECRET_REF: file:/run/secrets/ring_client_secret
