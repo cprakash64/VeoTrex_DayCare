@@ -14,8 +14,7 @@ copy of the **existing** vault master key somewhere the VPS cannot reach.
 ## What this procedure deliberately does not do
 
 - **It does not rotate the key.** Rotation invalidates every archive taken before it and is a
-  migration, not a setting. The key in `/etc/veotrex-daycare/secrets/vault_master_key` is left
-  byte-for-byte unchanged.
+  migration, not a setting. The live key file is left byte-for-byte unchanged.
 - **It never reveals the key.** The key is not printed, echoed, passed on argv, placed in the
   environment, written to shell history, or copied in plaintext. `age` reads the secret file
   directly by path; the bytes never pass through a shell variable or a terminal.
@@ -31,9 +30,17 @@ copy of the **existing** vault master key somewhere the VPS cannot reach.
 | --- | --- |
 | Root gate (runs on the VPS) | `veotrex-vault-key-escrow.sh` → `/usr/local/sbin/veotrex-vault-key-escrow` (root:root 0700) |
 | Verifier (runs off-host only) | `veotrex-vault-key-verify.sh` |
+| Live vault key | resolved from `VEOTREX_HOSTINGER_SECRETS_DIR` in `/etc/veotrex-daycare/hostinger.env` |
 | Public recovery recipient (on VPS) | `/etc/veotrex-daycare/vault-recovery-recipient.txt` |
 | Escrow artefact (transient, on VPS) | `/root/veotrex-vault-escrow/veotrex-vault-master-key-<UTC>.age` |
 | Private recovery identity | **off-host only**, passphrase-wrapped, never on the VPS |
+
+The gate does not carry its own idea of where the secrets live. It reads
+`VEOTREX_HOSTINGER_SECRETS_DIR` from the deployment env file, which is the same file compose
+interpolates, so the key it escrows is by construction the key the running stack mounts. This
+matters here: Docker is installed as a snap and cannot bind-mount arbitrary host paths, so the
+secrets directory is under `/var/snap/docker/common/`, not the `/etc/veotrex-daycare/secrets`
+that `hostinger.env.example` shows. A gate with a hardcoded default would have escrowed nothing.
 
 Like the backup script, the gate is executed from `/usr/local/sbin` and never from
 `/srv/veotrex-daycare`: that checkout is owned by the unprivileged `veotrex` user, and a root

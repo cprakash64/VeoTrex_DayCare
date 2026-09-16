@@ -34,7 +34,9 @@ command -v age >/dev/null 2>&1 || fail "age is not installed on this machine"
 # The verifier needs the private recovery identity. Running it on the VPS would put that identity
 # on the machine whose compromise it is supposed to survive, so the marks of that host are a
 # hard refusal rather than a warning in a runbook.
+ENV_FILE=${VEOTREX_ENV_FILE:-/etc/veotrex-daycare/hostinger.env}
 for marker in \
+    "$ENV_FILE" \
     "${VEOTREX_HOSTINGER_SECRETS_DIR:-/etc/veotrex-daycare/secrets}/vault_master_key" \
     /usr/local/sbin/veotrex-vault-key-escrow \
     /etc/veotrex-daycare/vault-recovery-recipient.txt

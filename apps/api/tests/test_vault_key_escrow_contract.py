@@ -174,3 +174,34 @@ def test_the_runbook_keeps_the_two_rehearsals_distinct() -> None:
     runbook = RUNBOOK.read_text()
     assert "RESTORE_REHEARSAL" in runbook and "CREDENTIAL_RECOVERY_REHEARSAL" in runbook
     assert "sha256sum /usr/local/sbin/veotrex-vault-key-escrow" in runbook, "checksum contract"
+
+
+def test_the_key_path_comes_from_the_deployment_env_file(escrow: str) -> None:
+    """A gate that carries its own idea of where the secrets live escrows the wrong file.
+
+    Compose interpolates VEOTREX_HOSTINGER_SECRETS_DIR from the deployment env file, and under
+    snap Docker that directory is not the one the example env documents. Reading the same file
+    compose reads is what makes "the key we escrowed" and "the key the stack mounts" the same
+    statement rather than two hopes.
+    """
+    lines = _active(escrow)
+    resolution = _index(lines, r"VEOTREX_HOSTINGER_SECRETS_DIR=//p")
+    # The assignment must CONSUME the resolution. A file that merely still contains the helper
+    # while SECRETS_DIR is hardcoded back to a guess is the exact regression this guards.
+    assignment = _index(lines, r"^SECRETS_DIR=.*env_secrets_dir")
+    assert resolution < assignment < _index(lines, r"^KEY_FILE=.*SECRETS_DIR")
+    assert _index(lines, r'\[ -n "\$SECRETS_DIR" \] \|\| fail') < _index(lines, r"age -R"), (
+        "an unresolvable secrets directory must refuse, not fall back to a guess"
+    )
+
+
+def test_failure_reporting_is_defined_before_anything_can_fail(escrow: str) -> None:
+    """`fail` used above its own definition reports "command not found", not the reason."""
+    lines = _active(escrow)
+    assert _index(lines, r"^fail\(\)") < _index(lines, r"\|\| fail"), "hoist fail() above its uses"
+
+
+def test_the_deployment_env_file_marks_the_host_for_the_verifier(verify: str) -> None:
+    lines = _active(verify)
+    assert _index(lines, r"^ENV_FILE=") < _index(lines, r"for marker in")
+    assert '"$ENV_FILE" \\' in verify, "the env file only exists on the host being protected"

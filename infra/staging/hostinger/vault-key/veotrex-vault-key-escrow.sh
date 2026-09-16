@@ -19,16 +19,28 @@
 
 set -euo pipefail
 
-SECRETS_DIR=${VEOTREX_HOSTINGER_SECRETS_DIR:-/etc/veotrex-daycare/secrets}
+log()  { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+fail() { log "REFUSED: $*"; exit 1; }
+
+ENV_FILE=${VEOTREX_ENV_FILE:-/etc/veotrex-daycare/hostinger.env}
+
+# The deployment's own env file is the authority for where the secrets live - compose reads
+# VEOTREX_HOSTINGER_SECRETS_DIR from exactly this file. A gate carrying its own guess escrows
+# whatever happens to sit at that guess, or nothing; under snap Docker, which cannot bind-mount
+# arbitrary host paths, the real directory is not the one the example file documents.
+env_secrets_dir() {
+    [ -r "$ENV_FILE" ] || return 0
+    sed -n 's/^[[:space:]]*VEOTREX_HOSTINGER_SECRETS_DIR=//p' "$ENV_FILE" |
+        tail -1 | tr -d '"'"'"'\r'
+}
+SECRETS_DIR=${VEOTREX_HOSTINGER_SECRETS_DIR:-$(env_secrets_dir)}
+[ -n "$SECRETS_DIR" ] || fail "VEOTREX_HOSTINGER_SECRETS_DIR is not set in $ENV_FILE"
 KEY_FILE=${VEOTREX_VAULT_KEY_FILE:-$SECRETS_DIR/vault_master_key}
 RECIPIENT=${VEOTREX_VAULT_RECOVERY_RECIPIENT:-/etc/veotrex-daycare/vault-recovery-recipient.txt}
 BACKUP_RECIPIENT=${VEOTREX_BACKUP_RECIPIENTS:-/etc/veotrex-daycare/backup-age-recipient.txt}
 OUT_DIR=${VEOTREX_VAULT_ESCROW_DIR:-/root/veotrex-vault-escrow}
 LOCK=${VEOTREX_VAULT_ESCROW_LOCK:-/var/lock/veotrex-vault-key-escrow.lock}
 CONFIRMATION="ESCROW VAULT KEY"
-
-log()  { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-fail() { log "REFUSED: $*"; exit 1; }
 
 # --- 1. privilege and concurrency bounds -----------------------------------------------------
 [ "$(id -u)" -eq 0 ] || fail "must run as root; the key file is root-owned 0600"
