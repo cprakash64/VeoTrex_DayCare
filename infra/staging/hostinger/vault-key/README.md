@@ -61,6 +61,11 @@ It takes the public recovery recipient as its only argument.
 It is rerunnable. If an escrow artefact already exists it is reported, never replaced — two
 ciphertexts of one key double the exposure and halve the clarity of custody.
 
+When it is waiting for you it prints `PHASE5_CONFIRMATION_REQUIRED` and the exact phrase to type,
+and prints `PHASE5_CONFIRMATION_ACCEPTED` once you have. Those markers exist because a run that
+died between two phases was indistinguishable from one that was waiting for a human. Any
+non-zero exit now names the phase it died in — silence is not a possible outcome.
+
 The operator command fast-forwards the checkout as the deployment user, pins both the commit and
 the script's checksum, installs the orchestrator root-owned, and executes only the root-owned
 copy. Root never executes a file the `veotrex` user can edit.

@@ -250,7 +250,7 @@ def test_the_phases_run_in_the_only_safe_order(stage: str) -> None:
     ]
     positions = [_index(lines, pattern) for pattern in order]
     assert positions == sorted(positions), "no phase may precede its own precondition"
-    assert positions[3] < _index(lines, r'"\$GATE" \|\| fail'), "recipient checked before escrow"
+    assert positions[3] < _index(lines, r'^\s*"\$GATE"'), "recipient checked before escrow"
 
 
 def test_the_stage_script_never_reads_the_live_key(stage: str) -> None:
@@ -264,7 +264,7 @@ def test_a_rerun_reports_the_existing_artefact_instead_of_making_another(stage: 
     """Two ciphertexts of one key double the exposure and halve the clarity of custody."""
     lines = _active(stage)
     guard = _index(lines, r'\[ "\$EXISTING" -gt 0 \]')
-    assert guard < _index(lines, r'"\$GATE" \|\| fail')
+    assert guard < _index(lines, r'^\s*"\$GATE"')
 
 
 def test_a_private_identity_argument_is_refused(stage: str) -> None:
@@ -294,3 +294,20 @@ def test_every_container_must_report_healthy(stage: str) -> None:
     body = "\n".join(_active(stage))
     assert "for service in postgres api web; do" in body
     assert "is not reporting healthy" in body, "a running-but-unhealthy container is not a baseline"
+
+
+def test_no_exit_of_the_stage_script_can_be_silent(stage: str) -> None:
+    """`set -e` exits without a word; a run that dies mid-phase looked like one that was waiting."""
+    body = "\n".join(_active(stage))
+    assert "trap report_exit EXIT" in body
+    assert "ABORTED: exited with status" in body, "a non-zero exit must name the phase"
+    assert "CURRENT_PHASE=$1" in body, "the trap can only name the phase if phase() records it"
+
+
+def test_counting_files_tolerates_a_directory_that_does_not_exist_yet(stage: str) -> None:
+    """Under pipefail, find(1) on a missing directory killed the run between two phases."""
+    body = "\n".join(_active(stage))
+    assert '[ -d "$1" ] || { printf' in body, "an absent directory is zero, not an error"
+    assert not re.search(r"\$\(find [^)]*\| wc -l\)", body), "no unguarded find|wc substitution"
+    for variable in ("ARCHIVE_COUNT", "EXISTING", "COUNT"):
+        assert re.search(rf"^{variable}=\$\(count_files ", body, re.MULTILINE), variable

@@ -132,9 +132,14 @@ cat >&2 <<BANNER
   identity exists ONLY on your trusted off-host machine before continuing.
 
 BANNER
-printf 'Type exactly "%s" to proceed: ' "$CONFIRMATION" >&2
+# Unmissable, on stdout, immediately before the only blocking call in this script. A run that
+# stops here must be obviously WAITING for a human, never mistakable for one that died quietly.
+printf 'PHASE5_CONFIRMATION_REQUIRED\n'
+printf 'Type exactly: %s\n' "$CONFIRMATION"
+printf 'Confirmation: '
 IFS= read -r REPLY_TEXT < /dev/tty || fail "no terminal available; this gate is interactive by design"
 [ "$REPLY_TEXT" = "$CONFIRMATION" ] || fail "confirmation did not match; nothing was written"
+printf 'PHASE5_CONFIRMATION_ACCEPTED\n'
 
 # --- 5. encrypt in place: no plaintext copy is ever created -----------------------------------
 WORK=$(mktemp -d "$OUT_DIR/.work.XXXXXXXX") || fail "cannot create work directory"

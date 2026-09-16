@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-GATE_SHA256=b315c9d4d49e6d0c1f3591929fd1f7dc06a5900f2234b4d7b0ddf7f3b791cc37
+GATE_SHA256=2cdf41d0252a2d882a100c67a6263923206ae1d7ceede87ad5b4283757e9c0f0
 REPO=${VEOTREX_REPO:-/srv/veotrex-daycare/repo}
 SRC="$REPO/infra/staging/hostinger/vault-key/veotrex-vault-key-escrow.sh"
 GATE=${VEOTREX_GATE:-/usr/local/sbin/veotrex-vault-key-escrow}
@@ -35,7 +35,26 @@ TIMER=veotrex-daycare-backup.timer
 
 say()  { printf '%s\n' "$*"; }
 fail() { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
-phase() { printf '\n--- %s ---\n' "$*"; }
+
+# `set -e` exits without a word, and a run that dies between two phases looks exactly like one
+# that is waiting for a human. Every non-zero exit now names the phase it died in.
+CURRENT_PHASE="startup"
+phase() { CURRENT_PHASE=$1; printf '\n--- %s ---\n' "$*"; }
+report_exit() {
+    status=$?
+    [ "$status" -eq 0 ] && return 0
+    printf 'ABORTED: exited with status %d during %s\n' "$status" "$CURRENT_PHASE" >&2
+    return 0
+}
+trap report_exit EXIT
+
+# find(1) fails when its starting point does not exist, and under `pipefail` that failure
+# propagates out of a $( ... | wc -l ) substitution and kills the script. An absent directory is
+# a legitimate answer of zero, not an error, so it is answered rather than raised.
+count_files() {  # directory glob
+    [ -d "$1" ] || { printf '0\n'; return 0; }
+    find "$1" -maxdepth 1 -type f -name "$2" | wc -l
+}
 
 NEW_RECIPIENT=${1:-}
 [ -n "$NEW_RECIPIENT" ] || fail "usage: $0 <vault-recovery age1 recipient>"
@@ -49,6 +68,7 @@ esac
 umask 077
 
 # The live key is only ever stat'ed. Recorded now, compared again after the escrow.
+[ -r "$ENVF" ] || fail "deployment env file is unreadable: $ENVF"
 SECRETS_DIR=$(sed -n 's/^[[:space:]]*VEOTREX_HOSTINGER_SECRETS_DIR=//p' "$ENVF" | tail -1 | tr -d '"\r')
 [ -n "$SECRETS_DIR" ] || fail "VEOTREX_HOSTINGER_SECRETS_DIR is not set in $ENVF"
 KEY="$SECRETS_DIR/vault_master_key"
@@ -104,7 +124,7 @@ probe "$WEB_LOCAL/" 200 "web (loopback)"
 systemctl is-enabled "$TIMER" >/dev/null || fail "$TIMER is not enabled"
 systemctl is-active  "$TIMER" >/dev/null || fail "$TIMER is not active"
 say "BACKUP_TIMER=enabled,active"
-ARCHIVE_COUNT=$(find "$ARCHIVES" -maxdepth 1 -name '*.dump.age' | wc -l)
+ARCHIVE_COUNT=$(count_files "$ARCHIVES" '*.dump.age')
 [ "$ARCHIVE_COUNT" -ge 1 ] || fail "no database archives in $ARCHIVES"
 say "BACKUP_ARCHIVES=$ARCHIVE_COUNT"
 say "DB_BACKUP_RECIPIENT=$(cat -- "$BAK")"
@@ -121,22 +141,28 @@ chown root:root -- "$REC"
 chmod 0600 -- "$REC"
 say "VAULT_RECOVERY_PUBLIC_RECIPIENT=$NEW_RECIPIENT"
 say "RECIPIENT_SEPARATION=distinct from the active database-backup recipient"
-PRIVATE=$(grep -rlI 'AGE-SECRET-KEY-' "$(dirname -- "$REC")" "$OUT" 2>/dev/null || true)
+# An age private identity is a whole line of its own, not a substring. Matching the bare
+# literal flags any file that merely NAMES it - this script, the gate, the runbook - and a check
+# that cries wolf on its own source is a check that gets switched off.
+PRIVATE=$(grep -rlI -E '^AGE-SECRET-KEY-1[0-9A-Z]+$' "$(dirname -- "$REC")" "$OUT" 2>/dev/null || true)
 [ -z "$PRIVATE" ] || fail "private age material present on this host: $PRIVATE"
 say "PRIVATE_AGE_MATERIAL=absent"
 
 # -------------------------------------------------------------- PHASE 5: live vault escrow
 phase "PHASE 5  live vault escrow"
-EXISTING=$(find "$OUT" -maxdepth 1 -name '*.age' 2>/dev/null | wc -l)
+EXISTING=$(count_files "$OUT" '*.age')
 if [ "$EXISTING" -gt 0 ]; then
     say "escrow artefact already exists; not creating a second one"
 else
-    "$GATE" || fail "the escrow gate refused; nothing was written"
+    GATE_STATUS=0
+    "$GATE" || GATE_STATUS=$?
+    [ "$GATE_STATUS" -eq 0 ] ||
+        fail "the escrow gate exited $GATE_STATUS; its refusal is printed above this line"
 fi
 
 # ------------------------------------------------------------- PHASE 6: post-escrow report
 phase "PHASE 6  result"
-COUNT=$(find "$OUT" -maxdepth 1 -name '*.age' | wc -l)
+COUNT=$(count_files "$OUT" '*.age')
 [ "$COUNT" -eq 1 ] || fail "expected exactly one artefact in $OUT, found $COUNT"
 ART=$(find "$OUT" -maxdepth 1 -name '*.age')
 ART_MODE=$(stat -c '%U:%G %a' -- "$ART")
