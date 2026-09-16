@@ -20,6 +20,7 @@ VAULT_KEY_DIR = REPOSITORY / "infra" / "staging" / "hostinger" / "vault-key"
 ESCROW = VAULT_KEY_DIR / "veotrex-vault-key-escrow.sh"
 VERIFY = VAULT_KEY_DIR / "veotrex-vault-key-verify.sh"
 RUNBOOK = VAULT_KEY_DIR / "README.md"
+STAGE = VAULT_KEY_DIR / "veotrex-vault-key-stage.sh"
 
 
 @pytest.fixture(scope="module")
@@ -46,9 +47,9 @@ def _index(lines: list[str], pattern: str) -> int:
 
 # --------------------------------------------------------------------- shape
 def test_escrow_assets_exist_and_scripts_are_executable() -> None:
-    for path in (ESCROW, VERIFY, RUNBOOK):
+    for path in (ESCROW, VERIFY, RUNBOOK, STAGE):
         assert path.is_file(), path
-    for script in (ESCROW, VERIFY):
+    for script in (ESCROW, VERIFY, STAGE):
         assert script.stat().st_mode & stat.S_IXUSR, f"{script.name} must be executable in the repo"
 
 
@@ -75,9 +76,17 @@ def test_the_key_is_not_rotated_or_written(escrow: str) -> None:
 # --------------------------------------------------------------------- identity separation
 def test_backup_identity_cannot_be_reused_as_the_recovery_recipient(escrow: str) -> None:
     lines = _active(escrow)
-    refusal = _index(lines, r"BACKUP_RECIPIENT.*grep -qxF")
     encryption = _index(lines, r"age -R")
-    assert refusal < encryption, "the reuse check must refuse before anything is encrypted"
+    # Presence and comparison are separate properties. The comparison alone passed while a
+    # missing file silently skipped it; the guards are what make "unreadable" mean "refuse".
+    for guard in (
+        r'\[ -e "\$BACKUP_RECIPIENT" \]',
+        r'\[ -f "\$BACKUP_RECIPIENT" \]',
+        r'\[ -r "\$BACKUP_RECIPIENT" \]',
+        r'\[ -s "\$BACKUP_RECIPIENT" \]',
+    ):
+        assert _index(lines, guard) < encryption, f"{guard} must refuse before encryption"
+    assert _index(lines, r'grep -qxF "\$RECIPIENT_KEY" -- "\$BACKUP_RECIPIENT"') < encryption
 
 
 def test_private_recovery_material_is_refused(escrow: str) -> None:
@@ -205,3 +214,64 @@ def test_the_deployment_env_file_marks_the_host_for_the_verifier(verify: str) ->
     lines = _active(verify)
     assert _index(lines, r"^ENV_FILE=") < _index(lines, r"for marker in")
     assert '"$ENV_FILE" \\' in verify, "the env file only exists on the host being protected"
+
+
+# --------------------------------------------------------------- the combined custody run
+@pytest.fixture(scope="module")
+def stage() -> str:
+    return STAGE.read_text()
+
+
+def test_the_stage_script_pins_the_gate_it_installs(stage: str) -> None:
+    """An installer that does not pin a checksum installs whatever is in the checkout."""
+    assert re.search(r"^GATE_SHA256=[0-9a-f]{64}$", stage, re.MULTILINE), "pin the gate checksum"
+    lines = _active(stage)
+    source_check = _index(lines, r'\[ "\$SRC_SHA" = "\$GATE_SHA256" \]')
+    install = _index(lines, r"^install -o root -g root -m 0700")
+    installed_check = _index(lines, r'\[ "\$INST_SHA" = "\$GATE_SHA256" \]')
+    assert source_check < install < installed_check, "verify the bytes, install, verify again"
+
+
+def test_the_gate_is_replaced_atomically(stage: str) -> None:
+    """A truncated root script is worse than an old one: write beside it, then rename."""
+    lines = _active(stage)
+    assert _index(lines, r'install .*"\$GATE\.new"') < _index(lines, r'mv -f -- "\$GATE\.new"')
+
+
+def test_the_phases_run_in_the_only_safe_order(stage: str) -> None:
+    lines = _active(stage)
+    order = [
+        r'phase "PHASE 1',
+        r'phase "PHASE 2',
+        r'phase "PHASE 3',
+        r'phase "PHASE 4',
+        r'phase "PHASE 5',
+        r'phase "PHASE 6',
+    ]
+    positions = [_index(lines, pattern) for pattern in order]
+    assert positions == sorted(positions), "no phase may precede its own precondition"
+    assert positions[3] < _index(lines, r'"\$GATE" \|\| fail'), "recipient checked before escrow"
+
+
+def test_the_stage_script_never_reads_the_live_key(stage: str) -> None:
+    body = "\n".join(_active(stage))
+    assert not re.search(r'(cat|sha256sum|base64|head|tail|grep)[^\n]*"\$KEY"', body)
+    assert "KEY_BEFORE=$(stat -c" in body and "KEY_AFTER=$(stat -c" in body
+    assert '[ "$KEY_BEFORE" = "$KEY_AFTER" ]' in body, "prove the key was not replaced"
+
+
+def test_a_rerun_reports_the_existing_artefact_instead_of_making_another(stage: str) -> None:
+    """Two ciphertexts of one key double the exposure and halve the clarity of custody."""
+    lines = _active(stage)
+    guard = _index(lines, r'\[ "\$EXISTING" -gt 0 \]')
+    assert guard < _index(lines, r'"\$GATE" \|\| fail')
+
+
+def test_a_private_identity_argument_is_refused(stage: str) -> None:
+    assert "AGE-SECRET-KEY-*) fail" in stage, "the argument is public material or nothing"
+
+
+def test_the_stage_script_touches_no_ring_material(stage: str) -> None:
+    body = "\n".join(_active(stage)).lower()
+    for foreign in ("ring_client", "ring_hmac", "auth0", "whep"):
+        assert foreign not in body

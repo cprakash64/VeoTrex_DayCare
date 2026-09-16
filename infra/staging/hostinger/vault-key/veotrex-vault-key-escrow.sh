@@ -82,7 +82,24 @@ RECIPIENT_COUNT=$(LC_ALL=C grep -cE '^age1[0-9a-z]+$' -- "$RECIPIENT" || true)
 [ "$RECIPIENT_COUNT" -eq 1 ] || fail "expected exactly one age1... recipient in $RECIPIENT, found $RECIPIENT_COUNT"
 RECIPIENT_KEY=$(LC_ALL=C grep -E '^age1[0-9a-z]+$' -- "$RECIPIENT")
 
-if [ -r "$BACKUP_RECIPIENT" ] && LC_ALL=C grep -qxF "$RECIPIENT_KEY" -- "$BACKUP_RECIPIENT"; then
+# The recovery recipient must be a recipient age itself accepts, not merely a string of the
+# right shape. Checking it here, before the human is asked to confirm, means a mistyped key is
+# refused up front rather than after the operator has authorised a custody event.
+printf '' | age -r "$RECIPIENT_KEY" -o /dev/null 2>/dev/null ||
+    fail "recovery recipient is not a valid age recipient"
+
+# "Unreadable" is not "different". Separation is only a guarantee if the file it compares
+# against is present, parseable, and actually read: every way of failing to read it is a refusal,
+# never a silent pass. This check previously began with `[ -r "$BACKUP_RECIPIENT" ] &&`, which
+# turned a missing or unreadable file into an unnoticed approval.
+[ -e "$BACKUP_RECIPIENT" ] || fail "database-backup recipient not found: $BACKUP_RECIPIENT"
+[ -f "$BACKUP_RECIPIENT" ] || fail "database-backup recipient is not a regular file: $BACKUP_RECIPIENT"
+[ -r "$BACKUP_RECIPIENT" ] || fail "database-backup recipient is unreadable: $BACKUP_RECIPIENT"
+[ -s "$BACKUP_RECIPIENT" ] || fail "database-backup recipient is empty: $BACKUP_RECIPIENT"
+BACKUP_COUNT=$(LC_ALL=C grep -cE '^age1[0-9a-z]+$' -- "$BACKUP_RECIPIENT" || true)
+[ "$BACKUP_COUNT" -ge 1 ] || fail "database-backup recipient holds no age1 recipient: $BACKUP_RECIPIENT"
+
+if LC_ALL=C grep -qxF "$RECIPIENT_KEY" -- "$BACKUP_RECIPIENT"; then
     fail "recovery recipient is the database-backup recipient; use a separate key pair so one identity cannot unlock both the archives and the key that makes them readable"
 fi
 

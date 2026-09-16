@@ -19,8 +19,10 @@ copy of the **existing** vault master key somewhere the VPS cannot reach.
   environment, written to shell history, or copied in plaintext. `age` reads the secret file
   directly by path; the bytes never pass through a shell variable or a terminal.
 - **It does not reuse the database-backup identity.** A single identity that unlocks both the
-  archives and the key that makes them readable is one compromise away from total loss. The
-  escrow script refuses to run if the two recipients are the same key.
+  archives and the key that makes them readable is one compromise away from total loss. The gate
+  refuses if the two recipients are the same key — and refuses just as hard if the backup
+  recipient file is missing, unreadable, a directory, empty, or holds no `age1` recipient.
+  "Unreadable" is not "different": every way of failing to answer the question is a refusal.
 - **It leaves no private recovery material on the VPS.** The host receives a public age
   recipient and nothing else. The gate refuses any file containing `AGE-SECRET-KEY-`, and the
   verifier refuses to run on a machine that carries the marks of this host.
@@ -30,6 +32,7 @@ copy of the **existing** vault master key somewhere the VPS cannot reach.
 | --- | --- |
 | Root gate (runs on the VPS) | `veotrex-vault-key-escrow.sh` → `/usr/local/sbin/veotrex-vault-key-escrow` (root:root 0700) |
 | Verifier (runs off-host only) | `veotrex-vault-key-verify.sh` |
+| Combined custody run | `veotrex-vault-key-stage.sh` → `/usr/local/sbin/veotrex-vault-key-stage` (root:root 0700) |
 | Live vault key | resolved from `VEOTREX_HOSTINGER_SECRETS_DIR` in `/etc/veotrex-daycare/hostinger.env` |
 | Public recovery recipient (on VPS) | `/etc/veotrex-daycare/vault-recovery-recipient.txt` |
 | Escrow artefact (transient, on VPS) | `/root/veotrex-vault-escrow/veotrex-vault-master-key-<UTC>.age` |
@@ -47,6 +50,22 @@ Like the backup script, the gate is executed from `/usr/local/sbin` and never fr
 command running a file that user can edit is a privilege-escalation path.
 
 ---
+
+## 0. VPS — the whole run, one command
+
+`veotrex-vault-key-stage.sh` performs the six phases in the only safe order and aborts before
+the next phase if one fails: install the pinned gate, verify the installation, baseline the
+running deployment, install and validate the public recovery recipient, escrow the key, report.
+It takes the public recovery recipient as its only argument.
+
+It is rerunnable. If an escrow artefact already exists it is reported, never replaced — two
+ciphertexts of one key double the exposure and halve the clarity of custody.
+
+The operator command fast-forwards the checkout as the deployment user, pins both the commit and
+the script's checksum, installs the orchestrator root-owned, and executes only the root-owned
+copy. Root never executes a file the `veotrex` user can edit.
+
+Steps 1 and 3 below are what that script automates; run them by hand only when diagnosing.
 
 ## 1. VPS — install the gate, checksum-pinned
 
