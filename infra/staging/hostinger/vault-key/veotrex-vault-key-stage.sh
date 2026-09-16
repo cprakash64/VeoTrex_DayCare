@@ -27,6 +27,8 @@ REC=${VEOTREX_VAULT_RECOVERY_RECIPIENT:-/etc/veotrex-daycare/vault-recovery-reci
 BAK=${VEOTREX_BACKUP_RECIPIENTS:-/etc/veotrex-daycare/backup-age-recipient.txt}
 OUT=${VEOTREX_VAULT_ESCROW_DIR:-/root/veotrex-vault-escrow}
 ORIGIN=${VEOTREX_ORIGIN_URL:-https://daycare.veotrex.com}
+API_LOCAL=${VEOTREX_API_LOCAL_URL:-http://127.0.0.1:8100}
+WEB_LOCAL=${VEOTREX_WEB_LOCAL_URL:-http://127.0.0.1:3100}
 ARCHIVES=${VEOTREX_BACKUP_DEST:-/var/backups/veotrex-daycare}
 DEPLOY_USER=${VEOTREX_DEPLOY_USER:-veotrex}
 TIMER=veotrex-daycare-backup.timer
@@ -76,13 +78,29 @@ say "DEPLOY_USER_CAN_MODIFY=no"
 
 # ------------------------------------------------------------- PHASE 3: deployment baseline
 phase "PHASE 3  application baseline"
-docker compose --env-file "$ENVF" -f "$COMPOSE" ps || fail "docker compose ps failed"
-for path in "/" "/health/live" "/health/ready"; do
-    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$ORIGIN$path") ||
-        fail "could not reach $ORIGIN$path"
-    [ "$code" = "200" ] || fail "$ORIGIN$path returned $code"
-    say "HTTP 200 $path"
+PS=$(docker compose --env-file "$ENVF" -f "$COMPOSE" ps) || fail "docker compose ps failed"
+printf '%s\n' "$PS"
+for service in postgres api web; do
+    printf '%s\n' "$PS" | grep -qE -- "-$service-1 .*\(healthy\)" ||
+        fail "$service is not reporting healthy"
 done
+say "CONTAINERS=postgres,api,web all healthy"
+
+probe() {  # url expected-status label
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$1") ||
+        fail "could not reach $1"
+    [ "$code" = "$2" ] || fail "$1 returned $code, expected $2"
+    say "HTTP $code $3"
+}
+
+# The public origin serves the web app. The health endpoints are NOT public: nginx answers
+# /health/ with 404 on purpose, so probing them through the origin tests the wrong thing.
+# They are reached over loopback, where only this host can.
+probe "$ORIGIN/" 200 "public origin"
+probe "$ORIGIN/health/live" 404 "health stays private at the edge"
+probe "$API_LOCAL/health/live" 200 "api liveness (loopback)"
+probe "$API_LOCAL/health/ready" 200 "api readiness incl. PostgreSQL (loopback)"
+probe "$WEB_LOCAL/" 200 "web (loopback)"
 systemctl is-enabled "$TIMER" >/dev/null || fail "$TIMER is not enabled"
 systemctl is-active  "$TIMER" >/dev/null || fail "$TIMER is not active"
 say "BACKUP_TIMER=enabled,active"

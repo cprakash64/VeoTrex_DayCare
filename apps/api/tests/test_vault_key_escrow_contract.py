@@ -275,3 +275,22 @@ def test_the_stage_script_touches_no_ring_material(stage: str) -> None:
     body = "\n".join(_active(stage)).lower()
     for foreign in ("ring_client", "ring_hmac", "auth0", "whep"):
         assert foreign not in body
+
+
+def test_the_baseline_probes_health_where_health_actually_lives(stage: str) -> None:
+    """nginx answers /health/ with 404 on purpose, so probing the origin tests nothing.
+
+    A baseline that expected 200 there would either fail forever or, if someone "fixed" it by
+    exposing the endpoint, would have traded a diagnostic for a public one.
+    """
+    body = "\n".join(_active(stage))
+    assert 'probe "$ORIGIN/health/live" 404' in body, "the edge must keep diagnostics private"
+    assert 'probe "$API_LOCAL/health/live" 200' in body
+    assert 'probe "$API_LOCAL/health/ready" 200' in body, "readiness is what touches PostgreSQL"
+    assert not re.search(r'probe "\$ORIGIN/health/\w+" 200', body)
+
+
+def test_every_container_must_report_healthy(stage: str) -> None:
+    body = "\n".join(_active(stage))
+    assert "for service in postgres api web; do" in body
+    assert "is not reporting healthy" in body, "a running-but-unhealthy container is not a baseline"
