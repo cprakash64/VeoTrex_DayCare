@@ -171,6 +171,18 @@ pg_restore --list /tmp/restore.dump          # verify before trusting it
 
 **Test the restore before relying on it.** An untested backup is not a backup.
 
+### Rotating the backup recipient
+
+`backup/veotrex-backup-recipient-rotate.sh`, installed root-owned like the backup script itself.
+It validates the new recipient with age, refuses to reuse the active one or any recipient passed
+as a forbidden argument, keeps the superseded recipient beside the file for the record, replaces
+it atomically, and runs one real backup through the qualified unit.
+
+It deliberately does **not** retire the old archives. They remain readable only by the identity
+they were encrypted to, and retiring them is a separate decision that belongs after a restore
+from the new recipient has actually passed. Rotation that prunes is rotation that destroys the
+only copies the old key can still open.
+
 ### Off-host copies
 
 `/var/backups` is on the same disk as the database (`/dev/sda1`). These archives protect against
