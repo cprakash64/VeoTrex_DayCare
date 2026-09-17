@@ -183,6 +183,21 @@ they were encrypted to, and retiring them is a separate decision that belongs af
 from the new recipient has actually passed. Rotation that prunes is rotation that destroys the
 only copies the old key can still open.
 
+### Verifying a restore off-host
+
+`backup/veotrex-db-restore-verify.sh` runs on the operator's trusted machine, never here: it
+needs the private recovery identity, and the host that holds the database must never see it. It
+refuses outright if it finds the marks of this host.
+
+It decrypts into RAM, restores into a throwaway `postgres:17.6-alpine` with `--network none`, no
+published port and a scratch volume, then checks migration head, public table count, RLS policy
+count, RLS-enabled table count and that `encrypted_credentials` is queryable, before destroying
+the container, the volume and the plaintext on every exit path. It prints counts and verdicts,
+never rows.
+
+Run it after every recipient rotation. A rotated recipient is an untested backup by definition:
+until this passes, nothing has shown the new key opens anything.
+
 ### Off-host copies
 
 `/var/backups` is on the same disk as the database (`/dev/sda1`). These archives protect against
