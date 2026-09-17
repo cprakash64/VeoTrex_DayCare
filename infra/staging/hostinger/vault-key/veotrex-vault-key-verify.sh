@@ -23,6 +23,35 @@ usage() { echo "usage: $0 <artefact.age> <recovery-identity> <expected-fingerpri
 log()   { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 fail()  { log "FAILED: $*"; exit 1; }
 
+# --- portability ------------------------------------------------------------------------------
+# This runs on the operator's own machine, which may be macOS. GNU coreutils are not a given
+# there: sha256sum, shred and `stat -c` do not exist, and /dev/shm is Linux-only. The handful of
+# tools that differ are resolved once, here, instead of being assumed and failing halfway through
+# a recovery rehearsal.
+if command -v sha256sum >/dev/null 2>&1; then
+    digest() { sha256sum | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    digest() { shasum -a 256 | cut -d' ' -f1; }
+else
+    echo "FAILED: neither sha256sum nor shasum is available" >&2; exit 1
+fi
+
+file_size() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
+
+# Overwrite where the platform can, remove either way. macOS has no shred; rm -P is its analogue.
+wipe() {
+    [ $# -gt 0 ] || return 0
+    if command -v shred >/dev/null 2>&1; then
+        shred -u -- "$@" 2>/dev/null && return 0
+    fi
+    rm -P -f -- "$@" 2>/dev/null || rm -f -- "$@" 2>/dev/null || true
+}
+
+wipe_tree() {
+    [ -d "$1" ] || return 0
+    find "$1" -type f -print0 2>/dev/null | while IFS= read -r -d "" victim; do wipe "$victim"; done
+}
+
 [ $# -eq 3 ] || usage
 ARTEFACT=$1
 IDENTITY_IN=$2
@@ -61,7 +90,7 @@ WORK=$(mktemp -d "${RAMDIR:-${TMPDIR:-/tmp}}/veotrex-vault-verify.XXXXXXXX") \
 [ -n "$RAMDIR" ] || log "NOTE: no RAM-backed directory found; plaintext will touch disk and is shredded on exit"
 chmod 0700 -- "$WORK"
 cleanup() {
-    find "$WORK" -type f -exec shred -u -- {} + 2>/dev/null || true
+    wipe_tree "$WORK"
     rm -rf -- "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -80,14 +109,14 @@ age -d -i "$IDENTITY" -o "$WORK/key" -- "$ARTEFACT" \
 [ -s "$WORK/key" ] || fail "decryption produced an empty file"
 
 # --- 2. it is the key the VPS is running ------------------------------------------------------
-ACTUAL=$(sha256sum < "$WORK/key" | cut -c1-16)
+ACTUAL=$(digest < "$WORK/key" | cut -c1-16)
 [ "$ACTUAL" = "$EXPECTED" ] \
     || fail "fingerprint mismatch: expected $EXPECTED, recovered $ACTUAL - this is not the live key"
 
 # --- 3. it is structurally a 32-byte AEAD key -------------------------------------------------
 if tr -d '[:space:]' < "$WORK/key" | LC_ALL=C grep -qE '^[0-9a-fA-F]{64}$'; then
     KEY_FORM=hex
-elif [ "$(tr -d '[:space:]' < "$WORK/key" | base64 -d 2>/dev/null | wc -c)" -eq 32 ]; then
+elif [ "$(tr -d '[:space:]' < "$WORK/key" | openssl base64 -d -A 2>/dev/null | wc -c)" -eq 32 ]; then
     KEY_FORM=base64
 else
     fail "recovered key is neither 64 hex characters nor 32 base64-decoded bytes"

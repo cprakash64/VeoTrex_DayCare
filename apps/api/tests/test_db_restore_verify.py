@@ -9,6 +9,7 @@ cleanup. The real container runs on the operator's machine.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -145,6 +146,7 @@ def test_a_good_archive_qualifies(workspace: Path) -> None:
     assert "RLS_POLICIES=14" in output
     assert "RLS_ENABLED_TABLES=14" in output
     assert "RESTORE_ERROR_LINES=0" in output
+    assert re.search(r"bytes=\d+", output), "the decrypted size is part of the evidence"
 
 
 def test_the_restore_target_is_isolated(workspace: Path) -> None:
@@ -240,3 +242,94 @@ def test_it_refuses_to_run_on_the_deployment_host(workspace: Path) -> None:
     status, output = _run(workspace, VEOTREX_ENV_FILE=str(marker))
     assert "this is the deployment host" in output
     assert status != 0
+
+
+# ------------------------------------------------------- the operator's machine may not be Linux
+# The trusted machine in this deployment is macOS, where sha256sum, shred and `stat -c` do not
+# exist. That is not a hypothetical: the first attempt to run this verifier there would have died
+# partway through a recovery rehearsal. The case below removes those tools from PATH entirely.
+MACOS_LIKE_TOOLS = (
+    "base64",
+    "basename",
+    "cat",
+    "chmod",
+    "cut",
+    "dirname",
+    "find",
+    "grep",
+    "head",
+    "mktemp",
+    "rm",
+    "sed",
+    "seq",
+    "shasum",
+    "sleep",
+    "sort",
+    "stat",
+    "tail",
+    "tr",
+    "wc",
+    "env",
+)
+
+
+@pytest.fixture
+def bsd_workspace(workspace: Path) -> Path:
+    """A PATH with BSD-ish tooling only: shasum instead of sha256sum, and no shred at all."""
+    lean = workspace / "leanbin"
+    lean.mkdir()
+    for tool in MACOS_LIKE_TOOLS:
+        resolved = shutil.which(tool)
+        if resolved is None:
+            pytest.skip(f"{tool} is unavailable on this machine")
+        (lean / tool).symlink_to(resolved)
+    for stub in ("docker", "age"):
+        (lean / stub).symlink_to(workspace / "bin" / stub)
+    # BSD stat has no -c. Translating -f %z onto the real stat makes the difference real rather
+    # than notional, so a script that reaches for GNU syntax fails here the way it would there.
+    bsd_stat = lean / "stat"
+    bsd_stat.unlink(missing_ok=True)
+    bsd_stat.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  -c) echo "stat: illegal option -- c" >&2; exit 1 ;;\n'
+        '  -f) shift 2; exec /usr/bin/stat -c %s "$@" ;;\n'
+        "esac\n"
+        'exec /usr/bin/stat "$@"\n'
+    )
+    bsd_stat.chmod(0o755)
+    return workspace
+
+
+def test_it_runs_where_sha256sum_and_shred_do_not_exist(bsd_workspace: Path) -> None:
+    archive = bsd_workspace / "veotrex-daycare-20260917T013302Z.dump.age"
+    lean = bsd_workspace / "leanbin"
+    assert shutil.which("sha256sum", path=str(lean)) is None, "the fixture must hide sha256sum"
+    assert shutil.which("shred", path=str(lean)) is None, "the fixture must hide shred"
+
+    environment = {
+        "PATH": str(lean),
+        "HOME": str(bsd_workspace),
+        "STUB_LOG": str(bsd_workspace / "docker.log"),
+        "VEOTREX_ENV_FILE": str(bsd_workspace / "absent.env"),
+    }
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(  # noqa: S603 - resolved interpreter, fixed argv, no shell
+        [
+            bash,
+            str(VERIFY),
+            str(archive),
+            str(bsd_workspace / "db-backup-recovery.txt.age"),
+            _sha256(archive),
+        ],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    assert "DB_RESTORE_VERIFY=QUALIFIED" in output, output
+    assert re.search(r"bytes=\d+", output), "file size must resolve without GNU stat"
+    assert result.returncode == 0

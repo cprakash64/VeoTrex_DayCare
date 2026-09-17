@@ -25,6 +25,35 @@ say()  { printf '%s\n' "$*"; }
 fail() { printf 'FAILED: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n--- %s ---\n' "$*"; }
 
+# --- portability ------------------------------------------------------------------------------
+# This runs on the operator's own machine, which may be macOS. GNU coreutils are not a given
+# there: sha256sum, shred and `stat -c` do not exist, and /dev/shm is Linux-only. The handful of
+# tools that differ are resolved once, here, instead of being assumed and failing halfway through
+# a recovery rehearsal.
+if command -v sha256sum >/dev/null 2>&1; then
+    digest() { sha256sum | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    digest() { shasum -a 256 | cut -d' ' -f1; }
+else
+    echo "FAILED: neither sha256sum nor shasum is available" >&2; exit 1
+fi
+
+file_size() { stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1"; }
+
+# Overwrite where the platform can, remove either way. macOS has no shred; rm -P is its analogue.
+wipe() {
+    [ $# -gt 0 ] || return 0
+    if command -v shred >/dev/null 2>&1; then
+        shred -u -- "$@" 2>/dev/null && return 0
+    fi
+    rm -P -f -- "$@" 2>/dev/null || rm -f -- "$@" 2>/dev/null || true
+}
+
+wipe_tree() {
+    [ -d "$1" ] || return 0
+    find "$1" -type f -print0 2>/dev/null | while IFS= read -r -d "" victim; do wipe "$victim"; done
+}
+
 [ $# -eq 3 ] || fail "usage: $0 <archive.age> <wrapped-identity.age> <expected-sha256>"
 ARCHIVE=$1
 IDENTITY_IN=$2
@@ -42,7 +71,7 @@ do
     fi
 done
 
-for tool in "$DOCKER" age sha256sum shred; do
+for tool in "$DOCKER" age; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required on this machine"
 done
 [ -r "$ARCHIVE" ]     || fail "archive is unreadable: $ARCHIVE"
@@ -62,14 +91,14 @@ VOLUME="veotrex-restore-$SUFFIX"
 cleanup() {
     "$DOCKER" rm -f -- "$CONTAINER" >/dev/null 2>&1 || true
     "$DOCKER" volume rm -f -- "$VOLUME" >/dev/null 2>&1 || true
-    find "$WORK" -type f -exec shred -u -- {} + 2>/dev/null || true
+    wipe_tree "$WORK"
     rm -rf -- "$WORK"
 }
 trap cleanup EXIT INT TERM
 
 # --- 1. the bytes are the bytes the VPS published ---------------------------------------------
 step "1  archive integrity"
-ACTUAL_SHA=$(sha256sum < "$ARCHIVE" | cut -d' ' -f1)
+ACTUAL_SHA=$(digest < "$ARCHIVE")
 [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] ||
     fail "archive sha256 $ACTUAL_SHA does not match the value published on the VPS"
 say "ARCHIVE_SHA256=$ACTUAL_SHA  (matches)"
@@ -85,10 +114,10 @@ fi
 LC_ALL=C grep -q 'AGE-SECRET-KEY-' -- "$IDENTITY" || fail "that file is not an age private identity"
 age -d -i "$IDENTITY" -o "$WORK/dump" -- "$ARCHIVE" ||
     fail "decryption failed - this archive is NOT recoverable with this identity"
-shred -u -- "$WORK/identity" 2>/dev/null || true
+wipe "$WORK/identity"
 [ -s "$WORK/dump" ] || fail "decryption produced an empty dump"
 head -c 5 -- "$WORK/dump" | grep -q 'PGDMP' || fail "not a PostgreSQL custom-format archive"
-say "DECRYPT=ok  format=PGDMP  bytes=$(stat -c %s -- "$WORK/dump")"
+say "DECRYPT=ok  format=PGDMP  bytes=$(file_size "$WORK/dump")"
 
 # --- 3. an isolated PostgreSQL of the same version --------------------------------------------
 step "3  isolated restore target"
