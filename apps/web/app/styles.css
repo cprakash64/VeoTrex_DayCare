@@ -9,10 +9,13 @@ a { color: #9be7c7; }
 button.primary { border: 0; cursor: pointer; font: inherit; }
 button.primary:disabled { cursor: wait; opacity: .65; }
 [role="alert"] { color: #ffc4bd; }
-nav { display: flex; align-items: center; gap: 1rem; }
+nav { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
 .toolbar { display: flex; align-items: center; justify-content: space-between; }
 h2 { margin-top: 2rem; }
 .inventory-grid { display: grid; gap: 1rem; margin-top: 2rem; }
 .camera-card { border: 1px solid #245143; border-radius: .75rem; padding: 1.25rem; background: #0b211b; }
 .camera-card h2 { margin: .25rem 0; }
 .camera-card small { color: #87a99b; overflow-wrap: anywhere; }
+.secondary { display: inline-block; margin-top: 1rem; padding: .75rem 1rem; border-radius: .4rem; border: 1px solid #2f6b58; color: #9be7c7; font-weight: 600; text-decoration: none; }
+.secondary:hover { border-color: #73d6ad; }
+a:focus-visible { outline: 3px solid #73d6ad; outline-offset: 3px; }
