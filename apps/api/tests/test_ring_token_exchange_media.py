@@ -220,3 +220,27 @@ async def test_authorization_code_never_appears_in_logs(settings: Settings) -> N
     assert observed, "the transport diagnostic did not record the request"
     assert observed[-1]["media_type"] == "application/x-www-form-urlencoded"
     assert observed[-1]["status_code"] == 200
+
+
+@pytest.mark.parametrize(
+    "body",
+    [f"code={SYNTHETIC_CODE}", json.dumps({"code": SYNTHETIC_CODE})],
+)
+async def test_absent_content_type_is_genuinely_absent(settings: Settings, body: str) -> None:
+    """Guards the probe itself, not just the handler.
+
+    A client that quietly supplies a default Content-Type would turn this into a test of
+    form-encoding and leave the header-less path - the one Java's HttpClient actually produces -
+    silently uncovered. The recorded media type is asserted to be empty so that cannot happen.
+    """
+    client, stub = build(settings)
+    async with client:
+        with capture_logs() as entries:
+            response = await client.post(PATH, content=body)
+    assert response.status_code == 200, response.text
+    assert stub.received == [SYNTHETIC_CODE]
+    observed = [entry for entry in entries if entry.get("event") == "provider_request"]
+    assert observed, "the transport diagnostic did not record the request"
+    assert observed[-1]["media_type"] == "", (
+        "the request carried a Content-Type; this test was not exercising the absent-header path"
+    )
