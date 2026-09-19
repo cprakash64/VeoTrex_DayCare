@@ -29,6 +29,14 @@ from veotrex_api.encrypted_vault import (
 )
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
+from veotrex_api.request_media import (
+    JSON_MEDIA_TYPE,
+    TOKEN_EXCHANGE_MEDIA_TYPES,
+    MalformedBody,
+    UnsupportedMedia,
+    canonical_code_payload,
+    normalize_media_type,
+)
 from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientError
 from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
@@ -103,6 +111,26 @@ class RingInventoryCameraResponse(BaseModel):
 class RingWebhookResponse(BaseModel):
     accepted: bool
     duplicate: bool
+
+
+def _rewrite_as_json(request: Request, body: bytes) -> None:
+    """Present an already-read, normalised body to FastAPI as JSON.
+
+    The provider's media type has been checked against the endpoint's allowlist and its body
+    converted to the canonical payload; rewriting the scope headers lets the unchanged route
+    model remain the authority on what a valid authorization code is.
+    """
+    headers = [
+        (name, value)
+        for name, value in request.scope["headers"]
+        if name.lower() not in (b"content-type", b"content-length")
+    ]
+    headers.append((b"content-type", JSON_MEDIA_TYPE.encode()))
+    headers.append((b"content-length", str(len(body)).encode()))
+    request.scope["headers"] = headers
+    # Starlette caches Headers on first access; drop the cache so the rewrite is observable.
+    request.__dict__.pop("_headers", None)
+    request._body = body
 
 
 def _default_vault(
@@ -194,34 +222,74 @@ def create_app(
         structlog.contextvars.bind_contextvars(request_id=request_id)
         try:
             body_limit: int | None = None
-            if request.url.path == "/v1/integrations/ring/token-exchange":
+            media_type = ""
+            is_token_exchange = request.url.path == "/v1/integrations/ring/token-exchange"
+            if is_token_exchange:
                 body_limit = resolved_settings.ring_token_exchange_body_bytes
             elif request.url.path == "/v1/providers/ring/webhooks":
                 body_limit = resolved_settings.ring_webhook_body_bytes
             if body_limit is not None:
+                media_type = normalize_media_type(request.headers.get("content-type"))
+
+                def observed(status_code: int) -> Response:
+                    """Record transport facts for a refused provider request, never its body."""
+                    logger.info(
+                        "provider_request",
+                        path=request.url.path,
+                        media_type=media_type,
+                        content_length=request.headers.get("content-length"),
+                        user_agent=request.headers.get("user-agent", "")[:120],
+                        status_code=status_code,
+                    )
+                    return Response(status_code=status_code)
+
                 if request.method != "POST":
-                    return Response(status_code=status.HTTP_405_METHOD_NOT_ALLOWED)
-                content_type = request.headers.get("content-type", "").split(";", 1)[0].strip()
-                if content_type != "application/json":
-                    return Response(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+                    return observed(status.HTTP_405_METHOD_NOT_ALLOWED)
+                # A closed allowlist per endpoint. The webhook contract is unchanged; only the
+                # token exchange accepts the shapes Ring's Java client actually sends.
+                accepted = (
+                    TOKEN_EXCHANGE_MEDIA_TYPES
+                    if is_token_exchange
+                    else frozenset({"application/json"})
+                )
+                if media_type not in accepted:
+                    return observed(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
                 raw_length = request.headers.get("content-length")
                 if raw_length is not None:
                     try:
                         declared_length = int(raw_length)
                     except ValueError:
-                        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+                        return observed(status.HTTP_400_BAD_REQUEST)
                     if declared_length < 0:
-                        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+                        return observed(status.HTTP_400_BAD_REQUEST)
                     if declared_length > body_limit:
-                        return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
+                        return observed(status.HTTP_413_CONTENT_TOO_LARGE)
                 bounded_body = bytearray()
                 async for chunk in request.stream():
                     bounded_body.extend(chunk)
                     if len(bounded_body) > body_limit:
-                        return Response(status_code=status.HTTP_413_CONTENT_TOO_LARGE)
-                request._body = bytes(bounded_body)
+                        return observed(status.HTTP_413_CONTENT_TOO_LARGE)
+                if is_token_exchange:
+                    try:
+                        canonical = canonical_code_payload(media_type, bytes(bounded_body))
+                    except UnsupportedMedia:
+                        return observed(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+                    except MalformedBody:
+                        return observed(status.HTTP_422_UNPROCESSABLE_CONTENT)
+                    _rewrite_as_json(request, canonical)
+                else:
+                    request._body = bytes(bounded_body)
             response = await call_next(request)
             response.headers["x-request-id"] = request_id
+            if body_limit is not None:
+                logger.info(
+                    "provider_request",
+                    path=request.url.path,
+                    media_type=media_type,
+                    content_length=request.headers.get("content-length"),
+                    user_agent=request.headers.get("user-agent", "")[:120],
+                    status_code=response.status_code,
+                )
             return response
         finally:
             structlog.contextvars.clear_contextvars()
