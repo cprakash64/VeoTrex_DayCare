@@ -6,12 +6,21 @@ from sqlalchemy import func, select, text
 from veotrex_api.authorization import Role
 from veotrex_api.config import Settings
 from veotrex_api.db import make_engine, make_session_factory
-from veotrex_api.models import ActorIdentity, AuditEvent, RoleAssignment, TenantIdentityBinding
+from veotrex_api.models import (
+    ActorIdentity,
+    AuditEvent,
+    RoleAssignment,
+    Tenant,
+    TenantIdentityBinding,
+)
 from veotrex_api.provisioning import (
+    TENANT_CREATED,
     BootstrapOwnerRequest,
+    CreateTenantRequest,
     ProvisioningError,
     bootstrap_owner,
     change_role_assignment,
+    ensure_tenant,
     revoke_role_assignment,
 )
 
@@ -168,5 +177,67 @@ async def test_role_change_and_revocation_are_audited(settings: Settings) -> Non
             actions = set((await session.scalars(select(AuditEvent.action))).all())
             assert "authorization.role.changed" in actions
             assert "authorization.role.revoked" in actions
+    finally:
+        await engine.dispose()
+
+
+def tenant_request(tenant_id, name: str):
+    return CreateTenantRequest(tenant_id=tenant_id, name=name, request_id=f"test:{uuid4()}")
+
+
+async def test_create_tenant_is_idempotent_and_refuses_conflicts(settings: Settings) -> None:
+    """The step that must precede bootstrap_owner on a deployment with no tenants yet."""
+    engine = make_engine(settings)
+    factory = make_session_factory(engine)
+    tenant_id = uuid4()
+    name = f"Staging Daycare {uuid4().hex[:8]}"
+    try:
+        async with factory() as session, session.begin():
+            assert await ensure_tenant(session, tenant_request(tenant_id, name), dry_run=True)
+
+        async with factory() as session, session.begin():
+            assert await ensure_tenant(session, tenant_request(tenant_id, name)) is True
+
+        # Re-running the identical request changes nothing and does not raise.
+        async with factory() as session, session.begin():
+            assert await ensure_tenant(session, tenant_request(tenant_id, name)) is False
+
+        async with factory() as session:
+            created = await session.get(Tenant, tenant_id)
+            assert created is not None
+            assert created.name == name
+            assert created.status == "ACTIVE"
+            audited = await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(AuditEvent.target_id == tenant_id, AuditEvent.action == TENANT_CREATED)
+            )
+            assert audited == 1
+
+        # The same id under a different name is a mistake, not something to reconcile.
+        with pytest.raises(ProvisioningError):
+            async with factory() as session, session.begin():
+                await ensure_tenant(session, tenant_request(tenant_id, "A Different Name"))
+
+        for invalid in ("", "   ", "x" * 201):
+            with pytest.raises(ProvisioningError):
+                async with factory() as session, session.begin():
+                    await ensure_tenant(session, tenant_request(uuid4(), invalid))
+
+        # The whole point: bootstrap_owner now has an ACTIVE tenant to bind to.
+        async with factory() as session, session.begin():
+            actor_id = await bootstrap_owner(session, request(tenant_id))
+        assert actor_id is not None
+
+        async with factory() as session:
+            owners = await session.scalar(
+                select(func.count())
+                .select_from(RoleAssignment)
+                .where(
+                    RoleAssignment.tenant_id == tenant_id,
+                    RoleAssignment.role == Role.TENANT_OWNER.value,
+                )
+            )
+            assert owners == 1
     finally:
         await engine.dispose()

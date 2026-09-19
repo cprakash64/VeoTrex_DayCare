@@ -21,10 +21,18 @@ ACTOR_BINDING_CREATED = "identity.actor_binding.created"
 ROLE_ASSIGNMENT_CREATED = "authorization.role.created"
 ROLE_ASSIGNMENT_CHANGED = "authorization.role.changed"
 ROLE_ASSIGNMENT_REVOKED = "authorization.role.revoked"
+TENANT_CREATED = "identity.tenant.created"
 
 
 class ProvisioningError(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class CreateTenantRequest:
+    tenant_id: UUID
+    name: str
+    request_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,3 +225,54 @@ async def revoke_role_assignment(
         request_id=request_id,
         metadata={"role": assignment.role},
     )
+
+
+async def ensure_tenant(
+    session: AsyncSession, request: CreateTenantRequest, *, dry_run: bool = False
+) -> bool:
+    """Create one tenant, or confirm that the identical one already exists.
+
+    Returns True when a tenant was created and False when the requested one was already
+    present. Idempotency is keyed on the primary key, not the name: `tenants.name` carries
+    no unique constraint, so matching on it could silently adopt an unrelated tenant as
+    though provisioning had succeeded. Re-running with the same id and name is a no-op; the
+    same id under a different name, or a tenant that is not ACTIVE, is refused rather than
+    reconciled, because neither is safely distinguishable from a mistake.
+
+    `bootstrap_owner` requires an existing ACTIVE tenant, so this is the step that precedes
+    it on a deployment whose tenant table is still empty.
+    """
+    name = request.name.strip()
+    if not name:
+        raise ProvisioningError("tenant name must not be blank")
+    if len(name) > 200:
+        raise ProvisioningError("tenant name exceeds the permitted 200 characters")
+
+    existing = await session.get(Tenant, request.tenant_id)
+    if existing is not None:
+        if existing.name != name:
+            raise ProvisioningError("tenant id already exists under a different name")
+        if existing.status != "ACTIVE":
+            raise ProvisioningError("tenant id already exists and is not ACTIVE")
+        return False
+    if dry_run:
+        return True
+
+    # Tenant-scoped inserts run under the tenant's own RLS context, exactly as
+    # bootstrap_owner does; nothing here bypasses row level security.
+    await session.execute(
+        text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+        {"tenant_id": str(request.tenant_id)},
+    )
+    session.add(Tenant(id=request.tenant_id, name=name, status="ACTIVE"))
+    await session.flush()
+    await _audit(
+        session,
+        tenant_id=request.tenant_id,
+        actor_id=None,
+        action=TENANT_CREATED,
+        target_type="tenant",
+        target_id=request.tenant_id,
+        request_id=request.request_id,
+    )
+    return True
