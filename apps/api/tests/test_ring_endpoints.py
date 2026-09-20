@@ -78,7 +78,7 @@ async def test_token_exchange_boundary_and_unauthenticated_claim(settings: Setti
                 await client.post(
                     "/v1/integrations/ring/token-exchange",
                     content="code=x",
-                    headers={"content-type": "application/x-www-form-urlencoded"},
+                    headers={"content-type": "text/plain"},
                 )
             ).status_code == 415
             assert (

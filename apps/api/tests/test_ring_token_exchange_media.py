@@ -91,12 +91,16 @@ def test_every_accepted_shape_yields_the_same_canonical_payload(
     )
 
 
-def test_fields_beyond_the_code_are_ignored_not_rejected() -> None:
-    """An additive change on Ring's side must not break linking."""
-    document = json.dumps({"code": SYNTHETIC_CODE, "state": "x", "scope": "y"}).encode()
-    assert b"state" not in canonical_code_payload("application/json", document)
+def test_fields_beyond_the_code_are_ignored_on_converted_shapes() -> None:
+    """An additive change on Ring's side must not break the shapes we convert.
+
+    JSON is deliberately excluded: that body reaches RingTokenExchangeRequest untouched,
+    where extra="forbid" still rejects unexpected fields.
+    """
     form = f"code={SYNTHETIC_CODE}&state=x".encode()
     assert b"state" not in canonical_code_payload("application/x-www-form-urlencoded", form)
+    unlabelled = f"code={SYNTHETIC_CODE}&scope=y".encode()
+    assert b"scope" not in canonical_code_payload("", unlabelled)
 
 
 @pytest.mark.parametrize("media_type", ["text/plain", "application/xml", "multipart/form-data"])
@@ -244,3 +248,16 @@ async def test_absent_content_type_is_genuinely_absent(settings: Settings, body:
     assert observed[-1]["media_type"] == "", (
         "the request carried a Content-Type; this test was not exercising the absent-header path"
     )
+
+
+async def test_json_still_rejects_unexpected_fields(settings: Settings) -> None:
+    """The strict JSON contract predates the media-type work and is kept intact."""
+    client, stub = build(settings)
+    async with client:
+        response = await client.post(
+            PATH,
+            headers={"content-type": "application/json"},
+            content=json.dumps({"code": SYNTHETIC_CODE, "unexpected": True}),
+        )
+    assert response.status_code == 422
+    assert stub.received == []

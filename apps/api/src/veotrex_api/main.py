@@ -269,7 +269,11 @@ def create_app(
                     bounded_body.extend(chunk)
                     if len(bounded_body) > body_limit:
                         return observed(status.HTTP_413_CONTENT_TOO_LARGE)
-                if is_token_exchange:
+                if is_token_exchange and media_type != JSON_MEDIA_TYPE:
+                    # Only the shapes FastAPI cannot parse are converted. A JSON body is
+                    # left exactly as sent so RingTokenExchangeRequest keeps validating it,
+                    # extra="forbid" included: nothing observed from Ring justifies
+                    # loosening a deliberate contract.
                     try:
                         canonical = canonical_code_payload(media_type, bytes(bounded_body))
                     except UnsupportedMedia:
