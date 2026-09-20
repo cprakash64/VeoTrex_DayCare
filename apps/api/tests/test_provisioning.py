@@ -195,6 +195,24 @@ async def test_create_tenant_is_idempotent_and_refuses_conflicts(settings: Setti
         async with factory() as session, session.begin():
             assert await ensure_tenant(session, tenant_request(tenant_id, name), dry_run=True)
 
+        # A dry run must leave the table exactly as it found it, not merely return early.
+        async with factory() as session:
+            assert await session.get(Tenant, tenant_id) is None
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(Tenant).where(Tenant.id == tenant_id)
+                )
+                == 0
+            )
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEvent)
+                    .where(AuditEvent.target_id == tenant_id)
+                )
+                == 0
+            )
+
         async with factory() as session, session.begin():
             assert await ensure_tenant(session, tenant_request(tenant_id, name)) is True
 
@@ -239,5 +257,41 @@ async def test_create_tenant_is_idempotent_and_refuses_conflicts(settings: Setti
                 )
             )
             assert owners == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_create_tenant_rolls_back_completely_on_failure(settings: Settings) -> None:
+    """A transaction that fails after the insert must leave no tenant and no audit row.
+
+    ensure_tenant writes the tenant and its audit event in one transaction owned by the
+    caller. If a later step in that transaction fails, a partially provisioned tenant -
+    present but never bound to an organization or an owner - would be invisible to the
+    provisioner's own conflict checks on the next run.
+    """
+    engine = make_engine(settings)
+    factory = make_session_factory(engine)
+    tenant_id = uuid4()
+    name = f"Rollback Daycare {uuid4().hex[:8]}"
+    try:
+        with pytest.raises(RuntimeError, match="induced"):
+            async with factory() as session, session.begin():
+                assert await ensure_tenant(session, tenant_request(tenant_id, name)) is True
+                raise RuntimeError("induced failure after the insert")
+
+        async with factory() as session:
+            assert await session.get(Tenant, tenant_id) is None
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEvent)
+                    .where(AuditEvent.target_id == tenant_id)
+                )
+                == 0
+            )
+
+        # The id is still free, so provisioning can simply be retried.
+        async with factory() as session, session.begin():
+            assert await ensure_tenant(session, tenant_request(tenant_id, name)) is True
     finally:
         await engine.dispose()
