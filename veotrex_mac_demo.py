@@ -14,9 +14,14 @@ Press Q or ESC to quit.
 from __future__ import annotations
 
 import argparse
+import json
+import queue
 import sys
+import threading
 import time
+import urllib.request
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 PERSON_CLASS_ID = 0  # COCO class 0 is "person"; nothing else is detected or drawn.
@@ -31,6 +36,54 @@ PANEL = (21, 31, 7)
 TEXT = (239, 244, 232)
 MUTED = (166, 179, 147)
 MAX_CONSECUTIVE_READ_FAILURES = 30
+TELEMETRY_URL = "http://127.0.0.1:8765/telemetry"
+
+
+class TelemetryPublisher:
+    """Best-effort delivery off the inference thread; a missing dashboard is harmless."""
+
+    def __init__(self) -> None:
+        self.pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        self.last_sent = 0.0
+        threading.Thread(target=self._deliver, daemon=True).start()
+
+    def publish(self, people_count: int, tracked_count: int, fps: float | None) -> None:
+        now = time.monotonic()
+        if now - self.last_sent < 0.2:
+            return
+        self.last_sent = now
+        payload = {
+            "camera_id": "classroom-demo",
+            "camera_name": "Classroom Demo",
+            "camera_status": "live",
+            "ai_status": "active",
+            "people_count": people_count,
+            "tracked_count": tracked_count,
+            "fps": round(fps, 1) if fps is not None else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self.pending.put_nowait(payload)
+        except queue.Full:
+            try:
+                self.pending.get_nowait()
+            except queue.Empty:
+                pass
+            self.pending.put_nowait(payload)
+
+    def _deliver(self) -> None:
+        while True:
+            payload = self.pending.get()
+            request = urllib.request.Request(
+                TELEMETRY_URL,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(request, timeout=0.3).close()
+            except (OSError, ValueError):
+                pass
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -210,6 +263,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     supports_tracking = True
+    publisher = TelemetryPublisher()
     smoothed_fps: float | None = None
     failures = 0
     window_created = False
@@ -262,6 +316,11 @@ def run(args: argparse.Namespace) -> int:
                     instant if smoothed_fps is None else (smoothed_fps * 0.85 + instant * 0.15)
                 )
             draw_overlay(cv2, frame, people, smoothed_fps)
+            publisher.publish(
+                len(people),
+                sum(track_id is not None for _, _, track_id in people),
+                smoothed_fps,
+            )
 
             cv2.imshow(WINDOW_TITLE, frame)
             window_created = True

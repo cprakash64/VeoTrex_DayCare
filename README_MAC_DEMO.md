@@ -55,6 +55,35 @@ Camera 1: AVAILABLE - 1920x1080
 python3 veotrex_mac_demo.py --camera 0
 ```
 
+## Live room dashboard (local customer demo)
+
+Use two terminals from this repository. In Terminal 1, with `.venv-demo` activated:
+
+```bash
+python3 veotrex_mac_demo.py --camera 0 --imgsz 416
+```
+
+In Terminal 2:
+
+```bash
+python3 demo_dashboard.py
+```
+
+Open **http://127.0.0.1:8765**. The dashboard binds only to `127.0.0.1` and uses
+in-memory state. The camera sends person count, tracked count, measured FPS, status and
+timestamp to that local process. A missing dashboard never stops camera inference.
+
+The count must remain at a new value for at least 0.6 seconds of telemetry before it
+becomes stable. Only stable count changes produce entry or exit events. Up to ten recent
+events are retained. If telemetry stops for 2.5 seconds, the dashboard reports camera
+unavailable and hides the occupancy value until data resumes. Restarting the dashboard
+clears its in-memory count and activity.
+
+This page follows the existing VeoTrex dashboard styling but runs separately because the
+owner dashboard requires Auth0 and a configured production API identity. No production
+credentials or database are needed for this local customer demo. The number is a detected
+person count within the camera frame; it is not doorway direction tracking.
+
 ## 7. Run — iPhone / alternate camera
 
 ```bash
