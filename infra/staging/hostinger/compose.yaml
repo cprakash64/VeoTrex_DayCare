@@ -86,6 +86,12 @@ services:
       VEOTREX_RING_CLIENT_SECRET_REF: file:/run/secrets/ring_client_secret
       VEOTREX_RING_HMAC_SIGNING_KEY_REF: file:/run/secrets/ring_hmac_signing_key
       VEOTREX_RING_CLIENT_ID: ${VEOTREX_RING_CLIENT_ID:-replace-with-ring-client-id}
+      # Optional, off by default. When set, ONLY requests to the Ring API base URL leave
+      # through this proxy; Ring OAuth token exchange and every other outbound request stay
+      # direct. An empty value (the default) is treated as unset, so this line is inert
+      # until the variable is given a value. Deliberately NOT HTTPS_PROXY: that would also
+      # capture Auth0/JWKS and Ring OAuth.
+      VEOTREX_RING_API_PROXY_URL: ${VEOTREX_RING_API_PROXY_URL:-}
     secrets:
       - database_url
       - vault_master_key

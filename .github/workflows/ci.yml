@@ -108,7 +108,24 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    # The workflow-level `contents: read` sets every other scope to none. On a
+    # pull_request event gitleaks-action reads GET /pulls/{n}/commits to derive the
+    # scan range, and that call is not error-handled, so it needs pull-requests
+    # read. Posting inline findings would need write, but the action already
+    # catches a failure there and warns; the scan verdict does not depend on it.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
-      - uses: gitleaks/gitleaks-action@v2
+      # v3 is the Node 24 runtime release - Node 20 left GitHub-hosted runners on
+      # 2026-09-16. Inputs, outputs and behaviour are identical to v2.
+      #
+      # GITHUB_TOKEN is the token GitHub generates per run; nothing is stored. Without
+      # it the action exits before scanning anything on a pull_request, which is not a
+      # clean scan but a scan that never happened. No GITLEAKS_LICENSE: it is required
+      # for organizations only, and this repository belongs to a user account.
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,6 +8,7 @@ from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import httpx
 from pydantic import SecretStr
+from socksio.exceptions import SOCKSError
 
 from veotrex_api.config import Settings
 from veotrex_api.ring_inventory import (
@@ -18,6 +19,12 @@ from veotrex_api.ring_inventory import (
     parse_inventory_page,
 )
 from veotrex_api.secrets import SecretResolver
+
+# A request that dies inside the optional Ring API proxy never reached Ring, so it is the same
+# outcome as any other transport failure. HTTPCORE's own proxy errors already arrive as
+# httpx.ProxyError, but a malformed SOCKS reply surfaces as a raw socksio error that would
+# otherwise escape this client's error contract. socksio is a declared dependency (httpx[socks]).
+_TRANSPORT_FAILURES = (httpx.TimeoutException, httpx.TransportError, SOCKSError)
 
 
 class RingClientError(Exception):
@@ -48,6 +55,7 @@ class RingClient:
         http_client: httpx.AsyncClient | None = None,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_value: Callable[[], float] = random.random,
+        api_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings
         self._secrets = secret_resolver
@@ -63,14 +71,42 @@ class RingClient:
             write=settings.ring_write_timeout_seconds,
             pool=settings.ring_connect_timeout_seconds,
         )
-        self._http = http_client or httpx.AsyncClient(
-            timeout=timeout,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        )
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        self._http = http_client or httpx.AsyncClient(timeout=timeout, limits=limits)
+        # Requests to the configured Ring API origin may leave through a separate client so an
+        # optional egress proxy applies to them and to nothing else - Ring OAuth token exchange
+        # keeps using ``self._http`` and stays direct. With no proxy configured the two names
+        # refer to one client, which is exactly the single-pool behaviour that existed before.
+        # An injected client is always honoured as-is for every request: it is the caller's
+        # explicit transport, and re-routing part of it through a proxy would defeat that.
+        self._api_http = self._http
+        self._owns_api_client = False
+        if api_http_client is not None:
+            self._api_http = api_http_client
+        elif http_client is None and settings.ring_api_proxy_url:
+            self._api_http = httpx.AsyncClient(
+                timeout=timeout, limits=limits, proxy=settings.ring_api_proxy_url
+            )
+            self._owns_api_client = True
 
     async def aclose(self) -> None:
+        if self._owns_api_client:
+            await self._api_http.aclose()
         if self._owns_client:
             await self._http.aclose()
+
+    def _client_for(self, url: str) -> httpx.AsyncClient:
+        """Pick the transport for ``url``: the Ring API client only for the Ring API origin.
+
+        Routing on the resolved origin rather than on the call site means a future Ring API
+        call cannot forget to opt in, and a non-Ring URL cannot accidentally opt in either.
+        """
+        if self._api_http is self._http:
+            return self._http
+        parsed = urlparse(url)
+        if (parsed.scheme, parsed.hostname or "", parsed.port) == self._expected_api_origin():
+            return self._api_http
+        return self._http
 
     def _client_secret(self) -> str:
         return self._secrets.resolve(self._settings.ring_client_secret_ref).get_secret_value()
@@ -87,10 +123,10 @@ class RingClient:
         json_body: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         try:
-            response = await self._http.request(
+            response = await self._client_for(url).request(
                 method, url, headers=headers, data=data, json=json_body
             )
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except _TRANSPORT_FAILURES as exc:
             error_type = RingAmbiguousResult if ambiguous_on_transport_failure else RingClientError
             raise error_type(operation, "transport_failure") from exc
         if len(response.content) > self._settings.ring_max_response_bytes:
@@ -234,12 +270,12 @@ class RingClient:
                 # This gate is deliberately process-wide for this Ring client: the documented
                 # quota belongs to the partner client_id, not to an individual tenant.
                 async with self._read_gate:
-                    response = await self._http.get(url, headers=self._bearer(token))
+                    response = await self._client_for(url).get(url, headers=self._bearer(token))
                 self.rate_limit_limit = self._nonnegative_header(response, "x-ratelimit-limit")
                 self.rate_limit_remaining = self._nonnegative_header(
                     response, "x-ratelimit-remaining"
                 )
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
+            except _TRANSPORT_FAILURES as exc:
                 if attempt + 1 == attempts:
                     raise RingClientError(operation, "transport_failure") from exc
             else:
