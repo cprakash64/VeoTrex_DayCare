@@ -1,13 +1,20 @@
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_prefix="VEOTREX_", extra="ignore", case_sensitive=False
+        env_file=".env",
+        env_prefix="VEOTREX_",
+        extra="ignore",
+        case_sensitive=False,
+        # Only ``ring_api_proxy_url`` carries an explicit alias; without this, that one field
+        # could no longer be set by its own name from application or test code.
+        populate_by_name=True,
     )
 
     environment: str = Field(min_length=1)
@@ -28,6 +35,21 @@ class Settings(BaseSettings):
     oidc_clock_skew_seconds: int = Field(default=30, ge=0, le=300)
     ring_oauth_token_url: str = "https://oauth.ring.com/oauth/token"  # noqa: S105 (public URL)
     ring_api_base_url: str = "https://api.amazonvision.com"
+    # Optional egress proxy for Ring API (control-plane) requests ONLY - never Ring OAuth token
+    # exchange, never Auth0/JWKS, never any other outbound traffic. Temporary unblocker for a
+    # deployment whose direct network path to ``ring_api_base_url`` is rejected upstream while
+    # the identical request succeeds from another egress. Unset (the default) leaves every
+    # request going out directly, exactly as before.
+    #
+    # Accepted as VEOTREX_RING_API_PROXY_URL (the repository convention) and, because the proxy
+    # is provisioned under that name, as a bare RING_API_PROXY_URL. Held ``repr=False``: a proxy
+    # URL may carry credentials in other deployments, so it must not reach a log through a
+    # settings repr.
+    ring_api_proxy_url: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices("VEOTREX_RING_API_PROXY_URL", "RING_API_PROXY_URL"),
+    )
     ring_client_id: str = "replace-with-ring-client-id"
     ring_client_secret_ref: str = Field(default="env:RING_CLIENT_SECRET", repr=False)
     ring_hmac_signing_key_ref: str = Field(default="env:RING_HMAC_SIGNING_KEY", repr=False)
@@ -106,6 +128,35 @@ class Settings(BaseSettings):
         if not value.startswith("https://"):
             raise ValueError("Ring endpoints must use HTTPS")
         return value
+
+    @field_validator("ring_api_proxy_url", mode="before")
+    @classmethod
+    def ring_api_proxy_url_must_be_a_supported_proxy(cls, value: Any) -> str | None:
+        """Reject an unusable proxy at startup rather than at the first Ring API call.
+
+        An empty or whitespace-only value means "unset", so an env var left blank behaves the
+        same as one that was never set. Error messages describe the shape only and never echo
+        the configured value, which may carry proxy credentials.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Ring API proxy URL must be a string")
+        candidate = value.strip()
+        if not candidate:
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme not in {"socks5", "socks5h", "http", "https"}:
+            raise ValueError("Ring API proxy URL must use socks5, socks5h, http or https")
+        if not parsed.hostname:
+            raise ValueError("Ring API proxy URL must include a host")
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Ring API proxy URL has an out-of-range port") from None
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("Ring API proxy URL has an out-of-range port")
+        return candidate
 
     @property
     def oidc_algorithms(self) -> tuple[str, ...]:
