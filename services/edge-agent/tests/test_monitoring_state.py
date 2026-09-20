@@ -194,6 +194,10 @@ def snapshot(**overrides: object) -> PipelineSnapshot:
         "seconds_since_last_frame": 0.1,
         "media_timestamp_seconds": 2.0,
         "source_error_category": None,
+        "peak_occupancy": 2,
+        "tracks_observed": 2,
+        "longest_track_seconds": 0.6,
+        "session_seconds": 1.0,
         "events": (),
     }
     return PipelineSnapshot(**(base | overrides))  # type: ignore[arg-type]

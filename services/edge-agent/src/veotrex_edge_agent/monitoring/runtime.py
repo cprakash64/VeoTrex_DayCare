@@ -97,6 +97,8 @@ def main() -> None:
         area=settings.area_label,
         source_kind=str(pipeline.snapshot().source_kind),
     )
+    # Printed plainly, not only as a log field: this is the line the operator copies.
+    print(f"OWNER_DEMO_URL=http://{settings.bind_host}:{settings.bind_port}/owner-demo", flush=True)
     try:
         stopping.wait()
     finally:

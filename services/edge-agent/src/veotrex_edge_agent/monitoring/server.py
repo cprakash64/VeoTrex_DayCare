@@ -17,6 +17,7 @@ from typing import Any
 
 import structlog
 
+from veotrex_edge_agent.monitoring.owner_demo import OWNER_DEMO_HTML
 from veotrex_edge_agent.monitoring.pipeline import MonitoringPipeline, PipelineSnapshot
 
 BOUNDARY = "veotrexframe"
@@ -60,6 +61,29 @@ def snapshot_payload(snapshot: PipelineSnapshot) -> dict[str, Any]:
     }
 
 
+def owner_status_payload(snapshot: PipelineSnapshot) -> dict[str, Any]:
+    """Flat telemetry for the owner page. No identity, no paths, no configuration values."""
+    occupancy = snapshot.occupancy
+    measured = occupancy.certainty is occupancy.certainty.MEASURED
+    return {
+        "source": str(snapshot.source_kind),
+        "is_live": snapshot.source_kind is not snapshot.source_kind.RECORDED_DEMO,
+        "area": snapshot.area_label,
+        "coverage": str(occupancy.coverage),
+        # Null rather than zero whenever the count is not measured.
+        "occupancy": occupancy.people_detected if measured else None,
+        "active_tracks": snapshot.active_track_count,
+        "peak_occupancy": snapshot.peak_occupancy,
+        "tracks_observed": snapshot.tracks_observed,
+        "longest_track_seconds": snapshot.longest_track_seconds,
+        "session_seconds": snapshot.session_seconds,
+        "fps": snapshot.measured_fps,
+        "inference_latency_ms": snapshot.inference_latency_ms,
+        "frames_processed": snapshot.frames_processed,
+        "events": [asdict(event) | {"kind": str(event.kind)} for event in snapshot.events],
+    }
+
+
 class MonitoringRequestHandler(BaseHTTPRequestHandler):
     server_version = "VeoTrexDemoRuntime"
     sys_version = ""
@@ -74,6 +98,10 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
             self._json({"status": "ok"})
         elif route == "/state":
             self._json(snapshot_payload(self.pipeline.snapshot()))
+        elif route == "/api/demo/status":
+            self._json(owner_status_payload(self.pipeline.snapshot()))
+        elif route in ("/owner-demo", "/owner-demo/", "/"):
+            self._html(OWNER_DEMO_HTML)
         elif route == "/stream.mjpg":
             self._stream()
         else:
@@ -86,6 +114,15 @@ class MonitoringRequestHandler(BaseHTTPRequestHandler):
             self._json({"status": "restarted"})
         else:
             self._json({"error": "not_found"}, status=404)
+
+    def _html(self, markup: str) -> None:
+        body = markup.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json(self, payload: dict[str, Any], *, status: int = 200) -> None:
         body = json.dumps(payload).encode()

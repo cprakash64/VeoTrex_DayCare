@@ -30,6 +30,10 @@ class SafetyEventKind(StrEnum):
     MONITORING_COVERAGE_RESTORED = "MONITORING_COVERAGE_RESTORED"
     DEMO_THRESHOLD_EXCEEDED = "DEMO_THRESHOLD_EXCEEDED"
     DEMO_THRESHOLD_CLEARED = "DEMO_THRESHOLD_CLEARED"
+    TRACK_STARTED = "TRACK_STARTED"
+    TRACK_ENDED = "TRACK_ENDED"
+    OCCUPANCY_CHANGED = "OCCUPANCY_CHANGED"
+    PEAK_OCCUPANCY = "PEAK_OCCUPANCY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,16 @@ class SessionEventLog:
     def events(self) -> tuple[SafetyEvent, ...]:
         """Newest first, which is the order a timeline reads in."""
         return tuple(reversed(self._events))
+
+    def record(
+        self,
+        kind: SafetyEventKind,
+        reading: OccupancyReading,
+        *,
+        duration: float | None = None,
+    ) -> SafetyEvent:
+        """Append an event the pipeline observed directly, such as a track appearing."""
+        return self._record(kind, reading, duration)
 
     def observe(self, reading: OccupancyReading) -> tuple[SafetyEvent, ...]:
         emitted: list[SafetyEvent] = []

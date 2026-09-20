@@ -24,7 +24,7 @@ from numpy.typing import NDArray
 from veotrex_edge_agent.frame_source.recorded_video import RecordedVideoSource
 from veotrex_edge_agent.frame_source.source import SourceFrame, SourceHealth, SourceKind
 from veotrex_edge_agent.image_pipeline import PixelFormat
-from veotrex_edge_agent.monitoring.events import SafetyEvent, SessionEventLog
+from veotrex_edge_agent.monitoring.events import SafetyEvent, SafetyEventKind, SessionEventLog
 from veotrex_edge_agent.monitoring.occupancy import (
     CoverageState,
     DemoStaffingPolicy,
@@ -73,6 +73,11 @@ class PipelineSnapshot:
     seconds_since_last_frame: float | None
     media_timestamp_seconds: float | None
     source_error_category: str | None
+    # Session aggregates. Counted from real tracker output over the life of the process.
+    peak_occupancy: int
+    tracks_observed: int
+    longest_track_seconds: float | None
+    session_seconds: float
     events: tuple[SafetyEvent, ...]
 
 
@@ -118,6 +123,11 @@ class MonitoringPipeline:
         self._media_timestamp: float | None = None
         self._last_reading: OccupancyReading | None = None
         self._failure_category: str | None = None
+        self._peak_occupancy = 0
+        self._observed_track_ids: set[int] = set()
+        self._confirmed_track_ids: set[int] = set()
+        self._longest_track_seconds: float | None = None
+        self._started_at = clock()
 
     # ---- lifecycle ----------------------------------------------------------------
 
@@ -188,6 +198,10 @@ class MonitoringPipeline:
                 seconds_since_last_frame=None if since is None else round(since, 2),
                 media_timestamp_seconds=self._media_timestamp,
                 source_error_category=self._failure_category or status.last_error_category,
+                peak_occupancy=self._peak_occupancy,
+                tracks_observed=len(self._observed_track_ids),
+                longest_track_seconds=self._longest_track_seconds,
+                session_seconds=round(now - self._started_at, 1),
                 events=self._events.events(),
             )
 
@@ -258,6 +272,32 @@ class MonitoringPipeline:
             )
             self._last_reading = reading
             self._events.observe(reading)
+            self._record_track_lifecycle(tracking, reading)
+
+    def _record_track_lifecycle(self, tracking: Any, reading: OccupancyReading) -> None:
+        """Real track appearances and disappearances, plus session aggregates.
+
+        Called with the lock held. Every number here comes from the tracker: a track that
+        started is one the tracker confirmed, not a heuristic over detections.
+        """
+        confirmed = {track.track_id for track in tracking.confirmed_tracks}
+        for track_id in sorted(confirmed - self._confirmed_track_ids):
+            self._observed_track_ids.add(track_id)
+            self._events.record(SafetyEventKind.TRACK_STARTED, reading)
+        for _ in sorted(self._confirmed_track_ids - confirmed):
+            self._events.record(SafetyEventKind.TRACK_ENDED, reading)
+        previous_count = len(self._confirmed_track_ids)
+        self._confirmed_track_ids = confirmed
+        for track in tracking.confirmed_tracks:
+            age = float(track.age_seconds)
+            if self._longest_track_seconds is None or age > self._longest_track_seconds:
+                self._longest_track_seconds = round(age, 1)
+        people = len(confirmed)
+        if people != previous_count:
+            self._events.record(SafetyEventKind.OCCUPANCY_CHANGED, reading)
+        if people > self._peak_occupancy:
+            self._peak_occupancy = people
+            self._events.record(SafetyEventKind.PEAK_OCCUPANCY, reading)
 
 
 def _detection(item: object) -> PersonDetection | None:
