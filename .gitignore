@@ -42,3 +42,7 @@ dist/
 data/demo/*
 !data/demo/.gitkeep
 !data/demo/README.md
+
+# Ultralytics model weights for the macOS demo. Downloaded on first run, never committed:
+# the production detector is a TensorRT engine, not a .pt file.
+*.pt

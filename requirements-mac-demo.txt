@@ -1,0 +1,15 @@
+# Dependencies for the isolated macOS live camera demo only.
+#
+# Deliberately separate from the production dependency set: the control plane and the edge
+# agent are managed by uv through pyproject.toml/uv.lock and must not be disturbed by an
+# Ultralytics/PyTorch install on a demo laptop.
+#
+#   python3 -m venv .venv-demo
+#   source .venv-demo/bin/activate
+#   pip install -r requirements-mac-demo.txt
+#
+# PyTorch arrives transitively through ultralytics; on Apple Silicon the default wheel
+# already carries MPS support, so no extra index or pin is needed.
+
+ultralytics>=8.3.0
+opencv-python>=4.9.0
