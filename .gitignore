@@ -36,3 +36,9 @@ artifacts/models/candidates/
 artifacts/validation/
 dist/
 *.egg-info/
+
+# Locally supplied demonstration footage. Recordings of real children must never be
+# committed; keep them on the machine that plays them. See docs/demo/daycare-owner-demo.md.
+data/demo/*
+!data/demo/.gitkeep
+!data/demo/README.md

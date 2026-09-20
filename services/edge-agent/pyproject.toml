@@ -5,6 +5,10 @@ description = "Hardware-neutral VeoTrex edge runtime skeleton"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "numpy==2.4.6",
+  # JPEG decode and detection-overlay drawing for the recorded-video demo source. Already
+  # pinned at this version in the qualification group; promoted to a runtime dependency
+  # because the demo runtime needs it outside the offline harness.
+  "pillow==12.3.0",
   "pydantic-settings==2.10.1",
   "scipy==1.18.1",
   "structlog==25.4.0",
@@ -13,6 +17,7 @@ dependencies = [
 [project.scripts]
 veotrex-edge-agent = "veotrex_edge_agent.main:main"
 veotrex-edge = "veotrex_edge_agent.qualification.cli:main"
+veotrex-demo-runtime = "veotrex_edge_agent.monitoring.runtime:main"
 
 [build-system]
 requires = ["hatchling"]

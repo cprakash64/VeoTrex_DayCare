@@ -1009,6 +1009,7 @@ version = "0.1.0"
 source = { editable = "services/edge-agent" }
 dependencies = [
     { name = "numpy" },
+    { name = "pillow" },
     { name = "pydantic-settings" },
     { name = "scipy" },
     { name = "structlog" },
@@ -1022,6 +1023,7 @@ qualification = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = "==2.4.6" },
+    { name = "pillow", specifier = "==12.3.0" },
     { name = "pydantic-settings", specifier = "==2.10.1" },
     { name = "scipy", specifier = "==1.18.1" },
     { name = "structlog", specifier = "==25.4.0" },

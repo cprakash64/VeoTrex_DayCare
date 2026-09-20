@@ -1,30 +1,16 @@
 import { redirect } from "next/navigation";
 
 import { auth0 } from "../../lib/auth0";
+import { fetchMonitoringStatus } from "../../lib/demo-runtime";
 import { protectedRouteRedirect } from "../../lib/session-policy";
-import { getApplicationIdentity } from "../../lib/veotrex-api";
+import { SafetyOperations } from "./monitoring-view";
 
-export default async function ApplicationShell() {
-  const session = await auth0.getSession();
-  const destination = protectedRouteRedirect(session);
-  if (destination) {
-    redirect(destination);
-  }
-  const identity = await getApplicationIdentity();
+export const dynamic = "force-dynamic";
 
-  return (
-    <main>
-      <header className="toolbar">
-        <p className="eyebrow">VeoTrex</p>
-        <a href="/auth/logout">Log out</a>
-      </header>
-      <h1>Safety operations</h1>
-      <p>Signed in as {identity.display_name ?? "authorized member"}.</p>
-      <section aria-labelledby="access-heading">
-        <h2 id="access-heading">Your access</h2>
-        <p>{identity.roles.map(({ role }) => role.replaceAll("_", " ")).join(", ")}</p>
-      </section>
-      <a className="primary" href="/app/integrations/ring/devices">View Ring device inventory</a>
-    </main>
-  );
+export default async function OverviewPage() {
+  const destination = protectedRouteRedirect(await auth0.getSession());
+  if (destination) redirect(destination);
+  // Rendered server-side first so the page is never blank, then kept current by polling.
+  const initial = await fetchMonitoringStatus();
+  return <SafetyOperations initial={initial} />;
 }
