@@ -10,14 +10,13 @@ import threading
 import urllib.request
 
 import pytest
+from test_monitoring_pipeline import StubDetector, StubSource
 
 from veotrex_edge_agent.frame_source.source import SourceHealth
 from veotrex_edge_agent.monitoring.occupancy import CoverageState
 from veotrex_edge_agent.monitoring.owner_demo import OWNER_DEMO_HTML
 from veotrex_edge_agent.monitoring.pipeline import MonitoringPipeline
 from veotrex_edge_agent.monitoring.server import make_server, owner_status_payload
-
-from test_monitoring_pipeline import StubDetector, StubSource
 
 BOX = [(10.0, 10.0, 60.0, 170.0), (120.0, 10.0, 170.0, 170.0)]
 
@@ -114,9 +113,20 @@ def test_the_payload_carries_no_identity_or_configuration(served) -> None:
     _, body = get(f"{base}/api/demo/status")
     payload = json.loads(body)
     assert set(payload) == {
-        "source", "is_live", "area", "coverage", "occupancy", "active_tracks",
-        "peak_occupancy", "tracks_observed", "longest_track_seconds", "session_seconds",
-        "fps", "inference_latency_ms", "frames_processed", "events",
+        "source",
+        "is_live",
+        "area",
+        "coverage",
+        "occupancy",
+        "active_tracks",
+        "peak_occupancy",
+        "tracks_observed",
+        "longest_track_seconds",
+        "session_seconds",
+        "fps",
+        "inference_latency_ms",
+        "frames_processed",
+        "events",
     }
 
 

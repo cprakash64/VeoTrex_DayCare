@@ -41,6 +41,8 @@ from veotrex_edge_agent.tracking import (
 )
 
 FPS_WINDOW = 30
+# Bounded per-track path history. Old points fall off the left; expired tracks are dropped.
+TRAIL_POINTS = 26
 
 
 class Detector(Protocol):
@@ -127,6 +129,7 @@ class MonitoringPipeline:
         self._observed_track_ids: set[int] = set()
         self._confirmed_track_ids: set[int] = set()
         self._longest_track_seconds: float | None = None
+        self._trails: dict[int, deque[tuple[float, float]]] = {}
         self._started_at = clock()
 
     # ---- lifecycle ----------------------------------------------------------------
@@ -225,6 +228,10 @@ class MonitoringPipeline:
                     break
                 self._process(frame)
         except Exception as exc:
+            if self._stop.is_set():
+                # Closing the decoder pipe out from under an in-flight read is how a normal
+                # shutdown looks from in here. It is not a fault worth showing an operator.
+                return
             category = getattr(exc, "category", type(exc).__name__)
             with self._lock:
                 self._failure_category = str(category)
@@ -248,7 +255,13 @@ class MonitoringPipeline:
             source_width=frame.width,
             source_height=frame.height,
         )
-        annotated = annotate(frame.rgb, tracking.confirmed_tracks, jpeg_quality=self._jpeg_quality)
+        trails = self._update_trails(tracking.confirmed_tracks)
+        annotated = annotate(
+            frame.rgb,
+            tracking.confirmed_tracks,
+            trails=trails,
+            jpeg_quality=self._jpeg_quality,
+        )
         now = self._clock()
         timing = inference.get("image_timing") or {}
         latency = timing.get("decoded_frame_to_detection_ms")
@@ -273,6 +286,29 @@ class MonitoringPipeline:
             self._last_reading = reading
             self._events.observe(reading)
             self._record_track_lifecycle(tracking, reading)
+
+    def _update_trails(
+        self, tracks: tuple[TrackView, ...]
+    ) -> dict[int, tuple[tuple[float, float], ...]]:
+        """Append each confirmed track's real centre-bottom point; drop expired tracks.
+
+        Bounded twice over: each path holds at most TRAIL_POINTS points, and the dictionary
+        only ever holds ids the tracker is currently confirming, so nothing survives a track
+        ending or leaks across sessions.
+        """
+        live = {track.track_id for track in tracks}
+        for track_id in list(self._trails):
+            if track_id not in live:
+                del self._trails[track_id]
+        for track in tracks:
+            x1, _, x2, y2 = track.bbox_xyxy_source
+            point = ((float(x1) + float(x2)) / 2.0, float(y2))
+            path = self._trails.get(track.track_id)
+            if path is None:
+                path = deque(maxlen=TRAIL_POINTS)
+                self._trails[track.track_id] = path
+            path.append(point)
+        return {track_id: tuple(path) for track_id, path in self._trails.items()}
 
     def _record_track_lifecycle(self, tracking: Any, reading: OccupancyReading) -> None:
         """Real track appearances and disappearances, plus session aggregates.

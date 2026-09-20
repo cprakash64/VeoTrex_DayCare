@@ -67,6 +67,12 @@ h1{margin:0;font-size:1.65rem;line-height:1.15;letter-spacing:-.015em}
 .kpi .v{margin-top:5px;font-size:1.9rem;font-weight:650;font-variant-numeric:tabular-nums;
   line-height:1.05}
 .kpi .v.unk{font-size:1.5rem;color:var(--unknown)}
+.kpi.bump{animation:bump .42s ease-out}
+@keyframes bump{
+  0%{background:rgba(109,224,178,.16)}
+  100%{background:var(--surface-2)}
+}
+@media (prefers-reduced-motion:reduce){.kpi.bump{animation:none}}
 .rows{display:flex;flex-direction:column;gap:11px}
 .row2{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .row2 .k{color:var(--muted);font-size:.88rem}
@@ -74,12 +80,12 @@ h1{margin:0;font-size:1.65rem;line-height:1.15;letter-spacing:-.015em}
   border-top:1px solid var(--line);color:var(--faint);font-size:.76rem;
   font-variant-numeric:tabular-nums}
 .act{list-style:none;margin:0;padding:0;max-height:212px;overflow-y:auto}
-.act li{display:grid;grid-template-columns:70px minmax(0,1fr);gap:12px;padding:9px 0;
-  border-top:1px solid var(--line)}
+.act li{display:grid;grid-template-columns:78px minmax(0,1fr);gap:14px;padding:10px 0;
+  border-top:1px solid var(--line);align-items:baseline}
 .act li:first-child{border-top:0;padding-top:0}
-.t{color:var(--faint);font-size:.78rem;font-variant-numeric:tabular-nums}
-.ti{font-weight:600;font-size:.9rem}
-.tm{color:var(--muted);font-size:.8rem;margin-top:2px}
+.t{color:var(--faint);font-size:.78rem;font-variant-numeric:tabular-nums;line-height:1.35}
+.ti{display:block;font-weight:600;font-size:.9rem;line-height:1.35}
+.tm{display:block;color:var(--muted);font-size:.8rem;margin-top:3px;line-height:1.35}
 .empty{color:var(--muted);font-size:.9rem}
 .empty strong{display:block;color:var(--text);margin-bottom:3px}
 .note{margin:13px 0 0;padding:9px 11px;border-radius:8px;font-size:.78rem;line-height:1.5;
@@ -136,7 +142,7 @@ h1{margin:0;font-size:1.65rem;line-height:1.15;letter-spacing:-.015em}
     <section class="card">
       <h2>Classroom status</h2>
       <div class="kpis">
-        <div class="kpi"><div class="k">Current occupancy</div>
+        <div class="kpi" id="occ-card"><div class="k">Current occupancy</div>
           <div class="v" id="occ">--</div></div>
         <div class="kpi"><div class="k">Active tracks</div><div class="v" id="act-n">--</div></div>
         <div class="kpi"><div class="k">Peak occupancy</div><div class="v" id="peak">--</div></div>
@@ -178,6 +184,7 @@ var TITLES = {
   DEMO_THRESHOLD_EXCEEDED: "Occupancy threshold exceeded",
   DEMO_THRESHOLD_CLEARED: "Occupancy threshold cleared"
 };
+var lastOccupancy = "init";
 function el(id){return document.getElementById(id)}
 function txt(id,v){el(id).textContent=v}
 // Absence renders as an em dash. Never as zero, never as a plausible placeholder.
@@ -206,6 +213,13 @@ function render(s){
 
   if(measured){ txt("occ",String(s.occupancy)); el("occ").className="v"; }
   else { txt("occ","\\u2014"); el("occ").className="v unk"; }
+  if(s.occupancy !== lastOccupancy){
+    lastOccupancy = s.occupancy;
+    var card = el("occ-card");
+    card.classList.remove("bump");
+    void card.offsetWidth;   // restart the animation
+    card.classList.add("bump");
+  }
   if(s.active_tracks!==null&&s.active_tracks!==undefined){
     txt("act-n",String(s.active_tracks)); el("act-n").className="v";
   } else { txt("act-n","\\u2014"); el("act-n").className="v unk"; }

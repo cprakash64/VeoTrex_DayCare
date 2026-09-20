@@ -218,3 +218,84 @@ def test_malformed_detections_are_dropped_rather_than_crashing(bad: object) -> N
     from veotrex_edge_agent.monitoring.pipeline import _detection
 
     assert _detection(bad) is None
+
+
+def test_trails_follow_real_track_positions_and_stay_bounded() -> None:
+    """Trail points are tracker positions; the history is capped and expired ids are dropped."""
+    from veotrex_edge_agent.monitoring.pipeline import TRAIL_POINTS
+
+    source = StubSource(TRAIL_POINTS + 12)
+    pipeline = MonitoringPipeline(
+        source,  # type: ignore[arg-type]
+        StubDetector([(10.0, 10.0, 60.0, 170.0)]),
+        area_label="Demo Classroom",
+        camera_label="Demo Camera",
+    )
+    for frame in source.frames():
+        pipeline._process(frame)
+    (track_id,) = pipeline._trails
+    path = pipeline._trails[track_id]
+    assert len(path) == TRAIL_POINTS, "history must be bounded"
+    # Centre-bottom of the stub box: ((10+60)/2, 170).
+    assert path[-1] == (35.0, 170.0)
+
+    # A track that stops being confirmed loses its trail rather than lingering.
+    pipeline._update_trails(())
+    assert pipeline._trails == {}
+
+
+def test_the_label_carries_a_track_id_and_dwell_but_no_identity() -> None:
+    rgb = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    track = TrackView(
+        stream_instance_id="stub",
+        track_id=7,
+        state=TrackState.CONFIRMED,
+        bbox_xyxy_source=(10.0, 20.0, 80.0, 200.0),
+        latest_detection_score=0.9,
+        first_seen_timestamp=0.0,
+        last_seen_timestamp=12.0,
+        age_seconds=12.0,
+        observation_count=20,
+        consecutive_misses=0,
+        was_low_score_recovery=False,
+    )
+    payload = annotate(rgb, (track,), trails={7: ((20.0, 200.0), (45.0, 200.0), (60.0, 195.0))})
+    assert payload.startswith(b"\xff\xd8\xff") and payload.endswith(b"\xff\xd9")
+
+
+def test_a_single_point_trail_is_drawn_without_error() -> None:
+    rgb = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    track = TrackView(
+        stream_instance_id="stub",
+        track_id=1,
+        state=TrackState.CONFIRMED,
+        bbox_xyxy_source=(10.0, 20.0, 80.0, 200.0),
+        latest_detection_score=0.9,
+        first_seen_timestamp=0.0,
+        last_seen_timestamp=0.1,
+        age_seconds=0.1,
+        observation_count=2,
+        consecutive_misses=0,
+        was_low_score_recovery=False,
+    )
+    assert annotate(rgb, (track,), trails={1: ((45.0, 200.0),)}).startswith(b"\xff\xd8\xff")
+
+
+def test_a_requested_stop_is_not_reported_as_a_pipeline_failure() -> None:
+    """Closing the decoder pipe mid-read is what shutdown looks like, not a fault."""
+
+    class ClosingSource(StubSource):
+        def frames(self) -> Any:
+            raise ValueError("read of closed file")
+            yield  # pragma: no cover
+
+    source = ClosingSource(0)
+    pipeline = MonitoringPipeline(
+        source,  # type: ignore[arg-type]
+        StubDetector([]),
+        area_label="Demo Classroom",
+        camera_label="Demo Camera",
+    )
+    pipeline._stop.set()
+    pipeline._run()
+    assert pipeline.snapshot().source_error_category is None
