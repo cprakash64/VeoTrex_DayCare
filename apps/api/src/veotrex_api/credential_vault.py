@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -19,6 +19,11 @@ class CredentialContext:
     provider: str
     owner_kind: str
     owner_id: UUID
+    # The tenant on whose behalf the operation runs, when one is known. It is the RLS context the
+    # production vault presents to PostgreSQL so the credential functions can authorize the
+    # caller; it is deliberately excluded from equality, because the binding of a credential is
+    # (provider, owner_kind, owner_id) and pre-tenant operations carry no tenant at all.
+    tenant_id: UUID | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

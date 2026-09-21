@@ -123,7 +123,9 @@ for p in (pw_path, url_path):
 PY
 ```
 
-Then provision the role (idempotent; safe to re-run after every migration):
+Migration 0006 must be applied first (`--profile migrate run --rm migrate`, step 2 of the
+deploy order): it creates the vault functions the runtime role is granted. Then provision the
+role (idempotent; safe and *required* to re-run after every migration):
 
 ```bash
 cd /srv/veotrex-daycare/repo/infra/staging/hostinger

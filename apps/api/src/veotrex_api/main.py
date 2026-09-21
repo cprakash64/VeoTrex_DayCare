@@ -208,8 +208,7 @@ def create_app(
             logger.error(
                 "database_role_privileged",
                 role=exc.identity.role,
-                superuser=exc.identity.superuser,
-                bypassrls=exc.identity.bypass_rls,
+                violations=list(exc.identity.violations),
             )
             raise
         except SQLAlchemyError:
@@ -352,8 +351,7 @@ def create_app(
                 dependency="database",
                 reason=reason,
                 role=exc.identity.role,
-                superuser=exc.identity.superuser,
-                bypassrls=exc.identity.bypass_rls,
+                violations=list(exc.identity.violations),
             )
         except SQLAlchemyError:
             health_status = "not_ready"

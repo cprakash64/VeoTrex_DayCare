@@ -1,4 +1,6 @@
-"""V1-00A acceptance: the API runtime role is real, restricted, idempotently provisioned, and
+# ruff: noqa: S608 - test SQL interpolates fixed module-level identifiers only, never input
+"""V1-00A / V1-00A-R1 acceptance: the API runtime role is real, restricted, idempotently
+provisioned, converges from an over-privileged state, fails closed for every new object, and
 Row Level Security actually constrains it.
 
 Unit tests need no database. Database-backed tests use ``admin_settings`` (cluster admin) only
@@ -27,12 +29,12 @@ from veotrex_api.db import (
 )
 from veotrex_api.models import Base
 from veotrex_api.runtime_role import (
-    DEFAULT_TABLE_PRIVILEGES,
     RUNTIME_FUNCTION_GRANTS,
-    RUNTIME_TABLE_GRANTS,
-    RUNTIME_TABLES_WITHOUT_ACCESS,
+    TABLE_CLASSIFICATION,
     RuntimeRoleError,
     SchemaInventory,
+    TableAccess,
+    TableClassification,
     _normalise_signature,
     apply_plan,
     build_plan,
@@ -46,28 +48,46 @@ from veotrex_api.runtime_role import (
     verify,
 )
 
+INSUFFICIENT_PRIVILEGE = "42501"
+SYNTHETIC_VERIFIER = "SCRAM-SHA-256$4096:AA$BB:CC"
+
 # --------------------------------------------------------------------------------------- unit
 
 
 def test_every_orm_table_is_classified_exactly_once() -> None:
     """A migration that adds a table must make an explicit privilege decision for the runtime
-    role. Unclassified tables would otherwise silently receive default privileges forever."""
-    granted = {grant.table for grant in RUNTIME_TABLE_GRANTS}
-    assert not granted & RUNTIME_TABLES_WITHOUT_ACCESS
+    role. This is the CI gate: an unclassified ORM table fails here before it can ship."""
     orm_tables = set(Base.metadata.tables) | {"alembic_version"}
-    assert granted | RUNTIME_TABLES_WITHOUT_ACCESS == orm_tables
+    assert set(TABLE_CLASSIFICATION) == orm_tables
+    for table, entry in TABLE_CLASSIFICATION.items():
+        assert isinstance(entry.access, TableAccess), table
+        assert entry.reason, table
 
 
-def test_runtime_never_holds_delete_on_a_tenant_table_or_writes_to_audit() -> None:
+def test_classification_semantics_are_explicit() -> None:
     tenant_tables = {
         name for name, table in Base.metadata.tables.items() if "tenant_id" in table.columns
     }
-    for grant in RUNTIME_TABLE_GRANTS:
-        if grant.table in tenant_tables:
-            assert "DELETE" not in grant.privileges, grant.table
-    audit = next(grant for grant in RUNTIME_TABLE_GRANTS if grant.table == "audit_events")
-    assert audit.privileges == {"SELECT", "INSERT"}
-    assert "DELETE" not in DEFAULT_TABLE_PRIVILEGES
+    for table, entry in TABLE_CLASSIFICATION.items():
+        if entry.access in (TableAccess.FUNCTION_ONLY, TableAccess.RUNTIME_NO_ACCESS):
+            assert not entry.privileges, table
+        if table in tenant_tables:
+            assert "DELETE" not in entry.privileges, table
+    assert TABLE_CLASSIFICATION["encrypted_credentials"].access is TableAccess.FUNCTION_ONLY
+    assert TABLE_CLASSIFICATION["ring_webhook_inbox"].access is TableAccess.FUNCTION_ONLY
+    assert TABLE_CLASSIFICATION["ring_pending_links"].access is TableAccess.FUNCTION_ONLY
+    assert TABLE_CLASSIFICATION["tenant_identity_bindings"].access is TableAccess.FUNCTION_ONLY
+    assert TABLE_CLASSIFICATION["alembic_version"].access is TableAccess.RUNTIME_NO_ACCESS
+    assert TABLE_CLASSIFICATION["audit_events"].privileges == {"SELECT", "INSERT"}
+    assert TABLE_CLASSIFICATION["cameras"].privileges == {"SELECT", "INSERT", "UPDATE"}
+    assert TABLE_CLASSIFICATION["tenants"].privileges == {"SELECT"}
+    with pytest.raises(ValueError, match="explicit privilege set"):
+        TableClassification(TableAccess.RUNTIME_WRITE)
+    with pytest.raises(ValueError, match="implies exactly"):
+        TableClassification(TableAccess.RUNTIME_READ, frozenset({"SELECT", "DELETE"}))
+    with pytest.raises(ValueError, match="unknown privileges"):
+        TableClassification(TableAccess.RUNTIME_WRITE, frozenset({"TRUNCATE"}))
+    assert "vault_credential_authorized" not in " ".join(RUNTIME_FUNCTION_GRANTS)
 
 
 def test_scram_verifier_shape_and_determinism() -> None:
@@ -125,50 +145,63 @@ def _inventory(**overrides: object) -> SchemaInventory:
 
 def test_plan_refuses_unmigrated_schema_and_self_owned_runtime() -> None:
     with pytest.raises(RuntimeRoleError, match="missing tables"):
-        build_plan(_inventory(tables=frozenset({"tenants"})), password_verifier="x")  # noqa: S106
+        build_plan(_inventory(tables=frozenset({"tenants"})), password_verifier=SYNTHETIC_VERIFIER)
     with pytest.raises(RuntimeRoleError, match="missing functions"):
-        build_plan(_inventory(functions=frozenset()), password_verifier="x")  # noqa: S106
+        build_plan(_inventory(functions=frozenset()), password_verifier=SYNTHETIC_VERIFIER)
     with pytest.raises(RuntimeRoleError, match="cannot also be the migration role"):
-        build_plan(_inventory(), role="veotrex_test", password_verifier="x")  # noqa: S106
+        build_plan(_inventory(), role="veotrex_test", password_verifier=SYNTHETIC_VERIFIER)
     with pytest.raises(RuntimeRoleError, match="password reference is required"):
         build_plan(_inventory())
     with pytest.raises(RuntimeRoleError, match="plain identifier"):
-        build_plan(_inventory(), role="drop role; --", password_verifier="x")  # noqa: S106
+        build_plan(_inventory(), role="drop role; --", password_verifier=SYNTHETIC_VERIFIER)
 
 
-def test_plan_renders_without_credentials_and_converges() -> None:
+def test_plan_never_grants_by_default_and_revokes_unclassified_objects() -> None:
     plan = build_plan(
-        _inventory(),
-        password_verifier="SCRAM-SHA-256$4096:AA$BB:CC",  # noqa: S106 - synthetic
+        _inventory(
+            tables=frozenset(Base.metadata.tables) | {"alembic_version", "future_sensitive_table"},
+            functions=frozenset(RUNTIME_FUNCTION_GRANTS) | {"zz_future_fn()"},
+            sequences=frozenset({"zz_future_seq"}),
+        ),
+        password_verifier=SYNTHETIC_VERIFIER,
     )
     rendered = plan.render()
     assert "CREATE ROLE" in rendered and "NOBYPASSRLS" in rendered and "NOINHERIT" in rendered
-    assert "SCRAM-SHA-256$4096" not in rendered
-    assert "statement withheld" in rendered
+    assert "SCRAM-SHA-256$4096" not in rendered and "statement withheld" in rendered
     assert 'GRANT CONNECT ON DATABASE "veotrex_test"' in rendered
-    assert 'REVOKE ALL ON SCHEMA "public"' in rendered
     assert "GRANT USAGE ON SCHEMA" in rendered and "GRANT CREATE" not in rendered
     assert 'GRANT SELECT ON TABLE "public"."tenants"' in rendered
     assert 'GRANT INSERT, SELECT ON TABLE "public"."audit_events"' in rendered
-    assert 'REVOKE ALL ON TABLE "public"."ring_webhook_inbox"' in rendered
+    assert 'REVOKE ALL ON TABLE "public"."encrypted_credentials"' in rendered
+    assert 'GRANT SELECT ON TABLE "public"."encrypted_credentials"' not in rendered
+    assert "UNCLASSIFIED" in rendered
+    assert 'REVOKE ALL ON TABLE "public"."future_sensitive_table"' in rendered
+    assert 'GRANT SELECT ON TABLE "public"."future_sensitive_table"' not in rendered
+    assert 'REVOKE ALL ON FUNCTION "public"."zz_future_fn"()' in rendered
+    assert 'REVOKE ALL ON SEQUENCE "public"."zz_future_seq"' in rendered
+    # No ALTER DEFAULT PRIVILEGES ... GRANT anywhere: nothing is handed out automatically.
+    for line in rendered.splitlines():
+        if line.startswith("ALTER DEFAULT PRIVILEGES"):
+            assert "GRANT" not in line, line
+    assert 'REVOKE ALL ON TABLES FROM "veotrex_api"' in rendered
     assert (
-        "ALTER DEFAULT PRIVILEGES" in rendered
-        and "GRANT SELECT, INSERT, UPDATE ON TABLES" in rendered
+        'ALTER DEFAULT PRIVILEGES FOR ROLE "veotrex_test" REVOKE ALL ON FUNCTIONS FROM PUBLIC'
+        in rendered
     )
-    assert "REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC" in rendered
-    assert "ALL PRIVILEGES" not in rendered and "BYPASSRLS" not in rendered.replace(
-        "NOBYPASSRLS", ""
-    )
+    assert "ALL PRIVILEGES" not in rendered
     existing = build_plan(_inventory(role_exists=True))
     assert "ALTER ROLE" in existing.render() and "CREATE ROLE" not in existing.render()
     assert "PASSWORD" not in existing.render()
 
 
-def test_guard_rejects_privileged_identities_without_leaking_dsn() -> None:
+def test_guard_rejects_every_escape_hatch_without_leaking_dsn() -> None:
     require_unprivileged(DatabaseRoleIdentity("veotrex_api", False, False))
     for identity in (
         DatabaseRoleIdentity("veotrex", True, False),
         DatabaseRoleIdentity("bypass", False, True),
+        DatabaseRoleIdentity("creator", False, False, schema_create=True),
+        DatabaseRoleIdentity("owner", False, False, owned_relations=2),
+        DatabaseRoleIdentity("member", False, False, role_memberships=1),
     ):
         with pytest.raises(PrivilegedDatabaseRole) as raised:
             require_unprivileged(identity)
@@ -189,20 +222,33 @@ def test_cli_refuses_without_a_url(
 # ---------------------------------------------------------------------------- database-backed
 
 
-def _admin(settings: Settings) -> psycopg.Connection[tuple[object, ...]]:
+def _connect(settings: Settings) -> psycopg.Connection[tuple[object, ...]]:
     return psycopg.connect(psycopg_dsn(settings.database_url.get_secret_value()), autocommit=False)
 
 
-def test_runtime_role_attributes_and_ownership(
+def _refused(connection: psycopg.Connection[tuple[object, ...]], statement: str) -> str:
+    """Run ``statement`` in its own transaction; return the SQLSTATE it was refused with."""
+    try:
+        with connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(statement)  # type: ignore[arg-type]
+    except psycopg.Error as exc:
+        return exc.sqlstate or "unknown"
+    return "succeeded"
+
+
+def _restore_production_model(
+    admin: psycopg.Connection[tuple[object, ...]], runtime_role_name: str
+) -> None:
+    apply_plan(admin, build_plan(inspect_schema(admin, runtime_role_name), role=runtime_role_name))
+    admin.commit()
+
+
+def test_runtime_role_attributes_ownership_and_membership(
     admin_settings: Settings, runtime_role_name: str
 ) -> None:
-    with _admin(admin_settings) as connection:
+    with _connect(admin_settings) as connection:
         attributes = role_attributes(connection, runtime_role_name)
-        assert attributes.can_login
-        assert attributes.restricted
-        assert not attributes.superuser and not attributes.bypass_rls
-        assert not attributes.create_role and not attributes.create_db
-        assert not attributes.replication and not attributes.inherit
+        assert attributes.can_login and attributes.restricted
         assert verify(connection, role=runtime_role_name) == []
         with connection.cursor() as cursor:
             cursor.execute(
@@ -210,19 +256,17 @@ def test_runtime_role_attributes_and_ownership(
                 "(SELECT oid FROM pg_roles WHERE rolname = %s)",
                 (runtime_role_name,),
             )
-            assert (cursor.fetchone() or (1,))[0] == 0, "runtime role must belong to no role"
+            assert (cursor.fetchone() or (1,))[0] == 0
             cursor.execute(
-                "SELECT relname, pg_get_userbyid(relowner), relrowsecurity, relforcerowsecurity "
-                "FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'"
+                "SELECT has_schema_privilege(%s, 'public', 'CREATE')", (runtime_role_name,)
             )
-            for table, owner, rls, force in cursor.fetchall():
-                assert owner != runtime_role_name, table
-                if (
-                    "tenant_id"
-                    in Base.metadata.tables.get(str(table), Base.metadata.tables["tenants"]).columns
-                    and table != "tenant_identity_bindings"
-                ):
-                    assert rls and force, table
+            assert (cursor.fetchone() or (True,))[0] is False
+            cursor.execute(
+                "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace "
+                "AND pg_get_userbyid(c.relowner) = %s",
+                (runtime_role_name,),
+            )
+            assert (cursor.fetchone() or (1,))[0] == 0
 
 
 def test_bootstrap_is_idempotent_and_never_touches_the_password_unasked(
@@ -247,13 +291,13 @@ def test_bootstrap_is_idempotent_and_never_touches_the_password_unasked(
             )
             routine_grants = tuple(cursor.fetchall())
             cursor.execute(
-                "SELECT defaclobjtype, defaclacl::text FROM pg_default_acl "
-                "WHERE defaclnamespace = 'public'::regnamespace ORDER BY 1"
+                "SELECT defaclnamespace, defaclobjtype, defaclacl::text FROM pg_default_acl "
+                "ORDER BY 1, 2"
             )
             defaults = tuple(cursor.fetchall())
         return (password_hash, table_grants, routine_grants, defaults)
 
-    with _admin(admin_settings) as connection:
+    with _connect(admin_settings) as connection:
         before = snapshot(connection)
         assert before[0] is not None and str(before[0][0]).startswith("SCRAM-SHA-256$")
         inventory = inspect_schema(connection, runtime_role_name)
@@ -266,54 +310,199 @@ def test_bootstrap_is_idempotent_and_never_touches_the_password_unasked(
         assert verify(connection, role=runtime_role_name) == []
 
 
-def test_default_privileges_apply_to_future_tables_and_functions_of_the_migration_role(
-    admin_settings: Settings, runtime_role_name: str
+def test_apply_converges_an_over_privileged_role_down_to_the_allow_list(
+    admin_settings: Settings,
 ) -> None:
-    """The migration role creates a table and a function; the runtime role must be able to use
-    the table without any GRANT and must NOT be able to execute the function."""
-    with _admin(admin_settings) as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT current_user")
-        assert (cursor.fetchone() or ("",))[0] == inspect_schema(
-            connection, runtime_role_name
-        ).connected_role
+    """An old deployment may carry broad grants and the V1-00A table default. apply must strip
+    them, including direct CRUD on encrypted_credentials, not merely add what is missing."""
+    role = "veotrex_api_overpriv_test"
+    with _connect(admin_settings) as connection:
+        owner = inspect_schema(connection, role).connected_role
+        with connection.transaction(), connection.cursor() as cursor:
+            cursor.execute(f"DROP ROLE IF EXISTS {role}")
+            cursor.execute(f"CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS")
+            cursor.execute(f"GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role}")
+            cursor.execute(f"GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO {role}")
+            cursor.execute(f"GRANT CREATE ON SCHEMA public TO {role}")
+            cursor.execute(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public "
+                f"GRANT SELECT, INSERT, UPDATE ON TABLES TO {role}"
+            )
+            cursor.execute(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public "
+                f"GRANT USAGE ON SEQUENCES TO {role}"
+            )
         try:
-            cursor.execute("CREATE TABLE public.zz_default_probe (id int)")
-            cursor.execute(
-                "CREATE FUNCTION public.zz_default_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'"
-            )
-            for privilege, expected in (
-                ("SELECT", True),
-                ("INSERT", True),
-                ("UPDATE", True),
-                ("DELETE", False),
-            ):
+            problems = verify(connection, role=role)
+            assert any("encrypted_credentials: DELETE is granted" in p for p in problems)
+            assert any("can CREATE" in p for p in problems)
+            assert any("default privileges grant the runtime role" in p for p in problems)
+            assert any("vault_credential_authorized" in p and "granted" in p for p in problems)
+            plan = build_plan(inspect_schema(connection, role), role=role)
+            apply_plan(connection, plan)
+            connection.commit()
+            assert verify(connection, role=role) == []
+            with connection.cursor() as cursor:
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    cursor.execute(
+                        "SELECT has_table_privilege(%s, 'public.encrypted_credentials', %s)",
+                        (role, privilege),
+                    )
+                    assert (cursor.fetchone() or (True,))[0] is False, privilege
                 cursor.execute(
-                    "SELECT has_table_privilege(%s, 'public.zz_default_probe', %s)",
-                    (runtime_role_name, privilege),
+                    "SELECT count(*) FROM pg_default_acl WHERE defaclacl::text LIKE %s",
+                    (f"%{role}=%",),
                 )
-                assert (cursor.fetchone() or (None,))[0] is expected, privilege
-            cursor.execute(
-                "SELECT has_function_privilege(%s, 'public.zz_default_fn()', 'EXECUTE')",
-                (runtime_role_name,),
-            )
-            assert (cursor.fetchone() or (True,))[0] is False
-            cursor.execute(
-                "SELECT has_function_privilege('public', 'public.zz_default_fn()', 'EXECUTE')"
-            )
-            assert (cursor.fetchone() or (True,))[0] is False
+                assert (cursor.fetchone() or (1,))[0] == 0
         finally:
-            connection.rollback()
+            with connection.transaction(), connection.cursor() as cursor:
+                cursor.execute(f"DROP OWNED BY {role}")
+                cursor.execute(f"DROP ROLE IF EXISTS {role}")
+
+
+def test_future_table_is_inaccessible_until_classified(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """Mandatory fail-closed check: a table the migration role creates is unreachable to the
+    runtime for every privilege, and becomes reachable only for the privileges a deliberate
+    classification grants."""
+    table = "future_sensitive_table"
+    with _connect(admin_settings) as admin:
+        with admin.transaction(), admin.cursor() as cursor:
+            cursor.execute(f"DROP TABLE IF EXISTS public.{table}")
+            cursor.execute(f"CREATE TABLE public.{table} (id int PRIMARY KEY, secret text)")
+            cursor.execute(f"INSERT INTO public.{table} VALUES (1, 'synthetic')")
+        try:
+            with _connect(settings) as runtime:
+                for statement in (
+                    f"SELECT * FROM public.{table}",
+                    f"INSERT INTO public.{table} VALUES (2, 'x')",
+                    f"UPDATE public.{table} SET secret = 'y'",
+                    f"DELETE FROM public.{table}",
+                ):
+                    assert _refused(runtime, statement) == INSUFFICIENT_PRIVILEGE, statement
+            problems = verify(admin, role=runtime_role_name)
+            assert f"table {table}: unclassified" in problems
+            # Deliberate classification: read-only. Only SELECT appears.
+            classified = dict(TABLE_CLASSIFICATION)
+            classified[table] = TableClassification(
+                TableAccess.RUNTIME_READ, frozenset({"SELECT"}), "test"
+            )
+            plan = build_plan(
+                inspect_schema(admin, runtime_role_name),
+                role=runtime_role_name,
+                classification=classified,
+            )
+            apply_plan(admin, plan)
+            admin.commit()
+            with _connect(settings) as runtime:
+                with runtime.transaction(), runtime.cursor() as cursor:
+                    cursor.execute(f"SELECT count(*) FROM public.{table}")
+                    assert (cursor.fetchone() or (0,))[0] == 1
+                for statement in (
+                    f"INSERT INTO public.{table} VALUES (3, 'x')",
+                    f"UPDATE public.{table} SET secret = 'y'",
+                    f"DELETE FROM public.{table}",
+                ):
+                    assert _refused(runtime, statement) == INSUFFICIENT_PRIVILEGE, statement
+            assert verify(admin, role=runtime_role_name, classification=classified) == []
+        finally:
+            with admin.transaction(), admin.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS public.{table}")
+            _restore_production_model(admin, runtime_role_name)
+
+
+def test_future_function_is_inaccessible_until_allowed(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    function = "zz_future_fn"
+    with _connect(admin_settings) as admin:
+        with admin.transaction(), admin.cursor() as cursor:
+            cursor.execute(
+                f"CREATE OR REPLACE FUNCTION public.{function}() RETURNS int "
+                "LANGUAGE sql SECURITY DEFINER AS 'SELECT 42'"
+            )
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT has_function_privilege('public', 'public.{function}()', 'EXECUTE')"
+                )
+                assert (cursor.fetchone() or (True,))[0] is False, "PUBLIC must not execute"
+                cursor.execute(
+                    f"SELECT has_function_privilege(%s, 'public.{function}()', 'EXECUTE')",
+                    (runtime_role_name,),
+                )
+                assert (cursor.fetchone() or (True,))[0] is False, "runtime must not execute"
+            with _connect(settings) as runtime:
+                assert _refused(runtime, f"SELECT public.{function}()") == INSUFFICIENT_PRIVILEGE
+            plan = build_plan(
+                inspect_schema(admin, runtime_role_name),
+                role=runtime_role_name,
+                function_grants=(*RUNTIME_FUNCTION_GRANTS, f"{function}()"),
+            )
+            apply_plan(admin, plan)
+            admin.commit()
+            with _connect(settings) as runtime, runtime.transaction(), runtime.cursor() as cursor:
+                cursor.execute(f"SELECT public.{function}()")
+                assert (cursor.fetchone() or (0,))[0] == 42
+        finally:
+            with admin.transaction(), admin.cursor() as cursor:
+                cursor.execute(f"DROP FUNCTION IF EXISTS public.{function}()")
+            _restore_production_model(admin, runtime_role_name)
+
+
+def test_future_sequence_is_inaccessible_until_allowed(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    sequence = "zz_future_seq"
+    with _connect(admin_settings) as admin:
+        with admin.transaction(), admin.cursor() as cursor:
+            cursor.execute(f"CREATE SEQUENCE public.{sequence}")
+        try:
+            with admin.cursor() as cursor:
+                for privilege in ("USAGE", "SELECT", "UPDATE"):
+                    cursor.execute(
+                        f"SELECT has_sequence_privilege('public', 'public.{sequence}', %s)",
+                        (privilege,),
+                    )
+                    assert (cursor.fetchone() or (True,))[0] is False, privilege
+                    cursor.execute(
+                        f"SELECT has_sequence_privilege(%s, 'public.{sequence}', %s)",
+                        (runtime_role_name, privilege),
+                    )
+                    assert (cursor.fetchone() or (True,))[0] is False, privilege
+            with _connect(settings) as runtime:
+                assert (
+                    _refused(runtime, f"SELECT nextval('public.{sequence}')")
+                    == INSUFFICIENT_PRIVILEGE
+                )
+                assert (
+                    _refused(runtime, f"SELECT last_value FROM public.{sequence}")
+                    == INSUFFICIENT_PRIVILEGE
+                )
+            # The production plan has no sequence allow list yet: apply keeps it revoked.
+            _restore_production_model(admin, runtime_role_name)
+            assert verify(admin, role=runtime_role_name) == []
+            with _connect(settings) as runtime:
+                assert (
+                    _refused(runtime, f"SELECT nextval('public.{sequence}')")
+                    == INSUFFICIENT_PRIVILEGE
+                )
+        finally:
+            with admin.transaction(), admin.cursor() as cursor:
+                cursor.execute(f"DROP SEQUENCE IF EXISTS public.{sequence}")
 
 
 def test_probe_from_the_runtime_role_passes_every_check(
     settings: Settings, admin_settings: Settings
 ) -> None:
-    migration_role = inspect_schema(_admin(admin_settings), "unused").connected_role
-    with psycopg.connect(psycopg_dsn(settings.database_url.get_secret_value())) as connection:
+    with _connect(admin_settings) as admin:
+        migration_role = inspect_schema(admin, "unused").connected_role
+    with _connect(settings) as connection:
         results = probe(connection, migration_role=migration_role)
     failed = [result for result in results if not result.passed]
     assert not failed, [(result.check, result.detail) for result in failed]
-    assert len(results) >= 14
+    assert len(results) >= 19
 
 
 async def test_engine_guard_accepts_runtime_and_refuses_admin(
@@ -324,11 +513,58 @@ async def test_engine_guard_accepts_runtime_and_refuses_admin(
     try:
         identity = await verify_runtime_role(runtime_engine)
         assert identity.role == runtime_role_name and identity.subject_to_rls
+        assert identity.violations == ()
         with pytest.raises(PrivilegedDatabaseRole):
             await verify_runtime_role(admin_engine)
     finally:
         await runtime_engine.dispose()
         await admin_engine.dispose()
+
+
+def test_every_runtime_executable_function_is_a_safe_security_definer(
+    admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """Section 11: fixed search_path, no dynamic SQL, no PUBLIC EXECUTE, expected owner, and
+    runtime EXECUTE exactly where the allow list says."""
+    expected = {_normalise_signature(item) for item in RUNTIME_FUNCTION_GRANTS}
+    with _connect(admin_settings) as admin, admin.cursor() as cursor:
+        cursor.execute("SELECT current_user")
+        owner = str((cursor.fetchone() or ("",))[0])
+        cursor.execute(
+            "SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', "
+            "pg_get_userbyid(p.proowner), p.prosecdef, p.proconfig::text, p.prosrc, "
+            "has_function_privilege(%s, p.oid, 'EXECUTE'), "
+            "has_function_privilege('public', p.oid, 'EXECUTE'), l.lanname "
+            "FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang "
+            "WHERE p.pronamespace = 'public'::regnamespace",
+            (runtime_role_name,),
+        )
+        rows = cursor.fetchall()
+    assert rows, "no application functions found"
+    seen: set[str] = set()
+    for row in rows:
+        (
+            signature,
+            function_owner,
+            secdef,
+            config,
+            source,
+            runtime_execute,
+            public_execute,
+            language,
+        ) = row
+        normalised = _normalise_signature(str(signature))
+        seen.add(normalised)
+        assert function_owner == owner, signature
+        assert secdef is True, signature
+        assert config is not None and "search_path=pg_catalog, public" in str(config), signature
+        assert public_execute is False, signature
+        assert runtime_execute is (normalised in expected), signature
+        lowered = str(source).lower()
+        if language == "plpgsql":
+            assert "execute " not in lowered and "format(" not in lowered, signature
+        assert "set role" not in lowered and "row_security" not in lowered, signature
+    assert expected <= seen
 
 
 # ----------------------------------------------------------------------------- RLS acceptance
@@ -378,7 +614,7 @@ async def test_rls_matrix_for_the_runtime_role(
     engine = make_engine(settings)
     try:
         async with engine.connect() as connection:
-            # B. Tenant A reads A.
+            # B. Tenant A reads A, and only its own tenant row.
             async with connection.begin():
                 await _set_tenant(connection, tenant_a)
                 rows = (
@@ -391,6 +627,13 @@ async def test_rls_matrix_for_the_runtime_role(
                     )
                 ).all()
                 assert [(row.id, row.name) for row in rows] == [(connection_a, "Secret ring A")]
+                tenant_rows = (
+                    await connection.scalars(
+                        text("SELECT id FROM tenants WHERE id IN (:a, :b)"),
+                        {"a": tenant_a, "b": tenant_b},
+                    )
+                ).all()
+                assert tenant_rows == [tenant_a]
                 # C. Tenant A cannot read B, even by primary key.
                 assert (
                     await connection.scalar(
@@ -411,7 +654,7 @@ async def test_rls_matrix_for_the_runtime_role(
                         ),
                         {"id": uuid4(), "tenant_id": tenant_b},
                     )
-            assert getattr(raised.value.orig, "sqlstate", None) == "42501"
+            assert getattr(raised.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE
             # E. Tenant A cannot update B: zero rows, no error, nothing changed.
             async with connection.begin():
                 await _set_tenant(connection, tenant_a)
@@ -428,7 +671,7 @@ async def test_rls_matrix_for_the_runtime_role(
                         text("DELETE FROM camera_provider_connections WHERE id = :b"),
                         {"b": connection_b},
                     )
-            assert getattr(raised.value.orig, "sqlstate", None) == "42501"
+            assert getattr(raised.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE
             # G. Missing context fails closed: nothing visible, nothing writable.
             async with connection.begin():
                 assert (
@@ -440,6 +683,7 @@ async def test_rls_matrix_for_the_runtime_role(
                     )
                     == 0
                 )
+                assert await connection.scalar(text("SELECT count(*) FROM tenants")) == 0
             with pytest.raises(DBAPIError):
                 async with connection.begin():
                     await connection.execute(
@@ -450,7 +694,6 @@ async def test_rls_matrix_for_the_runtime_role(
                         ),
                         {"id": uuid4(), "tenant_id": tenant_a},
                     )
-        # B's row is intact and still named as seeded, as seen by the admin.
         admin_engine = make_engine(admin_settings)
         try:
             async with admin_engine.begin() as admin:
@@ -498,14 +741,12 @@ async def test_tenant_context_never_leaks_across_pooled_transactions(
             async with connection.begin():
                 await _set_tenant(connection, tenant_a)
                 assert await visible(connection) == [connection_a]
-        # Committed transaction released the connection: the next one starts clean.
         async with engine.connect() as connection:
             async with connection.begin():
                 assert await visible(connection) == []
             async with connection.begin():
                 await _set_tenant(connection, tenant_b)
                 assert await visible(connection) == [connection_b]
-        # A rolled-back transaction must not keep its tenant either.
         async with engine.connect() as connection:
             with pytest.raises(RuntimeError, match="induced"):
                 async with connection.begin():
@@ -514,7 +755,6 @@ async def test_tenant_context_never_leaks_across_pooled_transactions(
                     raise RuntimeError("induced rollback")
             async with connection.begin():
                 assert await visible(connection) == []
-        # And a transaction that ended in a database error is rolled back and clean too.
         async with engine.connect() as connection:
             with pytest.raises(DBAPIError):
                 async with connection.begin():
@@ -545,15 +785,6 @@ async def test_security_definer_surface_is_exact_and_does_not_cross_tenants(
                 ),
                 {"account": account_b, "id": connection_b},
             )
-            await admin.execute(
-                text(
-                    "CREATE OR REPLACE FUNCTION public.zz_privileged_probe() RETURNS int "
-                    "LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'"
-                )
-            )
-            await admin.execute(
-                text("REVOKE ALL ON FUNCTION public.zz_privileged_probe() FROM PUBLIC")
-            )
     finally:
         await admin_engine.dispose()
 
@@ -575,9 +806,6 @@ async def test_security_definer_surface_is_exact_and_does_not_cross_tenants(
                 )
                 expected = {item.partition("(")[0] for item in RUNTIME_FUNCTION_GRANTS}
                 assert exposed == expected
-                # The webhook resolver is global by design (a webhook has no tenant yet): it
-                # yields the connection's tenant, which the caller then sets as context; RLS
-                # still governs what that context can read.
                 resolved = (
                     await connection.execute(
                         text("SELECT * FROM resolve_ring_webhook_connection(:account)"),
@@ -593,11 +821,9 @@ async def test_security_definer_surface_is_exact_and_does_not_cross_tenants(
                     )
                     is None
                 )
-            with pytest.raises(DBAPIError) as raised:
-                async with connection.begin():
-                    await connection.execute(text("SELECT public.zz_privileged_probe()"))
-            assert getattr(raised.value.orig, "sqlstate", None) == "42501"
             for statement in (
+                "SELECT public.vault_credential_authorized"
+                "('ring_pending_link', gen_random_uuid(), 'open')",
                 "SELECT pg_reload_conf()",
                 "SELECT pg_read_file('/etc/hostname')",
                 "ALTER ROLE CURRENT_USER WITH SUPERUSER",
@@ -607,17 +833,15 @@ async def test_security_definer_surface_is_exact_and_does_not_cross_tenants(
                 "CREATE EXTENSION IF NOT EXISTS pgcrypto",
                 "ALTER TABLE public.cameras NO FORCE ROW LEVEL SECURITY",
                 "DROP POLICY tenant_isolation ON public.cameras",
+                "DROP POLICY tenant_self ON public.tenants",
                 "GRANT SELECT ON public.ring_webhook_inbox TO CURRENT_USER",
+                "GRANT SELECT ON public.encrypted_credentials TO CURRENT_USER",
             ):
                 with pytest.raises(DBAPIError) as raised:
                     async with connection.begin():
                         await connection.execute(text(statement))
-                assert getattr(raised.value.orig, "sqlstate", None) == "42501", statement
+                assert getattr(raised.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE, (
+                    statement
+                )
     finally:
         await engine.dispose()
-        cleanup = make_engine(admin_settings)
-        try:
-            async with cleanup.begin() as admin:
-                await admin.execute(text("DROP FUNCTION IF EXISTS public.zz_privileged_probe()"))
-        finally:
-            await cleanup.dispose()

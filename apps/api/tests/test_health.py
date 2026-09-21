@@ -11,16 +11,18 @@ from veotrex_api.main import create_app
 
 
 class StubResult:
-    def __init__(self, row: tuple[str, bool, bool]) -> None:
+    def __init__(self, row: tuple[object, ...]) -> None:
         self.row = row
 
-    def one(self) -> tuple[str, bool, bool]:
+    def one(self) -> tuple[object, ...]:
         return self.row
 
 
 class StubConnection:
     def __init__(
-        self, failing: bool = False, role: tuple[str, bool, bool] = ("veotrex_api", False, False)
+        self,
+        failing: bool = False,
+        role: tuple[object, ...] = ("veotrex_api", False, False, False, 0, 0),
     ) -> None:
         self.failing = failing
         self.role = role
@@ -44,7 +46,9 @@ class StubConnection:
 
 class StubEngine:
     def __init__(
-        self, failing: bool = False, role: tuple[str, bool, bool] = ("veotrex_api", False, False)
+        self,
+        failing: bool = False,
+        role: tuple[object, ...] = ("veotrex_api", False, False, False, 0, 0),
     ) -> None:
         self.failing = failing
         self.role = role
@@ -99,14 +103,23 @@ def test_readiness_reports_success() -> None:
 
 
 @pytest.mark.parametrize(
-    "role",
-    [("veotrex", True, False), ("bypasser", False, True), ("both", True, True)],
-    ids=["superuser", "bypassrls", "superuser-and-bypassrls"],
+    ("role", "expected"),
+    [
+        (("veotrex", True, False, False, 0, 0), "SUPERUSER"),
+        (("bypasser", False, True, False, 0, 0), "BYPASSRLS"),
+        (("both", True, True, False, 0, 0), "SUPERUSER and BYPASSRLS"),
+        (("creator", False, False, True, 0, 0), "CREATE on the application schema"),
+        (("owner", False, False, False, 3, 0), "ownership of 3 application relation(s)"),
+        (("member", False, False, False, 0, 1), "membership in 1 other role(s)"),
+    ],
+    ids=["superuser", "bypassrls", "superuser-and-bypassrls", "schema-create", "owner", "member"],
 )
-def test_privileged_database_role_refuses_startup(role: tuple[str, bool, bool]) -> None:
-    """A superuser or BYPASSRLS connection is a configuration fault: the process must not start.
+def test_privileged_database_role_refuses_startup(role: tuple[object, ...], expected: str) -> None:
+    """A role RLS would not constrain, or one that could escape the model through ownership,
+    schema CREATE or role membership, is a configuration fault: the process must not start.
 
-    The failure names the role and attribute so an operator can act on it, and never the DSN.
+    The failure names the role and the violated invariant so an operator can act on it, and
+    never the DSN.
     """
     app = create_app(settings(), StubEngine(role=role))  # type: ignore[arg-type]
     with pytest.raises(PrivilegedDatabaseRole) as raised, TestClient(app):
@@ -114,8 +127,7 @@ def test_privileged_database_role_refuses_startup(role: tuple[str, bool, bool]) 
     message = str(raised.value)
     offending = message.split(" has ", 1)[1].split(";", 1)[0]
     assert f"database role {role[0]!r}" in message
-    assert ("SUPERUSER" in offending) is role[1]
-    assert ("BYPASSRLS" in offending) is role[2]
+    assert offending == expected
     assert "postgresql" not in message
 
 
@@ -126,7 +138,7 @@ def test_privileged_database_role_fails_readiness_when_reached_after_startup() -
     app = create_app(settings(), engine)  # type: ignore[arg-type]
     with TestClient(app) as client:
         engine.failing = False
-        engine.role = ("veotrex", True, False)
+        engine.role = ("veotrex", True, False, False, 0, 0)
         response = client.get("/health/ready")
     assert response.status_code == 503
     assert response.json()["status"] == "not_ready"

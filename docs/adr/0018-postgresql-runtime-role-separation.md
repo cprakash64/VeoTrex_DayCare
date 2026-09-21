@@ -47,31 +47,73 @@ policy changes, no `SET ROLE` to the admin, `row_security = off` refused rather 
 ### Privilege inventory
 
 The runtime role holds `SELECT`/`INSERT`/`UPDATE` on the tenant tables the service code writes,
-`SELECT` only on `tenants`, `actors` and `role_assignments`, `SELECT`+`UPDATE` on
-`actor_identities`, `SELECT`+`INSERT` on `audit_events` (append-only from the runtime) and
-`provider_events`, and `SELECT`/`INSERT`/`UPDATE`/`DELETE` on `encrypted_credentials` (the vault
-deletes rows on disconnect). It holds **no** `DELETE` on any tenant table and **no** access at all
-to `ring_pending_links`, `ring_webhook_inbox`, `tenant_identity_bindings`, `alembic_version`, the
-policy catalog, or tables the API does not yet use (`facilities`, `areas`, `zones`, `edge_nodes`,
-`camera_assignments`). It can `EXECUTE` exactly the eleven SECURITY DEFINER functions the code
-calls; every other function is revoked. A unit test pins the classification to the ORM metadata,
-so adding a table forces an explicit decision.
+`SELECT` only on `tenants` (behind a self-only RLS policy), `actors` and `role_assignments`,
+`SELECT`+`UPDATE` on `actor_identities`, and `SELECT`+`INSERT` on `audit_events` (append-only
+from the runtime) and `provider_events`. It holds **no** `DELETE` on any tenant table and **no**
+table privilege at all on `encrypted_credentials`, `ring_pending_links`, `ring_webhook_inbox`,
+`tenant_identity_bindings`, `alembic_version`, the policy catalog, or tables the API does not yet
+use (`facilities`, `areas`, `zones`, `edge_nodes`, `camera_assignments`). It can `EXECUTE` exactly
+the fifteen SECURITY DEFINER functions the code calls (identity resolution, the pending-link state
+machine, the webhook inbox, and the four vault operations); every other function, including the
+private vault authorization predicate, is revoked. The classification below is the source of
+truth and a unit test pins it to the ORM metadata.
 
-### Default privileges keyed to the creating role
+### Fail-closed defaults (corrected in V1-00A-R1)
 
-`ALTER DEFAULT PRIVILEGES FOR ROLE <migration role> IN SCHEMA public GRANT SELECT, INSERT, UPDATE
-ON TABLES TO veotrex_api` makes tables created by future migrations usable without a remembered
-grant, while `DELETE` and function `EXECUTE` stay explicit allowlist decisions applied by re-running
-`apply` after the migration. PostgreSQL scopes default privileges to the *creating* role, not the
-schema, which is why the migration identity is named explicitly and verified. On PostgreSQL 17 a
-bare `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` default stores nothing; pairing it with an explicit
-`GRANT EXECUTE ... TO <migration role>` persists the PUBLIC-free default, and a test creates a
-table and a function as the migration role to prove both behaviours.
+The first version of this decision installed `ALTER DEFAULT PRIVILEGES ... GRANT SELECT, INSERT,
+UPDATE ON TABLES TO veotrex_api`, so a table created by any future migration - teacher biometric
+templates, enrollment images, integration secrets - would have been readable and writable by the
+API automatically. That was the wrong default and is withdrawn. **No default privilege ever grants
+the runtime role anything.** A new table, function or sequence is inaccessible to the API until a
+developer classifies it in `veotrex_api.runtime_role.TABLE_CLASSIFICATION` (or lists a function
+in `RUNTIME_FUNCTION_GRANTS`) and `apply` is re-run; a unit test fails CI when an ORM table has no
+classification. `apply` converges: it revokes runtime access on every unclassified table, every
+sequence, every non-allow-listed function, and on default-privilege entries an earlier version
+installed, so an over-privileged deployment is corrected rather than merely extended.
+
+The only defaults installed are *denials*: `ALTER DEFAULT PRIVILEGES FOR ROLE <migration role>
+REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` (global, because per-schema defaults are added to the
+global defaults and cannot remove PUBLIC's built-in EXECUTE - verified on PostgreSQL 17 and pinned
+by a test that creates a function as the migration role), plus explicit no-op revokes for tables
+and sequences that state the intent. Tests create a `future_sensitive_table`, a function and a
+sequence as the migration role and prove the runtime is refused every privilege until a
+deliberate classification grants exactly the intended ones.
+
+### Classification model
+
+| Class | Privileges | Tables |
+|---|---|---|
+| RUNTIME_READ | SELECT | tenants (self-policy), actors, role_assignments |
+| RUNTIME_WRITE | explicit set, DELETE never inferred | actor_identities (S,U); camera_provider_connections, cameras, camera_provider_devices, camera_provider_components (S,I,U) |
+| RUNTIME_APPEND_ONLY | SELECT, INSERT | provider_events, audit_events |
+| FUNCTION_ONLY | none | encrypted_credentials, ring_pending_links, ring_webhook_inbox, tenant_identity_bindings |
+| RUNTIME_NO_ACCESS | none | alembic_version, jurisdiction_policies, policy_versions, facilities, areas, zones, edge_nodes, camera_assignments |
+
+### The credential boundary (V1-00A-R1)
+
+`encrypted_credentials` is global by design and the API holds the vault master key, so direct
+table privileges would let a compromised API process decrypt every tenant's Ring tokens with one
+`SELECT`. The runtime now has **no table privilege** on it. Migration 0006 adds four SECURITY
+DEFINER functions - `vault_credential_create`, `_open`, `_replace`, `_delete` - each addressing
+exactly one credential by primary key, checking the `(provider, owner_kind, owner_id)` binding,
+and authorizing against existing state: the pending link being `CLAIMING` by the caller's tenant
+(the claim step), a `camera_provider_connections` row of the caller's tenant referencing the
+credential (retrieval, refresh, disconnect, remote removal), or, for deletion only, a link still
+in `RECEIVED` or never created (token-receipt clean-up). The caller's tenant is `app.tenant_id`,
+which `EncryptedCredentialVault` presents from the new optional `CredentialContext.tenant_id`.
+The private predicate `vault_credential_authorized` is not executable by the runtime. No function
+enumerates, and none takes anything but a primary key.
+
+`tenants` gains `FORCE ROW LEVEL SECURITY` with a self-only policy, so a tenant-scoped request
+reads its own row and nothing else; identity bootstrap is unaffected because the resolver is
+SECURITY DEFINER and provisioning runs as the admin.
 
 ### Fail closed in the application
 
 `veotrex_api.db.verify_runtime_role` reads `pg_roles` for `current_user` at startup. A superuser or
-`BYPASSRLS` role raises `PrivilegedDatabaseRole` and the process does not start; an unreachable
+`BYPASSRLS` role, a role that can `CREATE` in the application schema, that owns any application
+relation, or that is a member of another role raises `PrivilegedDatabaseRole` and the process
+does not start; an unreachable
 database only defers the check. `/health/ready` repeats the check on every call and reports
 `reason: privileged_database_role` with HTTP 503, so `docker compose up --wait` fails the rollout
 instead of serving traffic. The diagnostic names the role and attribute, never the DSN. There is no
@@ -100,5 +142,8 @@ mounts only `api_database_url`; `migrate` and the new `runtime-role` job mount `
 Cross-tenant disclosure now requires defeating PostgreSQL RLS itself rather than a missed `WHERE`
 clause. Deployments gain two secret files and one idempotent job in the deploy order, and every
 migration that adds a function or needs `DELETE` must be followed by `runtime-role apply`.
-Remaining for a later stage: a migration identity distinct from the bootstrap superuser, and a
-review of whether `tenants` should carry an RLS policy of its own.
+Remaining for a later stage: a migration identity distinct from the bootstrap superuser. When
+that happens the SECURITY DEFINER functions will run as a non-superuser owner, and because
+`tenants` and the tenant tables `FORCE` RLS, `resolve_tenant_identity_binding` and the vault
+predicate will need an explicit bypass (owner `BYPASSRLS`, or policies granting the owner) -
+which is exactly the kind of decision that separation stage must make deliberately.

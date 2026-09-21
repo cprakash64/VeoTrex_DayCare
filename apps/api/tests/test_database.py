@@ -84,8 +84,58 @@ async def test_migration_enables_rls_on_every_tenant_table(admin_settings: Setti
             )
         assert enabled == len(TENANT_TABLES) == 14
         assert policies == 14
+        async with engine.connect() as connection:
+            tenants_rls = (
+                await connection.execute(
+                    text(
+                        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                        "WHERE relname = 'tenants'"
+                    )
+                )
+            ).one()
+            assert tuple(tenants_rls) == (True, True)
+            assert (
+                await connection.scalar(
+                    text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_self'")
+                )
+                == 1
+            )
     finally:
         await engine.dispose()
+
+
+async def test_tenants_table_exposes_only_the_current_tenant(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    """The runtime holds SELECT on tenants, but the self policy makes it a single-row view."""
+    admin_engine = make_engine(admin_settings)
+    engine = make_engine(settings)
+    tenant_a, tenant_b = uuid4(), uuid4()
+    try:
+        async with admin_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, status) VALUES "
+                    "(:a, 'Self A', 'ACTIVE'), (:b, 'Self B', 'ACTIVE')"
+                ),
+                {"a": tenant_a, "b": tenant_b},
+            )
+        async with engine.connect() as connection:
+            async with connection.begin():
+                assert await connection.scalar(text("SELECT count(*) FROM tenants")) == 0
+            async with connection.begin():
+                await set_tenant(connection, tenant_a)
+                names = (await connection.scalars(text("SELECT name FROM tenants"))).all()
+                assert names == ["Self A"]
+                assert (
+                    await connection.scalar(
+                        text("SELECT name FROM tenants WHERE id = :b"), {"b": tenant_b}
+                    )
+                    is None
+                )
+    finally:
+        await engine.dispose()
+        await admin_engine.dispose()
 
 
 async def test_rls_fails_closed_without_tenant_context(

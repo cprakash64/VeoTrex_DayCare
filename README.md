@@ -114,7 +114,9 @@ Three database identities are kept apart (ADR 0018). The bootstrap superuser (`P
 and the migration identity provision and migrate; the API connects only as the restricted
 `veotrex_api` role - `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION
 NOINHERIT`, owning nothing and holding only the table and function privileges enumerated in
-`veotrex_api.runtime_role`. `veotrex-db-runtime-role apply` provisions it idempotently, `verify`
+`veotrex_api.runtime_role`. Nothing is granted by default: a new table, function or sequence
+is inaccessible to the API until it is classified there and `apply` is re-run, and CI fails on an
+unclassified ORM table. `veotrex-db-runtime-role apply` provisions and converges it, `verify`
 audits it, and `probe` exercises the boundary from the runtime role's own connection. The API
 refuses to start, and readiness reports `privileged_database_role`, if it is ever connected as a
 superuser or `BYPASSRLS` role. The automated suite runs application code as a role provisioned

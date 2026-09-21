@@ -1,10 +1,9 @@
-"""PostgreSQL runtime-role provisioning for the VeoTrex API (V1-00A).
+"""PostgreSQL runtime-role provisioning for the VeoTrex API (V1-00A, corrected in V1-00A-R1).
 
 Row Level Security is only a tenant boundary when the connecting role is subject to it. A
 superuser, or any role with ``BYPASSRLS``, reads every tenant's rows regardless of ``FORCE ROW
-LEVEL SECURITY``. This module provisions the restricted role the API must connect as, applies the
-smallest privilege set the current code needs, and installs default privileges so tables created
-by future migrations are usable without a developer remembering a ``GRANT``.
+LEVEL SECURITY``. This module provisions the restricted role the API must connect as and applies
+exactly the privilege set the current code needs, and nothing else.
 
 Three identities are involved and deliberately kept apart:
 
@@ -12,21 +11,28 @@ Three identities are involved and deliberately kept apart:
     The cluster's bootstrap superuser (``POSTGRES_USER``). Runs this module. Never the API.
 ``migration``
     The role that owns the schema and executes Alembic. Today it is the same role as the
-    bootstrap identity; default privileges are keyed to it because PostgreSQL scopes
-    ``ALTER DEFAULT PRIVILEGES`` to the *creating* role, not to the schema.
+    bootstrap identity.
 ``runtime``
     ``LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT``, owns
-    nothing, cannot ``CREATE`` in the schema, and holds only the table and function privileges
-    enumerated here. The API connects as this role.
+    nothing, cannot ``CREATE`` in the schema, belongs to no other role, and holds only the table
+    and function privileges enumerated in :data:`TABLE_CLASSIFICATION` and
+    :data:`RUNTIME_FUNCTION_GRANTS`. The API connects as this role.
+
+**The model fails closed.** A table, function or sequence that a migration introduces is
+inaccessible to the runtime role until a developer classifies it here and ``apply`` is re-run.
+No ``ALTER DEFAULT PRIVILEGES`` grants the runtime anything; the only defaults installed remove
+privileges PostgreSQL would otherwise hand to PUBLIC (function EXECUTE). ``apply`` converges an
+existing database to this model: it revokes what should not exist as well as granting what
+should, including on tables it does not classify and on default-privilege entries an earlier
+version installed. A unit test pins the classification to the ORM metadata so an unclassified
+table fails CI.
 
 Role provisioning is cluster-level administration, not an application schema change, so it lives
 here behind a privileged console script rather than in an Alembic migration. Running it twice is
-a no-op: attributes are re-asserted, grants are revoked-then-granted so they converge exactly, and
-the password is touched only when a password reference is supplied explicitly.
+a no-op; the password is touched only when a password reference is supplied explicitly, and it
+is sent as a pre-computed SCRAM-SHA-256 verifier so the plaintext never appears in server logs.
 
-No password, DSN or secret value is ever printed, logged or included in an exception. The
-password is sent to PostgreSQL as a pre-computed SCRAM-SHA-256 verifier so that the plaintext
-never appears in server logs or ``pg_stat_statements`` either.
+No password, DSN or secret value is ever printed, logged or included in an exception.
 """
 
 from __future__ import annotations
@@ -38,8 +44,9 @@ import hmac
 import os
 import secrets
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
@@ -55,64 +62,98 @@ ROLE_ATTRIBUTES = sql.SQL(
 )
 
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
-# Tables created by future migrations receive these, and only these, automatically. DELETE stays
-# an explicit per-table decision below. Function EXECUTE is never granted by default.
-DEFAULT_TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE")
+SEQUENCE_PRIVILEGES = ("USAGE", "SELECT", "UPDATE")
+
+
+class TableAccess(StrEnum):
+    """How the API runtime role may touch a table. Every application table declares one."""
+
+    RUNTIME_READ = "RUNTIME_READ"  # SELECT only
+    RUNTIME_APPEND_ONLY = "RUNTIME_APPEND_ONLY"  # SELECT, INSERT; rows can never be rewritten
+    RUNTIME_WRITE = "RUNTIME_WRITE"  # explicit privilege set, DELETE never inferred
+    FUNCTION_ONLY = "FUNCTION_ONLY"  # no table privilege; reached via SECURITY DEFINER only
+    RUNTIME_NO_ACCESS = "RUNTIME_NO_ACCESS"  # the API never touches it
 
 
 @dataclass(frozen=True, slots=True)
-class TableGrant:
-    table: str
-    privileges: frozenset[str]
+class TableClassification:
+    access: TableAccess
+    privileges: frozenset[str] = frozenset()
+    reason: str = ""
 
     def __post_init__(self) -> None:
         unknown = self.privileges - set(TABLE_PRIVILEGES)
-        if unknown or not self.privileges:
-            raise ValueError(f"invalid privilege set for {self.table}: {sorted(unknown)}")
+        if unknown:
+            raise ValueError(f"unknown privileges {sorted(unknown)}")
+        expected: frozenset[str] | None
+        if self.access is TableAccess.RUNTIME_READ:
+            expected = frozenset({"SELECT"})
+        elif self.access is TableAccess.RUNTIME_APPEND_ONLY:
+            expected = frozenset({"SELECT", "INSERT"})
+        elif self.access is TableAccess.RUNTIME_WRITE:
+            expected = None
+            if not self.privileges:
+                raise ValueError("RUNTIME_WRITE requires an explicit privilege set")
+        else:
+            expected = frozenset()
+        if expected is not None and self.privileges != expected:
+            raise ValueError(f"{self.access} implies exactly {sorted(expected)}")
 
 
-def _grant(table: str, *privileges: str) -> TableGrant:
-    return TableGrant(table, frozenset(privileges))
+def _read(reason: str) -> TableClassification:
+    return TableClassification(TableAccess.RUNTIME_READ, frozenset({"SELECT"}), reason)
 
 
-# The exact privilege inventory of the running API, derived from the statements the service code
-# issues (see tests/test_runtime_role.py, which pins this to the ORM metadata). Anything not
-# listed here or in RUNTIME_TABLES_WITHOUT_ACCESS is a classification error caught in tests.
-RUNTIME_TABLE_GRANTS: tuple[TableGrant, ...] = (
-    # Tenant name for the Ring link preview. No RLS on this table; read-only by design.
-    _grant("tenants", "SELECT"),
-    # Principal resolution and last-authentication bookkeeping (access.py).
-    _grant("actors", "SELECT"),
-    _grant("actor_identities", "SELECT", "UPDATE"),
-    _grant("role_assignments", "SELECT"),
-    # Ring linking, inventory reconciliation and webhook application.
-    _grant("camera_provider_connections", "SELECT", "INSERT", "UPDATE"),
-    _grant("cameras", "SELECT", "INSERT", "UPDATE"),
-    _grant("camera_provider_devices", "SELECT", "INSERT", "UPDATE"),
-    _grant("camera_provider_components", "SELECT", "INSERT", "UPDATE"),
-    _grant("provider_events", "SELECT", "INSERT"),
-    # Append-only from the runtime: no UPDATE or DELETE, so audit rows cannot be rewritten.
-    _grant("audit_events", "SELECT", "INSERT"),
-    # AEAD ciphertext store; rows are deleted on disconnect/removal (encrypted_vault.py).
-    _grant("encrypted_credentials", "SELECT", "INSERT", "UPDATE", "DELETE"),
-)
+def _append(reason: str) -> TableClassification:
+    return TableClassification(
+        TableAccess.RUNTIME_APPEND_ONLY, frozenset({"SELECT", "INSERT"}), reason
+    )
 
-# Reached only through SECURITY DEFINER functions, or never by the API at all.
-RUNTIME_TABLES_WITHOUT_ACCESS: frozenset[str] = frozenset(
-    {
-        "alembic_version",
-        "ring_pending_links",
-        "ring_webhook_inbox",
-        "tenant_identity_bindings",
-        "jurisdiction_policies",
-        "policy_versions",
-        "facilities",
-        "areas",
-        "zones",
-        "edge_nodes",
-        "camera_assignments",
-    }
-)
+
+def _write(reason: str, *privileges: str) -> TableClassification:
+    return TableClassification(TableAccess.RUNTIME_WRITE, frozenset(privileges), reason)
+
+
+def _function_only(reason: str) -> TableClassification:
+    return TableClassification(TableAccess.FUNCTION_ONLY, frozenset(), reason)
+
+
+def _no_access(reason: str) -> TableClassification:
+    return TableClassification(TableAccess.RUNTIME_NO_ACCESS, frozenset(), reason)
+
+
+# The canonical classification of every application table. tests/test_runtime_role.py fails
+# when an ORM table is missing here, so a new table cannot reach production unclassified.
+TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
+    # RLS self-policy (migration 0006): a request reads only its own tenant row.
+    "tenants": _read("tenant name for the Ring link preview and claim"),
+    "actors": _read("principal resolution"),
+    "actor_identities": _write(
+        "principal resolution and last-authentication mark", "SELECT", "UPDATE"
+    ),
+    "role_assignments": _read("permission resolution"),
+    "camera_provider_connections": _write(
+        "Ring linking, refresh bookkeeping, inventory, disconnect", "SELECT", "INSERT", "UPDATE"
+    ),
+    "cameras": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
+    "camera_provider_devices": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
+    "camera_provider_components": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
+    "provider_events": _append("provider telemetry, deduplicated on request id"),
+    "audit_events": _append("audit trail; the runtime can never rewrite or remove an entry"),
+    # Global by design; reached only through the vault functions (migration 0006).
+    "encrypted_credentials": _function_only("vault_credential_* SECURITY DEFINER functions"),
+    "ring_pending_links": _function_only("pending-link state machine functions"),
+    "ring_webhook_inbox": _function_only("webhook inbox functions"),
+    "tenant_identity_bindings": _function_only("resolve_tenant_identity_binding"),
+    "alembic_version": _no_access("migration bookkeeping"),
+    "jurisdiction_policies": _no_access("policy catalog is file-backed in the API today"),
+    "policy_versions": _no_access("policy catalog is file-backed in the API today"),
+    "facilities": _no_access("no API endpoint yet"),
+    "areas": _no_access("no API endpoint yet"),
+    "zones": _no_access("no API endpoint yet"),
+    "edge_nodes": _no_access("no API endpoint yet"),
+    "camera_assignments": _no_access("no API endpoint yet"),
+}
 
 # The intentionally exposed SECURITY DEFINER surface. Each was created with a fixed
 # ``search_path`` and ``REVOKE ALL ... FROM PUBLIC`` in its migration; EXECUTE is granted here
@@ -130,7 +171,13 @@ RUNTIME_FUNCTION_GRANTS: tuple[str, ...] = (
     "claim_next_ring_webhook()",
     "finish_ring_webhook(uuid, text, text, timestamp with time zone)",
     "resolve_ring_webhook_connection(text)",
+    "vault_credential_create(uuid, text, text, uuid, integer, bytea, bytea)",
+    "vault_credential_open(uuid, text, text, uuid)",
+    "vault_credential_replace(uuid, text, text, uuid, integer, integer, bytea, bytea)",
+    "vault_credential_delete(uuid, text, text, uuid)",
 )
+# ``vault_credential_authorized`` is deliberately absent: it is the private predicate the four
+# vault functions call as their owner, and the runtime must not be able to probe it.
 
 
 class RuntimeRoleError(RuntimeError):
@@ -143,6 +190,10 @@ def _scalar_int(row: tuple[object, ...] | None, *, default: int = 0) -> int:
         return default
     value = row[0]
     return value if isinstance(value, int) else default
+
+
+def _scalar_bool(row: tuple[object, ...] | None) -> bool:
+    return bool(row[0]) if row else False
 
 
 # ------------------------------------------------------------------------------- credentials
@@ -250,7 +301,7 @@ def _table(name: str) -> sql.Identifier:
 
 
 def _function(signature: str) -> sql.Composed:
-    # Signatures are constants defined in this module, never caller input, and the function
+    # Signatures are module constants or catalog output, never caller input, and the function
     # must exist in the inventory before it is referenced.
     name, _, arguments = signature.partition("(")
     return sql.SQL("{}.{}({}").format(_ident(SCHEMA), _ident(name), sql.SQL(arguments))
@@ -263,7 +314,7 @@ def inspect_schema(
         cursor.execute("SELECT current_database(), current_user")
         database, connected_role = cursor.fetchone() or ("", "")
         cursor.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)", (role,))
-        role_exists = bool((cursor.fetchone() or (False,))[0])
+        role_exists = _scalar_bool(cursor.fetchone())
         cursor.execute(
             "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = %s AND c.relkind IN ('r', 'p')",
@@ -310,13 +361,20 @@ def build_plan(
     migration_role: str | None = None,
     password_verifier: str | None = None,
     require_credential: bool = True,
+    classification: Mapping[str, TableClassification] = TABLE_CLASSIFICATION,
+    function_grants: Sequence[str] = RUNTIME_FUNCTION_GRANTS,
 ) -> RuntimeRolePlan:
-    """Compose the idempotent statement sequence. Raises before any statement runs if the
-    schema is missing a table or function the runtime needs (the database is not migrated).
+    """Compose the idempotent, converging statement sequence.
+
+    Raises before any statement runs if the schema is missing a table or function the runtime
+    needs (the database is not migrated). ``classification`` and ``function_grants`` exist so
+    tests can prove a deliberately classified object becomes reachable; production always uses
+    the module constants.
 
     ``require_credential=False`` lets a dry run render the plan for a role that does not exist
     yet; ``apply`` always requires a credential to create one, since a LOGIN role without a
-    password can never authenticate and would only look provisioned."""
+    password can never authenticate and would only look provisioned.
+    """
     if not role or not role.isidentifier():
         raise RuntimeRoleError("runtime role name must be a plain identifier")
     owner = migration_role or inventory.connected_role
@@ -327,15 +385,16 @@ def build_plan(
             f"role {role!r} does not exist; a password reference is required to create it"
         )
 
-    missing_tables = sorted(
-        grant.table for grant in RUNTIME_TABLE_GRANTS if grant.table not in inventory.tables
-    )
+    granted_tables = {
+        table: entry.privileges for table, entry in classification.items() if entry.privileges
+    }
+    missing_tables = sorted(table for table in granted_tables if table not in inventory.tables)
     if missing_tables:
         raise RuntimeRoleError(
             "database is not migrated: missing tables " + ", ".join(missing_tables)
         )
     present_functions = {_normalise_signature(item): item for item in inventory.functions}
-    required = {_normalise_signature(item): item for item in RUNTIME_FUNCTION_GRANTS}
+    required = {_normalise_signature(item): item for item in function_grants}
     missing_functions = sorted(required[key] for key in required if key not in present_functions)
     if missing_functions:
         raise RuntimeRoleError(
@@ -401,30 +460,31 @@ def build_plan(
         )
     )
 
-    for grant in RUNTIME_TABLE_GRANTS:
+    # Tables: every table present in the schema converges. Classified tables get exactly their
+    # privilege set; FUNCTION_ONLY, RUNTIME_NO_ACCESS and *unclassified* tables are revoked, so a
+    # table this build does not know about (a newer migration, a stray object) fails closed.
+    for table in sorted(inventory.tables):
+        privileges = granted_tables.get(table, frozenset())
+        label = ", ".join(sorted(privileges)) if privileges else "no runtime access"
+        if table not in classification:
+            label = "UNCLASSIFIED: no runtime access until classified"
         steps.append(
             PlanStep(
-                f"table {grant.table}: converge to {', '.join(sorted(grant.privileges))}",
-                sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(_table(grant.table), _ident(role)),
-            )
-        )
-        steps.append(
-            PlanStep(
-                f"table {grant.table}: converge to {', '.join(sorted(grant.privileges))}",
-                sql.SQL("GRANT {} ON TABLE {} TO {}").format(
-                    sql.SQL(", ").join(sql.SQL(p) for p in sorted(grant.privileges)),
-                    _table(grant.table),
-                    _ident(role),
-                ),
-            )
-        )
-    for table in sorted(RUNTIME_TABLES_WITHOUT_ACCESS & inventory.tables):
-        steps.append(
-            PlanStep(
-                f"table {table}: no runtime access",
+                f"table {table}: {label}",
                 sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(_table(table), _ident(role)),
             )
         )
+        if privileges:
+            steps.append(
+                PlanStep(
+                    f"table {table}: {label}",
+                    sql.SQL("GRANT {} ON TABLE {} TO {}").format(
+                        sql.SQL(", ").join(sql.SQL(p) for p in sorted(privileges)),
+                        _table(table),
+                        _ident(role),
+                    ),
+                )
+            )
     for sequence in sorted(inventory.sequences):
         steps.append(
             PlanStep(
@@ -433,9 +493,8 @@ def build_plan(
             )
         )
 
-    granted_keys = set(required)
     for key, signature in sorted(present_functions.items()):
-        if key in granted_keys:
+        if key in required:
             steps.append(
                 PlanStep(
                     f"function {signature}: EXECUTE",
@@ -454,32 +513,40 @@ def build_plan(
                 )
             )
 
-    steps.append(
-        PlanStep(
-            f"default privileges for tables created by {owner}",
-            sql.SQL(
-                "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} GRANT {} ON TABLES TO {}"
-            ).format(
-                _ident(owner),
-                _ident(SCHEMA),
-                sql.SQL(", ").join(sql.SQL(p) for p in DEFAULT_TABLE_PRIVILEGES),
-                _ident(role),
-            ),
+    # Default privileges: NEVER a grant to the runtime role. Objects a migration creates are
+    # inaccessible until classified above and apply is re-run. An earlier version installed a
+    # per-schema table default for the runtime; revoking it here converges old deployments.
+    for kind, label in (
+        ("TABLES", "tables"),
+        ("SEQUENCES", "sequences"),
+        ("FUNCTIONS", "functions"),
+    ):
+        steps.append(
+            PlanStep(
+                f"no automatic runtime access to {label} created by {owner} (converge)",
+                sql.SQL(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} REVOKE ALL ON {} FROM {}"
+                ).format(_ident(owner), _ident(SCHEMA), sql.SQL(kind), _ident(role)),
+            )
         )
-    )
-    # Per-schema default privileges are ADDED to the global defaults and can never remove
-    # PUBLIC's built-in EXECUTE on functions; only a global (schema-less) default for the
-    # creating role does that. It applies to every schema that role creates functions in,
-    # which is exactly the intent: new functions are executable by their owner only until a
-    # later apply lists them in RUNTIME_FUNCTION_GRANTS. Pinned by tests/test_runtime_role.py.
-    steps.append(
-        PlanStep(
-            f"future functions created by {owner} are not PUBLIC-executable",
-            sql.SQL(
-                "ALTER DEFAULT PRIVILEGES FOR ROLE {} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
-            ).format(_ident(owner)),
+    # Safe default denial: PostgreSQL grants PUBLIC EXECUTE on every new function. Per-schema
+    # defaults are ADDED to the global defaults and can never remove that, so the revoke must be
+    # global for the creating role (verified empirically on PostgreSQL 17 and pinned by tests).
+    # Tables and sequences carry no PUBLIC privilege by default; the revokes state the intent
+    # explicitly and are no-ops today.
+    for kind, label in (
+        ("FUNCTIONS", "functions"),
+        ("SEQUENCES", "sequences"),
+        ("TABLES", "tables"),
+    ):
+        steps.append(
+            PlanStep(
+                f"future {label} created by {owner} carry no PUBLIC privilege",
+                sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} REVOKE ALL ON {} FROM PUBLIC").format(
+                    _ident(owner), sql.SQL(kind)
+                ),
+            )
         )
-    )
     return RuntimeRolePlan(role, owner, inventory.database, tuple(steps))
 
 
@@ -536,6 +603,8 @@ def verify(
     *,
     role: str = DEFAULT_RUNTIME_ROLE,
     migration_role: str | None = None,
+    classification: Mapping[str, TableClassification] = TABLE_CLASSIFICATION,
+    function_grants: Sequence[str] = RUNTIME_FUNCTION_GRANTS,
 ) -> list[str]:
     """Return the list of discrepancies between the intended and effective privilege model.
 
@@ -560,6 +629,13 @@ def verify(
     owner = migration_role or inventory.connected_role
     with connection.cursor() as cursor:
         cursor.execute(
+            "SELECT count(*) FROM pg_auth_members WHERE member = "
+            "(SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (role,),
+        )
+        if _scalar_int(cursor.fetchone()) > 0:
+            problems.append("role is a member of another role")
+        cursor.execute(
             "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()"
         )
         if (cursor.fetchone() or ("",))[0] == role:
@@ -570,79 +646,80 @@ def verify(
         if (cursor.fetchone() or ("",))[0] == role:
             problems.append("role owns the application schema")
         cursor.execute("SELECT has_schema_privilege(%s, %s, 'CREATE')", (role, SCHEMA))
-        if bool((cursor.fetchone() or (False,))[0]):
+        if _scalar_bool(cursor.fetchone()):
             problems.append("role can CREATE in the application schema")
         cursor.execute("SELECT has_schema_privilege(%s, %s, 'USAGE')", (role, SCHEMA))
-        if not bool((cursor.fetchone() or (False,))[0]):
+        if not _scalar_bool(cursor.fetchone()):
             problems.append("role lacks USAGE on the application schema")
         cursor.execute(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = %s AND c.relkind IN ('r','p','S','v') "
+            "WHERE n.nspname = %s AND c.relkind IN ('r','p','S','v','m') "
             "AND pg_get_userbyid(c.relowner) = %s",
             (SCHEMA, role),
         )
         if _scalar_int(cursor.fetchone()) > 0:
             problems.append("role owns application relations")
 
-        expected = {grant.table: grant.privileges for grant in RUNTIME_TABLE_GRANTS}
         for table in sorted(inventory.tables):
-            wanted = expected.get(table, frozenset())
-            if table not in expected and table not in RUNTIME_TABLES_WITHOUT_ACCESS:
-                continue  # unknown to this build: default privileges apply, nothing to assert
+            entry = classification.get(table)
+            if entry is None:
+                problems.append(f"table {table}: unclassified")
+            wanted = entry.privileges if entry is not None else frozenset()
             for privilege in TABLE_PRIVILEGES:
                 cursor.execute(
                     "SELECT has_table_privilege(%s, %s, %s)",
                     (role, f"{SCHEMA}.{table}", privilege),
                 )
-                actual = bool((cursor.fetchone() or (False,))[0])
+                actual = _scalar_bool(cursor.fetchone())
                 if actual != (privilege in wanted):
                     problems.append(
                         f"table {table}: {privilege} is {'granted' if actual else 'missing'}"
                     )
         for sequence in sorted(inventory.sequences):
-            cursor.execute(
-                "SELECT has_sequence_privilege(%s, %s, 'USAGE') "
-                "OR has_sequence_privilege(%s, %s, 'SELECT') "
-                "OR has_sequence_privilege(%s, %s, 'UPDATE')",
-                (role, f"{SCHEMA}.{sequence}") * 3,
-            )
-            if bool((cursor.fetchone() or (False,))[0]):
-                problems.append(f"sequence {sequence}: runtime privilege granted")
+            for privilege in SEQUENCE_PRIVILEGES:
+                cursor.execute(
+                    "SELECT has_sequence_privilege(%s, %s, %s)",
+                    (role, f"{SCHEMA}.{sequence}", privilege),
+                )
+                if _scalar_bool(cursor.fetchone()):
+                    problems.append(f"sequence {sequence}: {privilege} granted")
 
-        wanted_functions = {_normalise_signature(item) for item in RUNTIME_FUNCTION_GRANTS}
+        wanted_functions = {_normalise_signature(item) for item in function_grants}
         for signature in sorted(inventory.functions):
             # has_function_privilege takes a regprocedure: types only, no argument names.
-            cursor.execute(
-                "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
-                (role, f"{SCHEMA}.{_normalise_signature(signature)}"),
-            )
-            actual = bool((cursor.fetchone() or (False,))[0])
+            regprocedure = f"{SCHEMA}.{_normalise_signature(signature)}"
+            cursor.execute("SELECT has_function_privilege(%s, %s, 'EXECUTE')", (role, regprocedure))
+            actual = _scalar_bool(cursor.fetchone())
             if actual != (_normalise_signature(signature) in wanted_functions):
                 problems.append(
                     f"function {signature}: EXECUTE is {'granted' if actual else 'missing'}"
                 )
+            cursor.execute(
+                "SELECT has_function_privilege('public', %s, 'EXECUTE')", (regprocedure,)
+            )
+            if _scalar_bool(cursor.fetchone()):
+                problems.append(f"function {signature}: PUBLIC can execute")
 
+        # Default privileges: nothing may ever be granted to the runtime role by default, and
+        # the global function default for the migration role must exclude PUBLIC.
         cursor.execute(
-            "SELECT d.defaclobjtype, d.defaclacl::text FROM pg_default_acl d "
-            "JOIN pg_namespace n ON n.oid = d.defaclnamespace "
-            "WHERE pg_get_userbyid(d.defaclrole) = %s AND n.nspname = %s",
-            (owner, SCHEMA),
-        )
-        defaults = {str(kind): str(acl) for kind, acl in cursor.fetchall()}
-        table_default = defaults.get("r", "")
-        if f"{role}=" not in table_default and f'"{role}"=' not in table_default:
-            problems.append(f"no default table privileges for tables created by {owner}")
-        # The function default is global (defaclnamespace = 0); see build_plan.
-        cursor.execute(
-            "SELECT d.defaclacl::text FROM pg_default_acl d "
-            "WHERE pg_get_userbyid(d.defaclrole) = %s AND d.defaclnamespace = 0 "
-            "AND d.defaclobjtype = 'f'",
+            "SELECT d.defaclobjtype, coalesce(n.nspname, ''), d.defaclacl::text "
+            "FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace "
+            "WHERE pg_get_userbyid(d.defaclrole) = %s",
             (owner,),
         )
-        function_default = cursor.fetchone()
-        acl = "" if function_default is None else str(function_default[0])
-        # An aclitem whose grantee is PUBLIC renders with an empty name before "=".
-        if function_default is None or "{=" in acl or ",=" in acl:
+        function_default_seen = False
+        for kind, namespace, acl in cursor.fetchall():
+            acl_text = str(acl)
+            if f"{role}=" in acl_text or f'"{role}"=' in acl_text:
+                problems.append(
+                    f"default privileges grant the runtime role access to new {kind!s} objects"
+                )
+            if str(kind) == "f" and namespace == "":
+                function_default_seen = True
+                if "{=" in acl_text or ",=" in acl_text:
+                    problems.append(f"functions created by {owner} still default to PUBLIC")
+        if not function_default_seen:
             problems.append(f"functions created by {owner} still default to PUBLIC EXECUTE")
     return problems
 
@@ -670,18 +747,27 @@ def probe(
 
     with connection.cursor() as cursor:
         cursor.execute(
-            "SELECT current_user, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, "
-            "rolreplication FROM pg_roles WHERE rolname = current_user"
+            "SELECT r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, "
+            "r.rolreplication, has_schema_privilege(current_user, %s, 'CREATE'), "
+            "(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            " WHERE n.nspname = %s AND c.relkind IN ('r','p','S','v','m') "
+            " AND c.relowner = r.oid), "
+            "(SELECT count(*) FROM pg_auth_members m WHERE m.member = r.oid) "
+            "FROM pg_roles r WHERE r.rolname = current_user",
+            (SCHEMA, SCHEMA),
         )
-        row = cursor.fetchone() or ("", True, True, True, True, True)
+        row = cursor.fetchone() or ("", True, True, True, True, True, True, 1, 1)
     connection.rollback()
-    flags = [bool(value) for value in row[1:]]
+    flags = [bool(value) for value in row[1:7]]
+    owned = _scalar_int((row[7],))
+    memberships = _scalar_int((row[8],))
     results.append(
         ProbeResult(
             "runtime role attributes",
-            not any(flags),
+            not any(flags) and owned == 0 and memberships == 0,
             f"current_user={row[0]} superuser={flags[0]} bypassrls={flags[1]} "
-            f"createrole={flags[2]} createdb={flags[3]} replication={flags[4]}",
+            f"createrole={flags[2]} createdb={flags[3]} replication={flags[4]} "
+            f"schema_create={flags[5]} owned_relations={owned} role_memberships={memberships}",
         )
     )
 
@@ -734,6 +820,15 @@ def probe(
         "SELECT count(*) FROM public.cameras",
         0,
     )
+    expect_count(
+        "tenants without tenant context discloses nothing",
+        "SELECT count(*) FROM public.tenants",
+        0,
+    )
+    expect_refused(
+        "cannot read encrypted credentials directly",
+        "SELECT count(*) FROM public.encrypted_credentials",
+    )
     expect_refused(
         "cannot read the webhook inbox directly", "SELECT count(*) FROM public.ring_webhook_inbox"
     )
@@ -743,6 +838,16 @@ def probe(
     expect_refused(
         "cannot read identity bindings directly",
         "SELECT count(*) FROM public.tenant_identity_bindings",
+    )
+    expect_refused(
+        "cannot call the private vault authorization predicate",
+        "SELECT public.vault_credential_authorized('ring_pending_link', gen_random_uuid(), 'open')",
+    )
+    expect_count(
+        "vault open of an unknown credential discloses nothing",
+        "SELECT count(*) FROM public.vault_credential_open("
+        "gen_random_uuid(), 'RING', 'ring_pending_link', gen_random_uuid()) WHERE outcome = 'ok'",
+        0,
     )
     expect_refused("cannot create tables", "CREATE TABLE public.zz_runtime_probe (id int)")
     expect_refused("cannot create roles", "CREATE ROLE zz_runtime_probe NOLOGIN")

@@ -57,13 +57,20 @@ class LinkContext:
     eligible: bool
 
 
-def _credential_context(owner_id: UUID) -> CredentialContext:
-    return CredentialContext(provider="RING", owner_kind="ring_pending_link", owner_id=owner_id)
+def _credential_context(owner_id: UUID, tenant_id: UUID | None = None) -> CredentialContext:
+    return CredentialContext(
+        provider="RING", owner_kind="ring_pending_link", owner_id=owner_id, tenant_id=tenant_id
+    )
 
 
-def ring_credential_context(owner_id: UUID) -> CredentialContext:
-    """Return the context binding used by Stage 1B vault records."""
-    return _credential_context(owner_id)
+def ring_credential_context(owner_id: UUID, tenant_id: UUID | None = None) -> CredentialContext:
+    """Return the context binding used by Stage 1B vault records.
+
+    ``tenant_id`` is the caller's tenant for operations that happen after a link is claimed; it
+    lets the production vault authorize the operation against the tenant-scoped connection.
+    Pre-tenant operations (token receipt and its clean-up) pass none.
+    """
+    return _credential_context(owner_id, tenant_id)
 
 
 class RingLinkService:
@@ -152,7 +159,7 @@ class RingLinkService:
 
         try:
             credential = await self._vault.get(
-                candidate.secret_ref, _credential_context(candidate.id)
+                candidate.secret_ref, _credential_context(candidate.id, principal.tenant_id)
             )
             if credential.version != candidate.generation:
                 raise CredentialVersionConflict("credential generation changed")
@@ -300,7 +307,7 @@ class RingLinkService:
                 or connection.access_expires_at is None
             ):
                 raise RingLinkError("credential_unavailable")
-            context = _credential_context(connection.credential_owner_id)
+            context = _credential_context(connection.credential_owner_id, tenant_id)
             try:
                 credential = await self._vault.get(connection.secret_ref, context)
             except CredentialVaultError:
@@ -411,7 +418,7 @@ class RingLinkService:
                 {"provider": "RING", "remote_revocation": "not_performed"},
             )
         if secret is not None:
-            await self._vault.delete(secret[0], _credential_context(secret[1]))
+            await self._vault.delete(secret[0], _credential_context(secret[1], principal.tenant_id))
             async with self._factory() as session, session.begin():
                 await self._set_tenant(session, principal.tenant_id)
                 connection = await session.scalar(
