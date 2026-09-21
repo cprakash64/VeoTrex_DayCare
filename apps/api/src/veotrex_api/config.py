@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # so a deployment can mount the DSN as a file instead of exposing it in the process
     # environment, where `docker inspect` and /proc/<pid>/environ would reveal it.
     database_url_ref: str = Field(default="", repr=False)
+    # Schema migrations need DDL and object ownership that the API runtime role must never
+    # hold. When set, Alembic connects with this DSN instead of ``database_url``; when unset,
+    # Alembic falls back to ``database_url`` so a deployment that already supplies the admin
+    # DSN to its one-shot migration job is unchanged. The API process never reads it.
+    migration_database_url: SecretStr | None = Field(default=None, repr=False)
+    migration_database_url_ref: str = Field(default="", repr=False)
     app_version: str = Field(min_length=1)
     service_name: str = "veotrex-api"
     oidc_issuer: str = "https://auth.example.invalid/"
@@ -88,20 +94,26 @@ class Settings(BaseSettings):
         """
         if not isinstance(data, dict):
             return data
-        reference = str(data.get("database_url_ref") or "").strip()
-        if not reference:
-            return data
-        if data.get("database_url"):
-            raise ValueError("configure either database_url or database_url_ref, never both")
-        from veotrex_api.secrets import DefaultSecretResolver, SecretResolutionError
+        for field_name in ("database_url", "migration_database_url"):
+            reference = str(data.get(f"{field_name}_ref") or "").strip()
+            if not reference:
+                continue
+            if data.get(field_name):
+                raise ValueError(f"configure either {field_name} or {field_name}_ref, never both")
+            from veotrex_api.secrets import DefaultSecretResolver, SecretResolutionError
 
-        try:
-            resolved = DefaultSecretResolver().resolve(reference)
-        except SecretResolutionError as exc:
-            # The resolver's messages never contain the secret value.
-            raise ValueError(f"database_url_ref is unusable: {exc}") from None
-        data["database_url"] = resolved.get_secret_value()
+            try:
+                resolved = DefaultSecretResolver().resolve(reference)
+            except SecretResolutionError as exc:
+                # The resolver's messages never contain the secret value.
+                raise ValueError(f"{field_name}_ref is unusable: {exc}") from None
+            data[field_name] = resolved.get_secret_value()
         return data
+
+    @property
+    def effective_migration_database_url(self) -> SecretStr:
+        """The DSN Alembic must use: the migration identity when configured, else the default."""
+        return self.migration_database_url or self.database_url
 
     @field_validator("public_origin")
     @classmethod

@@ -105,10 +105,12 @@ def test_context_fields_containing_the_separator_are_rejected() -> None:
 
 
 # --------------------------------------------------------------------- database-backed
-# conftest.py has already resolved and validated the isolated test target and placed it in
-# VEOTREX_DATABASE_URL. Re-resolving here would compare that value against itself and be
-# refused as "shares the development cluster", so the validated value is consumed directly.
+# conftest.py has already resolved and validated the isolated test target: VEOTREX_DATABASE_URL
+# is the restricted runtime role the vault runs as in production, and VEOTREX_TEST_DATABASE_URL
+# the cluster admin used only to make sure the schema exists. Re-resolving here would compare
+# the value against itself and be refused, so the validated values are consumed directly.
 DATABASE_URL = os.environ["VEOTREX_DATABASE_URL"]
+ADMIN_DATABASE_URL = os.environ["VEOTREX_TEST_DATABASE_URL"]
 
 
 def _database_available() -> bool:
@@ -134,9 +136,15 @@ async def vault_factory():  # type: ignore[no-untyped-def]
 
     from veotrex_api.models import Base, EncryptedCredential
 
+    admin_engine = create_async_engine(ADMIN_DATABASE_URL)
+    try:
+        async with admin_engine.begin() as connection:
+            await connection.run_sync(
+                Base.metadata.create_all, tables=[EncryptedCredential.__table__]
+            )
+    finally:
+        await admin_engine.dispose()
     engine = create_async_engine(DATABASE_URL)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all, tables=[EncryptedCredential.__table__])
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         yield factory

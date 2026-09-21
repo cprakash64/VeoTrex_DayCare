@@ -51,6 +51,7 @@ def ring_device(name: str = "Camera", *, component_count: int = 1) -> Normalized
 
 
 async def setup_connection(factory) -> tuple[AuthenticatedPrincipal, UUID]:
+    """Seed a tenant, owner and connection. ``factory`` must be the ADMIN session factory."""
     tenant_id, actor_id, connection_id = uuid4(), uuid4(), uuid4()
     async with factory() as session, session.begin():
         await session.execute(
@@ -94,12 +95,15 @@ async def setup_connection(factory) -> tuple[AuthenticatedPrincipal, UUID]:
     return principal, connection_id
 
 
-async def test_reconciliation_is_idempotent_and_preserves_camera_identity(settings) -> None:
+async def test_reconciliation_is_idempotent_and_preserves_camera_identity(
+    settings, admin_settings
+) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     client = Client((ring_device(component_count=2),))
     subject = RingInventoryService(factory, Link(), client)  # type: ignore[arg-type]
-    principal, connection_id = await setup_connection(factory)
+    principal, connection_id = await setup_connection(make_session_factory(admin_engine))
     try:
         first = await subject.sync_connection(principal, connection_id)  # type: ignore[arg-type]
         assert first.cameras_created == 2
@@ -145,14 +149,18 @@ async def test_reconciliation_is_idempotent_and_preserves_camera_identity(settin
             }
     finally:
         await engine.dispose()
+        await admin_engine.dispose()
 
 
-async def test_temporary_discovery_omission_does_not_remove_device(settings) -> None:
+async def test_temporary_discovery_omission_does_not_remove_device(
+    settings, admin_settings
+) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     client = Client((ring_device(),))
     subject = RingInventoryService(factory, Link(), client)  # type: ignore[arg-type]
-    principal, connection_id = await setup_connection(factory)
+    principal, connection_id = await setup_connection(make_session_factory(admin_engine))
     try:
         await subject.sync_connection(principal, connection_id)  # type: ignore[arg-type]
         client.devices = ()
@@ -178,3 +186,4 @@ async def test_temporary_discovery_omission_does_not_remove_device(settings) -> 
             assert state == "ACTIVE"
     finally:
         await engine.dispose()
+        await admin_engine.dispose()

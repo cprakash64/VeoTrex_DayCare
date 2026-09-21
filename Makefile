@@ -1,4 +1,4 @@
-.PHONY: bootstrap db-up db-down db-test-up db-test-down migrate migrate-test db-test api web edge test lint format typecheck check
+.PHONY: bootstrap db-up db-down db-test-up db-test-down migrate migrate-test db-runtime-role db-test api web edge test lint format typecheck check
 
 COMPOSE := docker compose -f infra/local/compose.yaml
 
@@ -42,7 +42,18 @@ migrate-test:
 	VEOTREX_DATABASE_URL="$${VEOTREX_TEST_DATABASE_URL:?VEOTREX_TEST_DATABASE_URL must be set}" \
 		uv run --all-packages alembic -c apps/api/alembic.ini upgrade head
 
-# Database-backed suite against the validated test cluster.
+# Provision the restricted role the API connects as (V1-00A). Idempotent; re-run after any
+# migration that adds tables or functions. Uses the admin DSN in VEOTREX_MIGRATION_DATABASE_URL
+# (or VEOTREX_DATABASE_URL when no split is configured yet) and reads the runtime password from
+# the git-ignored local secret file. Never pass the password as an argument.
+db-runtime-role:
+	uv run --all-packages python -m veotrex_api.database_targets --require-development
+	uv run --all-packages veotrex-db-runtime-role apply --role veotrex_api \
+		--url-ref "$${VEOTREX_MIGRATION_DATABASE_URL_REF:-env:VEOTREX_DATABASE_URL}" \
+		--password-ref file:$(CURDIR)/infra/local/secrets/postgres_api_password
+
+# Database-backed suite against the validated test cluster. conftest provisions the test
+# runtime role from the admin identity and runs application code as that role.
 db-test:
 	uv run --all-packages python -m veotrex_api.database_targets --require-test
 	uv run --all-packages pytest apps/api/tests

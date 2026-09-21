@@ -31,7 +31,12 @@ def external(subject: str, organization: str) -> ExternalIdentity:
     )
 
 
-async def test_me_authenticates_maps_tenant_and_fails_closed(settings: Settings) -> None:
+async def test_me_authenticates_maps_tenant_and_fails_closed(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    # Fixtures are seeded with the cluster admin; the application itself (create_app below)
+    # connects as the restricted runtime role, exactly as deployed.
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     tenant_a, tenant_b, tenant_c = uuid4(), uuid4(), uuid4()
@@ -45,7 +50,7 @@ async def test_me_authenticates_maps_tenant_and_fails_closed(settings: Settings)
     organization_a_binding = uuid4()
 
     try:
-        async with engine.begin() as connection:
+        async with admin_engine.begin() as connection:
             await connection.execute(
                 text(
                     "INSERT INTO tenants (id, name, status) VALUES "
@@ -163,7 +168,7 @@ async def test_me_authenticates_maps_tenant_and_fails_closed(settings: Settings)
                 await client.get("/v1/me", headers={"Authorization": "Bearer archived-identity"})
             ).status_code == 403
 
-            async with engine.begin() as connection:
+            async with admin_engine.begin() as connection:
                 await connection.execute(
                     text(
                         "UPDATE tenant_identity_bindings SET archived_at = now() "
@@ -176,3 +181,4 @@ async def test_me_authenticates_maps_tenant_and_fails_closed(settings: Settings)
             ).status_code == 403
     finally:
         await engine.dispose()
+        await admin_engine.dispose()

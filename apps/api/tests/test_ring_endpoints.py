@@ -110,7 +110,12 @@ async def test_token_exchange_boundary_and_unauthenticated_claim(settings: Setti
         await engine.dispose()
 
 
-async def test_webhook_boundary_is_bounded_signed_and_durable(settings: Settings) -> None:
+async def test_webhook_boundary_is_bounded_signed_and_durable(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    # The inbox is function-only for the runtime role; clearing and inspecting it is admin work.
+    admin_engine = make_engine(admin_settings)
+    admin_factory = make_session_factory(admin_engine)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
@@ -125,7 +130,7 @@ async def test_webhook_boundary_is_bounded_signed_and_durable(settings: Settings
     request_id = f"endpoint-{uuid4()}"
     raw, signature = signed_webhook(request_id)
     try:
-        async with factory() as session, session.begin():
+        async with admin_factory() as session, session.begin():
             await session.execute(text("DELETE FROM ring_webhook_inbox"))
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             assert (await client.get("/v1/providers/ring/webhooks")).status_code == 405
@@ -170,7 +175,7 @@ async def test_webhook_boundary_is_bounded_signed_and_durable(settings: Settings
             assert [response.status_code for response in responses] == [200, 200]
             assert sorted(response.json()["duplicate"] for response in responses) == [False, True]
             assert await app.state.ring_webhook_service.process_one()
-            async with factory() as session:
+            async with admin_factory() as session:
                 state = await session.scalar(
                     text("SELECT state FROM ring_webhook_inbox WHERE request_id = :request"),
                     {"request": request_id},
@@ -189,3 +194,4 @@ async def test_webhook_boundary_is_bounded_signed_and_durable(settings: Settings
     finally:
         await http.aclose()
         await engine.dispose()
+        await admin_engine.dispose()

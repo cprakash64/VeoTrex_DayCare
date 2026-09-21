@@ -5,6 +5,10 @@ from sqlalchemy import func, select, text
 
 from veotrex_api.authorization import Role
 from veotrex_api.config import Settings
+
+# Provisioning is the privileged, non-public CLI path (veotrex-provision). It runs as the
+# deployment admin identity by design - never as the API runtime role - so every test here
+# uses ``admin_settings``.
 from veotrex_api.db import make_engine, make_session_factory
 from veotrex_api.models import (
     ActorIdentity,
@@ -37,9 +41,9 @@ def request(tenant_id, *, issuer: str = "https://tenant.auth0.example/"):
 
 
 async def test_bootstrap_owner_is_atomic_audited_and_refuses_duplicates(
-    settings: Settings,
+    admin_settings: Settings,
 ) -> None:
-    engine = make_engine(settings)
+    engine = make_engine(admin_settings)
     factory = make_session_factory(engine)
     tenant_id = uuid4()
     bootstrap_request = request(tenant_id)
@@ -101,8 +105,10 @@ async def test_bootstrap_owner_is_atomic_audited_and_refuses_duplicates(
         await engine.dispose()
 
 
-async def test_bootstrap_dry_run_and_invalid_inputs_make_no_changes(settings: Settings) -> None:
-    engine = make_engine(settings)
+async def test_bootstrap_dry_run_and_invalid_inputs_make_no_changes(
+    admin_settings: Settings,
+) -> None:
+    engine = make_engine(admin_settings)
     factory = make_session_factory(engine)
     tenant_id = uuid4()
     try:
@@ -127,8 +133,8 @@ async def test_bootstrap_dry_run_and_invalid_inputs_make_no_changes(settings: Se
         await engine.dispose()
 
 
-async def test_role_change_and_revocation_are_audited(settings: Settings) -> None:
-    engine = make_engine(settings)
+async def test_role_change_and_revocation_are_audited(admin_settings: Settings) -> None:
+    engine = make_engine(admin_settings)
     factory = make_session_factory(engine)
     tenant_id = uuid4()
     try:
@@ -185,9 +191,9 @@ def tenant_request(tenant_id, name: str):
     return CreateTenantRequest(tenant_id=tenant_id, name=name, request_id=f"test:{uuid4()}")
 
 
-async def test_create_tenant_is_idempotent_and_refuses_conflicts(settings: Settings) -> None:
+async def test_create_tenant_is_idempotent_and_refuses_conflicts(admin_settings: Settings) -> None:
     """The step that must precede bootstrap_owner on a deployment with no tenants yet."""
-    engine = make_engine(settings)
+    engine = make_engine(admin_settings)
     factory = make_session_factory(engine)
     tenant_id = uuid4()
     name = f"Staging Daycare {uuid4().hex[:8]}"
@@ -261,7 +267,7 @@ async def test_create_tenant_is_idempotent_and_refuses_conflicts(settings: Setti
         await engine.dispose()
 
 
-async def test_create_tenant_rolls_back_completely_on_failure(settings: Settings) -> None:
+async def test_create_tenant_rolls_back_completely_on_failure(admin_settings: Settings) -> None:
     """A transaction that fails after the insert must leave no tenant and no audit row.
 
     ensure_tenant writes the tenant and its audit event in one transaction owned by the
@@ -269,7 +275,7 @@ async def test_create_tenant_rolls_back_completely_on_failure(settings: Settings
     present but never bound to an organization or an owner - would be invisible to the
     provisioner's own conflict checks on the next run.
     """
-    engine = make_engine(settings)
+    engine = make_engine(admin_settings)
     factory = make_session_factory(engine)
     tenant_id = uuid4()
     name = f"Rollback Daycare {uuid4().hex[:8]}"

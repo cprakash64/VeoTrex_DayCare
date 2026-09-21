@@ -78,6 +78,7 @@ class FakeRingClient:
 
 
 async def create_actor(factory, *, role: Role = Role.TENANT_OWNER) -> AuthenticatedPrincipal:
+    """Seed a tenant and owner. ``factory`` must be the ADMIN session factory."""
     tenant_id, actor_id = uuid4(), uuid4()
     async with factory() as session, session.begin():
         await session.execute(
@@ -120,13 +121,16 @@ def service(settings: Settings, factory, vault, client: FakeRingClient) -> RingL
     return RingLinkService(settings, factory, vault, client, TestSecrets())  # type: ignore[arg-type]
 
 
-async def test_successful_claim_is_atomic_audited_and_replay_safe(settings: Settings) -> None:
+async def test_successful_claim_is_atomic_audited_and_replay_safe(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
     client = FakeRingClient(f"ring-{uuid4().hex}")
     subject = service(settings, factory, vault, client)
-    principal = await create_actor(factory)
+    principal = await create_actor(make_session_factory(admin_engine))
     try:
         assert await subject.receive_authorization_code(SecretStr("code-success")) == "UNCLAIMED"
         timestamp = int(datetime.now(UTC).timestamp() * 1000)
@@ -166,17 +170,22 @@ async def test_successful_claim_is_atomic_audited_and_replay_safe(settings: Sett
             assert "access-" not in serialized and "refresh-" not in serialized
     finally:
         await engine.dispose()
+        await admin_engine.dispose()
 
 
-async def test_permission_patch_recovery_and_cross_tenant_conflict(settings: Settings) -> None:
+async def test_permission_patch_recovery_and_cross_tenant_conflict(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    admin_engine = make_engine(admin_settings)
+    admin_factory = make_session_factory(admin_engine)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
     account_id = f"ring-{uuid4().hex}"
     client = FakeRingClient(account_id)
     subject = service(settings, factory, vault, client)
-    owner = await create_actor(factory)
-    viewer = await create_actor(factory, role=Role.VIEWER)
+    owner = await create_actor(admin_factory)
+    viewer = await create_actor(admin_factory, role=Role.VIEWER)
     try:
         await subject.receive_authorization_code(SecretStr("code-first"))
         timestamp = int(datetime.now(UTC).timestamp() * 1000)
@@ -193,7 +202,7 @@ async def test_permission_patch_recovery_and_cross_tenant_conflict(settings: Set
         resumed = await subject.resume_completion(owner, result.connection_id, "resume")
         assert resumed.state is ConnectionState.ACTIVE
 
-        other_owner = await create_actor(factory)
+        other_owner = await create_actor(admin_factory)
         await subject.receive_authorization_code(SecretStr("code-second"))
         second_time = int(datetime.now(UTC).timestamp() * 1000)
         second_nonce = compute_ring_nonce(second_time, account_id, "test-hmac-key")
@@ -206,11 +215,13 @@ async def test_permission_patch_recovery_and_cross_tenant_conflict(settings: Set
             )
     finally:
         await engine.dispose()
+        await admin_engine.dispose()
 
 
 async def test_users_me_failure_is_safely_retained_without_personal_data(
-    settings: Settings,
+    settings: Settings, admin_settings: Settings
 ) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
@@ -220,7 +231,9 @@ async def test_users_me_failure_is_safely_retained_without_personal_data(
     try:
         state = await subject.receive_authorization_code(SecretStr("code-users-failure"))
         assert state is TokenReceiptState.ACCOUNT_LOOKUP_PENDING
-        async with factory() as session:
+        # ring_pending_links is reachable only through SECURITY DEFINER functions; inspecting
+        # the raw row is an admin-only view.
+        async with make_session_factory(admin_engine)() as session:
             pending = await session.scalar(
                 select(RingPendingLink).where(
                     RingPendingLink.last_failure_category == "provider_unavailable"
@@ -233,17 +246,19 @@ async def test_users_me_failure_is_safely_retained_without_personal_data(
             assert "refresh-1" not in repr(pending.__dict__)
     finally:
         await engine.dispose()
+        await admin_engine.dispose()
 
 
 async def test_refresh_rotation_is_single_writer_and_ambiguous_state_commits(
-    settings: Settings,
+    settings: Settings, admin_settings: Settings
 ) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
     client = FakeRingClient(f"ring-{uuid4().hex}")
     subject = service(settings, factory, vault, client)
-    principal = await create_actor(factory)
+    principal = await create_actor(make_session_factory(admin_engine))
     owner_id, connection_id = uuid4(), uuid4()
     context = CredentialContext("RING", "ring_pending_link", owner_id)
     credential = await vault.store_new(
@@ -319,3 +334,4 @@ async def test_refresh_rotation_is_single_writer_and_ambiguous_state_commits(
             assert disconnected.secret_ref is None
     finally:
         await engine.dispose()
+        await admin_engine.dispose()

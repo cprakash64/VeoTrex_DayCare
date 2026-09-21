@@ -123,17 +123,19 @@ binding, Actor, Actor identity, owner role, and three safe AuditEvents. Duplicat
 without mutation. It accepts and prints no tokens or secrets.
 
 The CLI must use a migration/deployment admin credential with RLS bypass. The production API
-credential must be a non-owner, non-superuser, `NOBYPASSRLS` role granted only needed table
-privileges plus:
+credential is the restricted `veotrex_api` role provisioned by `veotrex-db-runtime-role apply`
+(ADR 0018): `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT`,
+owning nothing, with the table privileges and the SECURITY DEFINER `EXECUTE` grants enumerated in
+`veotrex_api.runtime_role`, including:
 
 ```sql
-GRANT EXECUTE ON FUNCTION resolve_tenant_identity_binding(text, text, text)
-TO your_veotrex_runtime_role;
+GRANT EXECUTE ON FUNCTION resolve_tenant_identity_binding(text, text, text) TO veotrex_api;
 ```
 
 The migration revokes this function from `PUBLIC`. The function has a fixed search path, returns
 only an active Tenant UUID, and performs exact matches. Never give the API the deployment-admin
-credential.
+credential: the API refuses to start as a superuser or `BYPASSRLS` role, and readiness reports
+`privileged_database_role` if such a connection is ever observed.
 
 ## MFA and operational requirements
 
