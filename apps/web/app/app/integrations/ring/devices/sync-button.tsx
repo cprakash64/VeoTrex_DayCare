@@ -3,11 +3,14 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+type SyncState = "ready" | "working" | "synchronized" | "failed";
+
 export function SyncButton({ connectionId }: { connectionId: string }) {
   const router = useRouter();
-  const [state, setState] = useState<"ready" | "working" | "failed">("ready");
+  const [state, setState] = useState<SyncState>("ready");
 
   async function synchronize() {
+    if (state === "working") return;
     setState("working");
     try {
       const response = await fetch("/api/integrations/ring/sync", {
@@ -16,7 +19,7 @@ export function SyncButton({ connectionId }: { connectionId: string }) {
         body: JSON.stringify({ connection_id: connectionId }),
       });
       if (!response.ok) throw new Error("sync failed");
-      setState("ready");
+      setState("synchronized");
       router.refresh();
     } catch {
       setState("failed");
@@ -25,10 +28,21 @@ export function SyncButton({ connectionId }: { connectionId: string }) {
 
   return (
     <div>
-      <button className="primary" type="button" disabled={state === "working"} onClick={synchronize}>
+      <button
+        className="primary"
+        type="button"
+        disabled={state === "working"}
+        aria-busy={state === "working"}
+        onClick={synchronize}
+      >
         {state === "working" ? "Synchronizing…" : "Sync Ring devices"}
       </button>
-      {state === "failed" ? <p role="alert">Ring synchronization is temporarily unavailable.</p> : null}
+      {state === "synchronized" ? (
+        <p role="status">Ring inventory synchronized.</p>
+      ) : null}
+      {state === "failed" ? (
+        <p role="alert">Ring synchronization is temporarily unavailable. Try again later.</p>
+      ) : null}
     </div>
   );
 }

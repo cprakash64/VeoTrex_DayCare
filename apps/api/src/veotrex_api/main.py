@@ -103,6 +103,19 @@ class RingSyncResponse(BaseModel):
     synchronized_at: str
 
 
+class RingConnectionResponse(BaseModel):
+    """Lifecycle and sync state of one Ring connection. No credential or account fields."""
+
+    connection_id: str
+    display_name: str
+    provider: str = "RING"
+    status: str
+    integration_state: str
+    operational_health: str
+    last_synchronized_at: str | None
+    last_sync_failure_category: str | None
+
+
 class RingInventoryCameraResponse(BaseModel):
     camera_id: str
     connection_id: str
@@ -475,6 +488,33 @@ def create_app(
         except RingLinkError:
             raise HTTPException(status_code=404, detail="Ring connection not found") from None
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get(
+        "/v1/integrations/ring/connections",
+        response_model=list[RingConnectionResponse],
+    )
+    async def ring_connections(
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_read_operational)],
+    ) -> list[RingConnectionResponse]:
+        service: RingInventoryService = request.app.state.ring_inventory_service
+        values = await service.list_connections(context.principal)
+        return [
+            RingConnectionResponse(
+                connection_id=str(value.connection_id),
+                display_name=value.display_name,
+                status=value.status,
+                integration_state=value.integration_state,
+                operational_health=value.operational_health,
+                last_synchronized_at=(
+                    value.last_synchronized_at.isoformat()
+                    if value.last_synchronized_at is not None
+                    else None
+                ),
+                last_sync_failure_category=value.last_sync_failure_category,
+            )
+            for value in values
+        ]
 
     @app.get(
         "/v1/integrations/ring/devices",

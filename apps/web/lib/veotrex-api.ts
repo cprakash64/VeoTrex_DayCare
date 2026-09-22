@@ -60,6 +60,23 @@ export async function claimRingLink(nonce: string, time: number): Promise<Respon
   });
 }
 
+export type RingConnection = Readonly<{
+  connection_id: string;
+  display_name: string;
+  provider: "RING";
+  status: string;
+  integration_state: string;
+  operational_health: string;
+  last_synchronized_at: string | null;
+  last_sync_failure_category: string | null;
+}>;
+
+export async function getRingConnections(): Promise<ReadonlyArray<RingConnection>> {
+  const response = await authorizedFetch("/v1/integrations/ring/connections");
+  if (!response.ok) throw new Error("Ring connections are unavailable");
+  return (await response.json()) as ReadonlyArray<RingConnection>;
+}
+
 export type RingInventoryCamera = Readonly<{
   camera_id: string;
   connection_id: string;
