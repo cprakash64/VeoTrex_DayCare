@@ -726,3 +726,121 @@ TENANT_OWNED_TABLES = (
 RLS_TENANT_TABLES = tuple(
     table for table in TENANT_OWNED_TABLES if table != "tenant_identity_bindings"
 )
+
+
+# --------------------------------------------------------------------- staff enrollment (V1-02A)
+# Monitored ADULT staff only. These rows are the people VeoTrex may later recognise in video.
+# They are deliberately separate from Actor/ActorIdentity (authenticated dashboard users) and
+# there is no child counterpart by design: the platform does not build child face identities.
+
+
+class StaffProfile(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    __tablename__ = "staff_profiles"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_staff_profiles_id_tenant"),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'INACTIVE', 'DELETED')", name="ck_staff_profiles_status"
+        ),
+        CheckConstraint(
+            "enrollment_state IN ('EMPTY', 'COLLECTING', 'PROCESSING', 'READY', 'FAILED')",
+            name="ck_staff_profiles_enrollment_state",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_profiles_creator_tenant",
+        ),
+        Index("ix_staff_profiles_tenant_status", "tenant_id", "status"),
+    )
+
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    # Backend-authoritative readiness; never inferred by the UI from image counts.
+    enrollment_state: Mapped[str] = mapped_column(String(20), nullable=False, default="EMPTY")
+    created_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StaffEnrollmentImage(Base, IdMixin, TenantOwnedMixin):
+    """One accepted enrollment photo. Bytes live in the private media store under an opaque
+    server-generated key; the row holds validation metadata only."""
+
+    __tablename__ = "staff_enrollment_images"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_staff_enrollment_images_id_tenant"),
+        CheckConstraint(
+            "status IN ('ACCEPTED', 'DELETED')", name="ck_staff_enrollment_images_status"
+        ),
+        ForeignKeyConstraint(
+            ["staff_profile_id", "tenant_id"],
+            ["staff_profiles.id", "staff_profiles.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_enrollment_images_profile_tenant",
+        ),
+        Index(
+            "uq_staff_enrollment_images_accepted_content",
+            "staff_profile_id",
+            "content_sha256",
+            unique=True,
+            postgresql_where=text("status = 'ACCEPTED'"),
+        ),
+        Index("ix_staff_enrollment_images_profile", "tenant_id", "staff_profile_id"),
+    )
+
+    staff_profile_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    media_key: Mapped[str | None] = mapped_column(String(64))
+    media_type: Mapped[str] = mapped_column(String(32), nullable=False, default="image/jpeg")
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    face_size_px: Mapped[int | None] = mapped_column(Integer)
+    quality: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACCEPTED")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class StaffFaceTemplate(Base, IdMixin, TenantOwnedMixin):
+    """A face template derived from one accepted image. Sensitive biometric material: never
+    serialised by a dashboard route, never logged; leaves the API only through the
+    admin-only recognition package for the edge."""
+
+    __tablename__ = "staff_face_templates"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_staff_face_templates_id_tenant"),
+        CheckConstraint("status IN ('ACTIVE', 'REVOKED')", name="ck_staff_face_templates_status"),
+        CheckConstraint("dimensions >= 1", name="ck_staff_face_templates_dimensions"),
+        ForeignKeyConstraint(
+            ["staff_profile_id", "tenant_id"],
+            ["staff_profiles.id", "staff_profiles.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_face_templates_profile_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["enrollment_image_id", "tenant_id"],
+            ["staff_enrollment_images.id", "staff_enrollment_images.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_face_templates_image_tenant",
+        ),
+        Index("ix_staff_face_templates_profile", "tenant_id", "staff_profile_id", "status"),
+    )
+
+    staff_profile_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    enrollment_image_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    model_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    template_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    dtype: Mapped[str] = mapped_column(String(16), nullable=False)
+    template: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    quality: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

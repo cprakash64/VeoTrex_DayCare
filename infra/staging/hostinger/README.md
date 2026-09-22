@@ -225,6 +225,15 @@ docker compose --env-file "$ENVFILE" --profile maintenance \
 `CLAIMED` links or any credential a `camera_provider_connections` row references, so an
 ACTIVE Ring connection cannot be unlinked by it. No SQL is ever run by hand for this.
 
+## 2c. Staff enrollment media (V1-02A)
+
+The `api` service mounts the named volume `veotrex-daycare-staff-media` at
+`/var/lib/veotrex/staff-media` for teacher enrollment photos. The image creates that directory
+0700 for uid 10001, so a fresh volume inherits it; no host directory is needed. The volume is
+NOT part of the PostgreSQL backup: losing it loses enrollment photos (templates stay in the
+database). Recreate services with `up -d --build --wait api` after deploying this stage; never
+`down -v`. The face backend remains `unavailable` on this host until a model is approved.
+
 ## 3. nginx integration (never touch existing sites)
 
 ```bash

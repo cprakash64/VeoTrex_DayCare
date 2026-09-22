@@ -12,6 +12,9 @@ dependencies = [
   # [socks] pulls socksio, which HTTPX uses for SOCKS proxy support. Required only when
   # VEOTREX_RING_API_PROXY_URL points at a socks5 proxy; inert otherwise.
   "httpx[socks]==0.28.1",
+  # Staff enrollment image validation (decode, orientation, canonical re-encode). Already
+  # resolved at this exact version in uv.lock via the edge-agent qualification group.
+  "pillow==12.3.0",
   "psycopg[binary]==3.2.9",
   "pydantic-settings==2.10.1",
   "pyjwt[crypto]==2.13.0",
@@ -30,6 +33,7 @@ veotrex-ring-readiness = "veotrex_api.ring_readiness:main"
 veotrex-provision = "veotrex_api.provision_cli:main"
 veotrex-db-runtime-role = "veotrex_api.runtime_role:main"
 veotrex-ring-pending-expiry = "veotrex_api.ring_pending_expiry:main"
+veotrex-staff-recognition-package = "veotrex_api.staff_package:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/veotrex_api"]

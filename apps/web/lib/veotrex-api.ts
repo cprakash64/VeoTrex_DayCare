@@ -101,3 +101,77 @@ export async function syncRingConnection(connectionId: string): Promise<Response
     method: "POST",
   });
 }
+
+// ------------------------------------------------------------------ staff enrollment (V1-02A)
+import type { EnrollmentImageSummary, StaffSummary } from "./staff";
+
+export async function getStaff(): Promise<ReadonlyArray<StaffSummary>> {
+  const response = await authorizedFetch("/v1/staff");
+  if (!response.ok) throw new Error("Staff roster is unavailable");
+  return (await response.json()) as ReadonlyArray<StaffSummary>;
+}
+
+export async function getStaffMember(staffId: string): Promise<StaffSummary | null> {
+  const response = await authorizedFetch(`/v1/staff/${encodeURIComponent(staffId)}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("Staff profile is unavailable");
+  return (await response.json()) as StaffSummary;
+}
+
+export async function getStaffImages(staffId: string): Promise<ReadonlyArray<EnrollmentImageSummary>> {
+  const response = await authorizedFetch(`/v1/staff/${encodeURIComponent(staffId)}/enrollment-images`);
+  if (!response.ok) throw new Error("Enrollment photos are unavailable");
+  return (await response.json()) as ReadonlyArray<EnrollmentImageSummary>;
+}
+
+export async function createStaff(displayName: string): Promise<Response> {
+  return authorizedFetch("/v1/staff", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+export async function renameStaff(staffId: string, displayName: string): Promise<Response> {
+  return authorizedFetch(`/v1/staff/${encodeURIComponent(staffId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+}
+
+export async function setStaffActive(staffId: string, active: boolean): Promise<Response> {
+  return authorizedFetch(
+    `/v1/staff/${encodeURIComponent(staffId)}/${active ? "activate" : "deactivate"}`,
+    { method: "POST" },
+  );
+}
+
+export async function deleteStaff(staffId: string): Promise<Response> {
+  return authorizedFetch(`/v1/staff/${encodeURIComponent(staffId)}`, { method: "DELETE" });
+}
+
+export async function uploadStaffImage(
+  staffId: string,
+  bytes: ArrayBuffer,
+  mediaType: string,
+): Promise<Response> {
+  return authorizedFetch(`/v1/staff/${encodeURIComponent(staffId)}/enrollment-images`, {
+    method: "POST",
+    headers: { "Content-Type": mediaType },
+    body: bytes,
+  });
+}
+
+export async function deleteStaffImage(staffId: string, imageId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/staff/${encodeURIComponent(staffId)}/enrollment-images/${encodeURIComponent(imageId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getStaffImageContent(staffId: string, imageId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/staff/${encodeURIComponent(staffId)}/enrollment-images/${encodeURIComponent(imageId)}/content`,
+  );
+}

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { auth0 } from "../../lib/auth0";
@@ -24,7 +25,10 @@ export default async function ApplicationShell() {
         <h2 id="access-heading">Your access</h2>
         <p>{identity.roles.map(({ role }) => role.replaceAll("_", " ")).join(", ")}</p>
       </section>
-      <a className="primary" href="/app/integrations/ring/devices">View Ring device inventory</a>
+      <nav aria-label="Sections">
+        <Link className="primary" href="/app/staff">Teachers &amp; staff</Link>
+        <a className="secondary" href="/app/integrations/ring/devices">Ring device inventory</a>
+      </nav>
     </main>
   );
 }

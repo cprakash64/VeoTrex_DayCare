@@ -153,11 +153,16 @@ services:
       # until the variable is given a value. Deliberately NOT HTTPS_PROXY: that would also
       # capture Auth0/JWKS and Ring OAuth.
       VEOTREX_RING_API_PROXY_URL: ${VEOTREX_RING_API_PROXY_URL:-}
+      # Staff enrollment photos (V1-02A): private named volume, opaque keys, 0600 files.
+      # The face backend stays "unavailable" until a licence-approved model is adopted.
+      VEOTREX_STAFF_MEDIA_DIR: /var/lib/veotrex/staff-media
     secrets:
       - api_database_url
       - vault_master_key
       - ring_client_secret
       - ring_hmac_signing_key
+    volumes:
+      - veotrex-daycare-staff-media:/var/lib/veotrex/staff-media
     # `app` provides outbound Internet access (Ring OAuth, api.amazonvision.com); `data` reaches
     # PostgreSQL. Making `app` internal would break Ring entirely.
     networks: [app, data]
@@ -221,3 +226,5 @@ secrets:
 
 volumes:
   veotrex-daycare-postgres:
+  # Enrollment photos are not in the PostgreSQL dump; see docs/adr/0019.
+  veotrex-daycare-staff-media:

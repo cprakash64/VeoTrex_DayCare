@@ -55,6 +55,13 @@ os.environ.pop("VEOTREX_DATABASE_URL_REF", None)
 os.environ.pop("VEOTREX_MIGRATION_DATABASE_URL", None)
 os.environ.pop("VEOTREX_MIGRATION_DATABASE_URL_REF", None)
 os.environ.setdefault("VEOTREX_ENVIRONMENT", "test")
+# Staff enrollment (V1-02A): the API refuses to start without a writable private media
+# directory, so every test app gets a fresh per-session one unless the environment names one.
+import tempfile  # noqa: E402
+
+os.environ.setdefault(
+    "VEOTREX_STAFF_MEDIA_DIR", tempfile.mkdtemp(prefix="veotrex-staff-media-test-")
+)
 os.environ.setdefault("VEOTREX_APP_VERSION", "0.1.0-test")
 
 
