@@ -166,6 +166,20 @@ def test_pending_expiry_job_is_a_read_only_by_default_maintenance_profile(
     assert job["networks"] == ["data"]
 
 
+def test_staff_media_volume_is_private_and_named(compose: dict[str, Any]) -> None:
+    """V1-02A: enrollment photos live on a named volume mounted only by the API."""
+    api = compose["services"]["api"]
+    assert api["volumes"] == ["veotrex-daycare-staff-media:/var/lib/veotrex/staff-media"]
+    assert api["environment"]["VEOTREX_STAFF_MEDIA_DIR"] == "/var/lib/veotrex/staff-media"
+    assert "VEOTREX_STAFF_FACE_BACKEND" not in api["environment"], "production stays unavailable"
+    assert "veotrex-daycare-staff-media" in compose["volumes"]
+    for name, service in compose["services"].items():
+        if name != "api":
+            assert "staff-media" not in str(service.get("volumes", []))
+    dockerfile = (REPOSITORY / "infra" / "staging" / "Dockerfile.api").read_text()
+    assert "install -d -m 0700 -o veotrex -g veotrex /var/lib/veotrex/staff-media" in dockerfile
+
+
 def test_migration_remains_a_discrete_job(compose: dict[str, Any]) -> None:
     migrate = compose["services"]["migrate"]
     assert migrate["profiles"] == ["migrate"]

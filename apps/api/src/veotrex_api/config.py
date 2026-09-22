@@ -82,6 +82,26 @@ class Settings(BaseSettings):
     public_origin: str = ""
     # Reference (never the value) to the vault AEAD master key, resolved through SecretResolver.
     vault_master_key_ref: str = Field(default="env:VEOTREX_VAULT_MASTER_KEY", repr=False)
+    # Staff enrollment (V1-02A). Enrollment photos are written under this private directory
+    # with opaque server-generated keys; it must be writable by the API process only.
+    staff_media_dir: str = Field(default="/var/lib/veotrex/staff-media", min_length=1)
+    staff_enrollment_image_bytes: int = Field(default=8_388_608, ge=65_536, le=33_554_432)
+    staff_enrollment_upload_rate_limit_per_minute: int = Field(default=60, ge=1, le=600)
+    # Face-template backend: "unavailable" (production default until a licence-approved model
+    # is adopted; uploads are refused with a bounded category) or "fake" (deterministic,
+    # test/local only; never a real biometric). A real backend is a later, explicit decision.
+    staff_face_backend: str = Field(default="unavailable", pattern=r"^(unavailable|fake)$")
+
+    @model_validator(mode="after")
+    def fake_face_backend_only_outside_production(self) -> "Settings":
+        if self.staff_face_backend == "fake" and self.environment not in {
+            "test",
+            "local",
+            "development",
+            "ci",
+        }:
+            raise ValueError("the fake face backend is permitted only in test/local environments")
+        return self
 
     @model_validator(mode="before")
     @classmethod

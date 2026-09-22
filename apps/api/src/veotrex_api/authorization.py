@@ -16,6 +16,9 @@ class Permission(StrEnum):
     MANAGE_FACILITIES = "manage:facilities"
     MANAGE_INTEGRATIONS = "manage:integrations"
     MANAGE_MEMBERS = "manage:members"
+    # Staff (adult teacher) enrollment lifecycle: create, photos, activate, deactivate, delete.
+    # Tenant owner only; viewers read the roster through READ_OPERATIONAL.
+    MANAGE_STAFF = "manage:staff"
     ADMINISTER_FACILITY = "administer:facility"
     CONFIGURE_FACILITY_CAMERAS = "configure:facility-cameras"
     REVIEW_SAFETY_DATA = "review:safety-data"

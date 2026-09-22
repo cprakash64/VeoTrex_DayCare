@@ -46,7 +46,8 @@ FROM python:3.12-slim-bookworm AS runtime
 
 # Non-root runtime. The application never needs to write to its own image.
 RUN groupadd --system --gid 10001 veotrex \
- && useradd --system --uid 10001 --gid veotrex --home /app --shell /usr/sbin/nologin veotrex
+ && useradd --system --uid 10001 --gid veotrex --home /app --shell /usr/sbin/nologin veotrex \
+ && install -d -m 0700 -o veotrex -g veotrex /var/lib/veotrex/staff-media
 
 WORKDIR /app
 

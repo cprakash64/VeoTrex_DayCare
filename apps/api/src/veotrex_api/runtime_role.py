@@ -138,6 +138,20 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "cameras": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
     "camera_provider_devices": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
     "camera_provider_components": _write("inventory reconciliation", "SELECT", "INSERT", "UPDATE"),
+    # Staff enrollment (V1-02A): soft delete only, DELETE never granted.
+    "staff_profiles": _write("staff roster and enrollment state", "SELECT", "INSERT", "UPDATE"),
+    "staff_enrollment_images": _write(
+        "enrollment photo metadata; bytes live in the private media store",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "staff_face_templates": _write(
+        "biometric templates; revoked by status, exported only by the admin package tool",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
     "provider_events": _append("provider telemetry, deduplicated on request id"),
     "audit_events": _append("audit trail; the runtime can never rewrite or remove an entry"),
     # Global by design; reached only through the vault functions (migration 0006).

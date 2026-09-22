@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -33,6 +34,7 @@ from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
     VaultKeyProvider,
 )
+from veotrex_api.face_backend import FaceEnrollmentBackend, backend_for
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.request_media import (
@@ -48,6 +50,9 @@ from veotrex_api.ring_inventory_service import RingInventoryError, RingInventory
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
 from veotrex_api.secrets import DefaultSecretResolver, SecretResolver
+from veotrex_api.staff_api import is_enrollment_upload, register_staff_routes
+from veotrex_api.staff_media import ALLOWED_MEDIA_TYPES, StaffMediaStore
+from veotrex_api.staff_service import StaffEnrollmentService
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
 require_manage_integrations = require_permission(Permission.MANAGE_INTEGRATIONS)
@@ -181,6 +186,8 @@ def create_app(
     credential_vault: CredentialVault | None = None,
     ring_client: RingClient | None = None,
     secret_resolver: SecretResolver | None = None,
+    face_backend: FaceEnrollmentBackend | None = None,
+    staff_media: StaffMediaStore | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     configure_logging(resolved_settings)
@@ -208,6 +215,13 @@ def create_app(
         resolved_vault,
         inventory_service,
     )
+    resolved_media = staff_media or StaffMediaStore(Path(resolved_settings.staff_media_dir))
+    staff_service = StaffEnrollmentService(
+        resolved_factory,
+        resolved_media,
+        face_backend or backend_for(resolved_settings.staff_face_backend),
+        max_image_bytes=resolved_settings.staff_enrollment_image_bytes,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -228,6 +242,11 @@ def create_app(
             logger.warning("database_role_check_deferred", dependency="database")
         else:
             logger.info("database_role_verified", role=identity.role)
+        try:
+            resolved_media.ensure_ready()
+        except OSError:
+            logger.error("staff_media_dir_unavailable")
+            raise
         logger.info(
             "service_started",
             service=resolved_settings.service_name,
@@ -251,6 +270,15 @@ def create_app(
         limit=resolved_settings.ring_token_exchange_rate_limit_per_minute,
         window_seconds=60,
     )
+    app.state.staff_service = staff_service
+    register_staff_routes(
+        app,
+        staff_service,
+        AuthenticationFailureLogLimiter(
+            limit=resolved_settings.staff_enrollment_upload_rate_limit_per_minute,
+            window_seconds=60,
+        ),
+    )
 
     @app.middleware("http")
     async def request_context(
@@ -262,10 +290,13 @@ def create_app(
             body_limit: int | None = None
             media_type = ""
             is_token_exchange = request.url.path == "/v1/integrations/ring/token-exchange"
+            is_enrollment_image = is_enrollment_upload(request.method, request.url.path)
             if is_token_exchange:
                 body_limit = resolved_settings.ring_token_exchange_body_bytes
             elif request.url.path == "/v1/providers/ring/webhooks":
                 body_limit = resolved_settings.ring_webhook_body_bytes
+            elif is_enrollment_image:
+                body_limit = resolved_settings.staff_enrollment_image_bytes
             if body_limit is not None:
                 media_type = normalize_media_type(request.headers.get("content-type"))
 
@@ -285,11 +316,12 @@ def create_app(
                     return observed(status.HTTP_405_METHOD_NOT_ALLOWED)
                 # A closed allowlist per endpoint. The webhook contract is unchanged; only the
                 # token exchange accepts the shapes Ring's Java client actually sends.
-                accepted = (
-                    TOKEN_EXCHANGE_MEDIA_TYPES
-                    if is_token_exchange
-                    else frozenset({"application/json"})
-                )
+                if is_token_exchange:
+                    accepted = TOKEN_EXCHANGE_MEDIA_TYPES
+                elif is_enrollment_image:
+                    accepted = ALLOWED_MEDIA_TYPES
+                else:
+                    accepted = frozenset({"application/json"})
                 if media_type not in accepted:
                     return observed(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
                 raw_length = request.headers.get("content-length")
