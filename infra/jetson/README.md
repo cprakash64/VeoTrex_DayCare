@@ -55,8 +55,27 @@ infra/jetson/veotrex-edge-ctl.sh preflight
 sudo infra/jetson/veotrex-edge-ctl.sh install
 ```
 
-`install` is idempotent: identity, directories, `edge.env` (generated node id, kept if present),
-the unit, `systemd-analyze verify`, `daemon-reload`, `enable`. It does not start anything.
+`preflight` is read-only and runs as any user. `/etc/veotrex-edge` is `0750 root:veotrex-edge`,
+so the operator cannot see whether `edge.env` exists inside it; preflight and status then
+report `config: protected (presence not observable as <user>; /etc/veotrex-edge is not
+searchable)` rather than guessing. Only a privileged run reports the file's metadata. The
+directory mode is never weakened to make the report prettier.
+
+`install` is idempotent and safe on any partial state: identity (created once, groups
+converged to exactly `video render`), directories, `edge.env` (generated node id, preserved
+byte for byte if present), the unit, a pre-release `systemd-analyze verify`, `daemon-reload`.
+It never starts and never enables the service: before the first `activate` there is no
+`/opt/veotrex-edge/current`, so the ExecStart target does not exist by design, and a unit whose
+executable is known to be absent must not be wired into boot. `install` ends with
+
+```
+host infrastructure installed: account, directories, config, unit (daemon reloaded)
+release not yet activated: /opt/veotrex-edge/current absent
+service intentionally disabled and inactive until 'activate <sha>'
+```
+
+which is the intended state, not a failure. If an earlier attempt left the unit enabled
+without a release, `install` disables it.
 
 ```bash
 infra/jetson/veotrex-edge-ctl.sh build
@@ -66,9 +85,31 @@ infra/jetson/veotrex-edge-ctl.sh build
 sudo infra/jetson/veotrex-edge-ctl.sh activate <sha> --restart
 ```
 
-`activate --restart` waits up to 90 s for `active` with a status line beginning `ready`; it
-exits 2 on `degraded` (agent up, GPU worker not READY) and 1 on failure, printing the last
-journal lines and the rollback command.
+`activate` is where boot enablement happens: it switches `current` atomically, checks the
+ExecStart target is executable, runs the **strict** `systemd-analyze verify` on the installed
+unit, `daemon-reload`s and only then `systemctl enable`s. If verify fails it restores the
+previous `current` (or removes the symlink on a first activation), enables nothing, and
+exits 1. `--restart` then restarts and waits up to 90 s for `active` with a status line
+beginning `ready`; it exits 2 on `degraded` (agent up, GPU worker not READY) and 1 on
+failure, printing the last journal lines and the rollback command.
+
+### systemd verify policy
+
+| Phase | `systemd-analyze verify` | Tolerated finding |
+|---|---|---|
+| `install`, no `current` yet | pre-release | exactly `Command /opt/veotrex-edge/current/venv/bin/veotrex-edge-agent is not executable: No such file or directory`; anything else about the unit fails the install |
+| `install` with a `current` | strict | none |
+| `activate` (every time) | strict | none; failure rolls the symlink back and never enables |
+
+No placeholder executable and no wrapper is ever installed to satisfy the tool.
+
+### Recovering a partial first install
+
+An interrupted `install` (for example, the shell closing after `sudo`) leaves a safe,
+convergent state: account and groups, directories, `edge.env`, the unit; no `current`, service
+disabled and inactive, no processes. Re-running `sudo infra/jetson/veotrex-edge-ctl.sh install`
+reuses the account, preserves `edge.env` and its node id byte for byte, re-asserts modes,
+reloads systemd, and reports the lines above. Then continue with `build` and `activate`.
 
 ## Update
 
@@ -106,6 +147,13 @@ ready commit=9deae867020f version=0.1.0+9deae867020f worker=READY worker_restart
 | readiness | configuration valid, startup complete: `READY=1` sent, unit `active (running)` | `systemctl is-active veotrex-edge` |
 | degraded | alive and ready, GPU worker not READY; `last_error=` names the safe category | `Status:` line starts with `degraded` |
 | version | `commit=` and `version=` in the status line; `/opt/veotrex-edge/current/release.env` | `infra/jetson/veotrex-edge-ctl.sh status` |
+
+`systemctl show -p WatchdogUSec` reports the *effective* watchdog of the running instance:
+`infinity` whenever the service is not running (never started, or stopped) and `1min` while
+it runs. The configured value is always visible with `systemctl cat veotrex-edge | grep
+Watchdog`. `infinity` on an inactive unit is therefore expected and is not a unit defect;
+the proof that matters is `WatchdogUSec=1min` plus an advancing `WatchdogTimestamp` on the
+running system service.
 | restarts | `NRestarts` (systemd) and `worker_restarts=` (agent's own worker recoveries) | `systemctl show -p NRestarts veotrex-edge` |
 
 Readiness deliberately does not depend on Ring, the VPS or any network: an offline daycare LAN
