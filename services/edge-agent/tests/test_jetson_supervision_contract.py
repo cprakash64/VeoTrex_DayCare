@@ -117,9 +117,18 @@ def test_control_script_deployment_rules() -> None:
     assert "systemd-analyze verify" in text
     assert not re.search(r"^\s*docker\b|docker\.sock", text, re.M)
     assert "chown -R" not in text
-    assert 'ln -sfn "$dest" "$CURRENT_LINK.tmp"; mv -T' in text, "atomic release switch"
-    assert "kept existing $CONF_FILE" in text, "install must never overwrite config"
+    assert 'ln -sfn "$1" "$CURRENT_LINK.tmp"; mv -T "$CURRENT_LINK.tmp" "$CURRENT_LINK"' in text
+    assert "config preserved: $CONF_FILE" in text, "install must never overwrite config"
     assert "require_operator build" in text and "require_root install" in text
+    # V1-00B-R1 lifecycle: install verifies pre-release and never enables; activate verifies
+    # strictly and is the only place boot enablement happens.
+    assert "verify_unit pre-release || die" in text and "verify_unit strict" in text
+    assert text.count('systemctl enable "$UNIT_NAME"') == 1
+    assert text.index('systemctl enable "$UNIT_NAME"') > text.index("cmd_activate() {")
+    assert text.index("cmd_install() {") < text.index("cmd_activate() {")
+    assert 'grep -vF "Command $UNIT_EXEC is not executable"' in text
+    assert "protected (presence not observable as" in text
+    assert "VEOTREX_EDGE_CTL_TEST_MODE is for unprivileged tests only, never root" in text
     for path in (UNIT, CTL, HARNESS, ENV_EXAMPLE, README):
         assert path.exists(), path
     assert CTL.stat().st_mode & 0o111, "control script must be executable"
@@ -135,5 +144,8 @@ def test_readme_documents_journal_and_rollback() -> None:
         "veotrex-edge-ctl.sh rollback",
         "systemctl status veotrex-edge",
         "RestartPreventExitStatus",
+        "protected (presence not observable as",
+        "service intentionally disabled and inactive until 'activate <sha>'",
+        "WatchdogUSec",
     ):
         assert needle in text, needle
