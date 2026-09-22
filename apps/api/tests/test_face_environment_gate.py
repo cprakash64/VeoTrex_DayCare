@@ -35,7 +35,10 @@ from veotrex_api.face_opencv import (
     build,
 )
 
-DSN = "postgresql+psycopg://veotrex:not-a-real-password@127.0.0.1:1/veotrex"
+# Unreachable sentinel host, and the repository's documented REPLACE_WITH placeholder:
+# nothing here connects, and the tracked-file credential scan in
+# test_local_database_topology must be able to see at a glance that this is not one.
+DSN = "postgresql+psycopg://veotrex:REPLACE_WITH_TEST_PASSWORD@127.0.0.1:1/veotrex"
 REFUSED_ENVIRONMENTS = ("staging", "production", "prod", "hostinger", "demo")
 
 
