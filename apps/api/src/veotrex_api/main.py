@@ -6,7 +6,6 @@ from uuid import UUID, uuid4
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -22,7 +21,14 @@ from veotrex_api.credential_vault import (
     InMemoryCredentialVault,
     UnavailableCredentialVault,
 )
-from veotrex_api.db import make_engine, make_session_factory
+from veotrex_api.db import (
+    PrivilegedDatabaseRole,
+    inspect_role,
+    make_engine,
+    make_session_factory,
+    require_unprivileged,
+    verify_runtime_role,
+)
 from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
     VaultKeyProvider,
@@ -52,6 +58,8 @@ class HealthResponse(BaseModel):
     service: str
     version: str
     environment: str
+    # Present only when not ready: which dependency or invariant failed. Never a DSN.
+    reason: str | None = None
 
 
 class RoleSummary(BaseModel):
@@ -190,6 +198,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # Tenant isolation is PostgreSQL Row Level Security, which a superuser or BYPASSRLS
+        # role is exempt from. Such a connection is a configuration fault: refuse to start.
+        # An unreachable database is an availability condition instead; readiness keeps
+        # re-checking the role and stays not-ready until it can prove the boundary.
+        try:
+            identity = await verify_runtime_role(resolved_engine)
+        except PrivilegedDatabaseRole as exc:
+            logger.error(
+                "database_role_privileged",
+                role=exc.identity.role,
+                violations=list(exc.identity.violations),
+            )
+            raise
+        except SQLAlchemyError:
+            logger.warning("database_role_check_deferred", dependency="database")
+        else:
+            logger.info("database_role_verified", role=identity.role)
         logger.info(
             "service_started",
             service=resolved_settings.service_name,
@@ -298,7 +323,7 @@ def create_app(
         finally:
             structlog.contextvars.clear_contextvars()
 
-    @app.get("/health/live", response_model=HealthResponse)
+    @app.get("/health/live", response_model=HealthResponse, response_model_exclude_none=True)
     async def live() -> HealthResponse:
         return HealthResponse(
             status="ok",
@@ -307,21 +332,38 @@ def create_app(
             environment=resolved_settings.environment,
         )
 
-    @app.get("/health/ready", response_model=HealthResponse)
+    @app.get("/health/ready", response_model=HealthResponse, response_model_exclude_none=True)
     async def ready(response: Response) -> HealthResponse:
+        # Readiness proves two things on every call: the database answers, and the role it
+        # answers as is subject to Row Level Security. A privileged role is reported as its own
+        # reason so an orchestrator's health gate fails the rollout rather than serving traffic.
         health_status = "ready"
+        reason: str | None = None
         try:
             async with resolved_engine.connect() as connection:
-                await connection.execute(text("SELECT 1"))
+                require_unprivileged(await inspect_role(connection))
+        except PrivilegedDatabaseRole as exc:
+            health_status = "not_ready"
+            reason = "privileged_database_role"
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            logger.error(
+                "readiness_check_failed",
+                dependency="database",
+                reason=reason,
+                role=exc.identity.role,
+                violations=list(exc.identity.violations),
+            )
         except SQLAlchemyError:
             health_status = "not_ready"
+            reason = "database_unavailable"
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            logger.warning("readiness_check_failed", dependency="database")
+            logger.warning("readiness_check_failed", dependency="database", reason=reason)
         return HealthResponse(
             status=health_status,
             service=resolved_settings.service_name,
             version=resolved_settings.app_version,
             environment=resolved_settings.environment,
+            reason=reason,
         )
 
     @app.get("/v1/me", response_model=MeResponse)

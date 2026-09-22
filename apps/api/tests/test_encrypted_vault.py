@@ -105,10 +105,12 @@ def test_context_fields_containing_the_separator_are_rejected() -> None:
 
 
 # --------------------------------------------------------------------- database-backed
-# conftest.py has already resolved and validated the isolated test target and placed it in
-# VEOTREX_DATABASE_URL. Re-resolving here would compare that value against itself and be
-# refused as "shares the development cluster", so the validated value is consumed directly.
+# conftest.py has already resolved and validated the isolated test target: VEOTREX_DATABASE_URL
+# is the restricted runtime role the vault runs as in production, and VEOTREX_TEST_DATABASE_URL
+# the cluster admin used only to make sure the schema exists. Re-resolving here would compare
+# the value against itself and be refused, so the validated values are consumed directly.
 DATABASE_URL = os.environ["VEOTREX_DATABASE_URL"]
+ADMIN_DATABASE_URL = os.environ["VEOTREX_TEST_DATABASE_URL"]
 
 
 def _database_available() -> bool:
@@ -130,13 +132,11 @@ pytestmark_db = pytest.mark.skipif(
 
 @pytest.fixture
 async def vault_factory():  # type: ignore[no-untyped-def]
+    """Runtime session factory for the vault under test. The vault holds no table privilege;
+    every operation goes through the vault_credential_* functions (migration 0006)."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    from veotrex_api.models import Base, EncryptedCredential
-
     engine = create_async_engine(DATABASE_URL)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all, tables=[EncryptedCredential.__table__])
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         yield factory
@@ -144,16 +144,64 @@ async def vault_factory():  # type: ignore[no-untyped-def]
         await engine.dispose()
 
 
+@pytest.fixture
+async def admin_factory():  # type: ignore[no-untyped-def]
+    """Admin session factory used ONLY to tamper with and inspect stored rows."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(ADMIN_DATABASE_URL)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture
+async def context(admin_factory) -> CredentialContext:  # type: ignore[no-untyped-def]
+    """A credential context the runtime is entitled to: a tenant whose connection references
+    the owner id. Without such a binding the functions answer 'unavailable' by design."""
+    from sqlalchemy import text
+
+    tenant_id, actor_id, owner_id = uuid4(), uuid4(), uuid4()
+    async with admin_factory() as session, session.begin():
+        await session.execute(
+            text("INSERT INTO tenants (id, name, status) VALUES (:id, 'Vault', 'ACTIVE')"),
+            {"id": tenant_id},
+        )
+        await session.execute(
+            text("SELECT set_config('app.tenant_id', :id, true)"), {"id": str(tenant_id)}
+        )
+        await session.execute(
+            text(
+                "INSERT INTO actors (id, tenant_id, display_name, status) "
+                "VALUES (:actor, :tenant, 'Owner', 'ACTIVE')"
+            ),
+            {"actor": actor_id, "tenant": tenant_id},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO camera_provider_connections "
+                "(id, tenant_id, name, provider_type, status, integration_state, "
+                "credential_owner_id, linked_by_actor_id, linked_at, access_expires_at) "
+                "VALUES (:id, :tenant, 'Vault ring', 'RING', 'ACTIVE', 'ACTIVE', :owner, "
+                ":actor, now(), now() + interval '1 hour')"
+            ),
+            {"id": uuid4(), "tenant": tenant_id, "owner": owner_id, "actor": actor_id},
+        )
+    return CredentialContext("RING", "ring_pending_link", owner_id, tenant_id=tenant_id)
+
+
 @pytestmark_db
-async def test_round_trip_stores_only_ciphertext(vault_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_round_trip_stores_only_ciphertext(vault_factory, admin_factory, context) -> None:  # type: ignore[no-untyped-def]
     from sqlalchemy import select
 
     from veotrex_api.models import EncryptedCredential
 
     vault = EncryptedCredentialVault(vault_factory, key_provider())
-    stored = await vault.store_new(CONTEXT, material())
+    stored = await vault.store_new(context, material())
     assert stored.secret_ref.startswith(SECRET_REF_PREFIX) and stored.version == 1
-    async with vault_factory() as session:
+    async with admin_factory() as session:
         record = await session.scalar(
             select(EncryptedCredential).where(
                 EncryptedCredential.id == UUID(stored.secret_ref.removeprefix(SECRET_REF_PREFIX))
@@ -163,33 +211,41 @@ async def test_round_trip_stores_only_ciphertext(vault_factory) -> None:  # type
     blob = bytes(record.ciphertext) + bytes(record.nonce)
     assert SYNTHETIC_ACCESS.encode() not in blob
     assert SYNTHETIC_REFRESH.encode() not in blob
-    opened = await vault.get(stored.secret_ref, CONTEXT)
+    opened = await vault.get(stored.secret_ref, context)
     assert opened.material.access_token.get_secret_value() == f"{SYNTHETIC_ACCESS}-1"
     assert opened.material.refresh_token.get_secret_value() == f"{SYNTHETIC_REFRESH}-1"
-    await vault.delete(stored.secret_ref, CONTEXT)
+    await vault.delete(stored.secret_ref, context)
     with pytest.raises(CredentialVaultError, match="unavailable"):
-        await vault.get(stored.secret_ref, CONTEXT)
+        await vault.get(stored.secret_ref, context)
 
 
 @pytestmark_db
-async def test_wrong_context_and_tampering_are_rejected(vault_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_wrong_context_and_tampering_are_rejected(
+    vault_factory, admin_factory, context
+) -> None:  # type: ignore[no-untyped-def]
     from sqlalchemy import select
 
     from veotrex_api.models import EncryptedCredential
 
     vault = EncryptedCredentialVault(vault_factory, key_provider())
-    stored = await vault.store_new(CONTEXT, material())
+    stored = await vault.store_new(context, material())
     identifier = UUID(stored.secret_ref.removeprefix(SECRET_REF_PREFIX))
     for wrong in (
-        CredentialContext("OTHER", CONTEXT.owner_kind, CONTEXT.owner_id),
-        CredentialContext(CONTEXT.provider, "other_kind", CONTEXT.owner_id),
-        CredentialContext(CONTEXT.provider, CONTEXT.owner_kind, uuid4()),
+        CredentialContext(
+            "OTHER", context.owner_kind, context.owner_id, tenant_id=context.tenant_id
+        ),
+        CredentialContext(
+            context.provider, "other_kind", context.owner_id, tenant_id=context.tenant_id
+        ),
+        CredentialContext(
+            context.provider, context.owner_kind, uuid4(), tenant_id=context.tenant_id
+        ),
     ):
         with pytest.raises(CredentialVaultError, match="context mismatch"):
             await vault.get(stored.secret_ref, wrong)
     # Tamper with ciphertext, then nonce, then the bound version: each must fail authentication.
     for mutate in ("ciphertext", "nonce", "version"):
-        async with vault_factory() as session, session.begin():
+        async with admin_factory() as session, session.begin():
             record = await session.scalar(
                 select(EncryptedCredential).where(EncryptedCredential.id == identifier)
             )
@@ -204,8 +260,8 @@ async def test_wrong_context_and_tampering_are_rejected(vault_factory) -> None: 
             else:
                 record.version = record.version + 5
         with pytest.raises(CredentialVaultError, match="authenticated|context mismatch"):
-            await vault.get(stored.secret_ref, CONTEXT)
-        async with vault_factory() as session, session.begin():
+            await vault.get(stored.secret_ref, context)
+        async with admin_factory() as session, session.begin():
             record = await session.scalar(
                 select(EncryptedCredential).where(EncryptedCredential.id == identifier)
             )
@@ -214,52 +270,56 @@ async def test_wrong_context_and_tampering_are_rejected(vault_factory) -> None: 
     # A different master key cannot open the record either.
     other_vault = EncryptedCredentialVault(vault_factory, key_provider())
     with pytest.raises(CredentialVaultError, match="authenticated"):
-        await other_vault.get(stored.secret_ref, CONTEXT)
-    await vault.delete(stored.secret_ref, CONTEXT)
+        await other_vault.get(stored.secret_ref, context)
+    await vault.delete(stored.secret_ref, context)
 
 
 @pytestmark_db
-async def test_rotation_is_compare_and_swap_and_rejects_stale_writers(vault_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_rotation_is_compare_and_swap_and_rejects_stale_writers(
+    vault_factory, context
+) -> None:  # type: ignore[no-untyped-def]
     vault = EncryptedCredentialVault(vault_factory, key_provider())
-    stored = await vault.store_new(CONTEXT, material("5"))
-    rotated = await vault.replace_if_version(stored.secret_ref, CONTEXT, 1, material("6"))
+    stored = await vault.store_new(context, material("5"))
+    rotated = await vault.replace_if_version(stored.secret_ref, context, 1, material("6"))
     assert rotated.version == 2
     # A worker still holding version 1 must not overwrite the newer refresh token.
     with pytest.raises(CredentialVersionConflict, match="generation changed"):
-        await vault.replace_if_version(stored.secret_ref, CONTEXT, 1, material("stale"))
-    current = await vault.get(stored.secret_ref, CONTEXT)
+        await vault.replace_if_version(stored.secret_ref, context, 1, material("stale"))
+    current = await vault.get(stored.secret_ref, context)
     assert current.version == 2
     assert current.material.refresh_token.get_secret_value() == f"{SYNTHETIC_REFRESH}-6"
 
     async def rotate(suffix: str):  # type: ignore[no-untyped-def]
-        return await vault.replace_if_version(stored.secret_ref, CONTEXT, 2, material(suffix))
+        return await vault.replace_if_version(stored.secret_ref, context, 2, material(suffix))
 
     results = await asyncio.gather(rotate("a"), rotate("b"), return_exceptions=True)
     assert sum(not isinstance(value, Exception) for value in results) == 1
     assert sum(isinstance(value, CredentialVersionConflict) for value in results) == 1
-    assert (await vault.get(stored.secret_ref, CONTEXT)).version == 3
+    assert (await vault.get(stored.secret_ref, context)).version == 3
     with pytest.raises(CredentialVaultError, match="context mismatch"):
         await vault.replace_if_version(
             stored.secret_ref,
-            CredentialContext(CONTEXT.provider, CONTEXT.owner_kind, uuid4()),
+            CredentialContext(
+                context.provider, context.owner_kind, uuid4(), tenant_id=context.tenant_id
+            ),
             3,
             material("x"),
         )
-    await vault.delete(stored.secret_ref, CONTEXT)
+    await vault.delete(stored.secret_ref, context)
 
 
 @pytestmark_db
-async def test_unknown_reference_and_delete_semantics(vault_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_unknown_reference_and_delete_semantics(vault_factory, context) -> None:  # type: ignore[no-untyped-def]
     vault = EncryptedCredentialVault(vault_factory, key_provider())
     for bogus in ("not-a-ref", f"{SECRET_REF_PREFIX}not-a-uuid", "vault://memory/" + str(uuid4())):
         with pytest.raises(CredentialVaultError, match="unavailable"):
-            await vault.get(bogus, CONTEXT)
+            await vault.get(bogus, context)
     # Deleting an absent credential is a no-op, not an error.
-    await vault.delete(f"{SECRET_REF_PREFIX}{uuid4()}", CONTEXT)
+    await vault.delete(f"{SECRET_REF_PREFIX}{uuid4()}", context)
 
 
 @pytestmark_db
-async def test_vault_fails_closed_without_a_key(vault_factory) -> None:  # type: ignore[no-untyped-def]
+async def test_vault_fails_closed_without_a_key(vault_factory, context) -> None:  # type: ignore[no-untyped-def]
     vault = EncryptedCredentialVault(vault_factory, VaultKeyProvider(StubResolver(None), "env:X"))
     with pytest.raises(VaultKeyUnavailable):
-        await vault.store_new(CONTEXT, material())
+        await vault.store_new(context, material())

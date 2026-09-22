@@ -63,6 +63,39 @@ services:
       postgres:
         condition: service_healthy
 
+  # One-shot, idempotent provisioning of the restricted PostgreSQL role the API connects as
+  # (V1-00A). Runs with the ADMIN DSN (the same `database_url` the migration job uses) and
+  # sets the runtime password from `api_database_password`. Re-run it after every migration
+  # that adds tables or SECURITY DEFINER functions: table defaults are automatic, function
+  # EXECUTE is granted only to the explicit allowlist in veotrex_api.runtime_role.
+  runtime-role:
+    profiles: ["runtime-role"]
+    build:
+      context: ../../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: "no"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      VEOTREX_PUBLIC_ORIGIN: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
+      VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
+    secrets:
+      - database_url
+      - vault_master_key
+      - api_database_password
+    command:
+      - veotrex-db-runtime-role
+      - apply
+      - --role
+      - veotrex_api
+      - --password-ref
+      - file:/run/secrets/api_database_password
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: ../../..
@@ -81,7 +114,10 @@ services:
       # not exist. Required here so a misconfigured deployment refuses to start instead.
       VEOTREX_OIDC_ISSUER: ${VEOTREX_OIDC_ISSUER:?VEOTREX_OIDC_ISSUER must be set}
       VEOTREX_OIDC_AUDIENCE: ${VEOTREX_OIDC_AUDIENCE:?VEOTREX_OIDC_AUDIENCE must be set}
-      VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
+      # The API connects as the restricted `veotrex_api` role (NOSUPERUSER NOBYPASSRLS), never
+      # as the bootstrap superuser in `database_url`: Row Level Security is only a tenant
+      # boundary for a role it applies to. Startup and readiness refuse a privileged role.
+      VEOTREX_DATABASE_URL_REF: file:/run/secrets/api_database_url
       VEOTREX_VAULT_MASTER_KEY_REF: file:/run/secrets/vault_master_key
       VEOTREX_RING_CLIENT_SECRET_REF: file:/run/secrets/ring_client_secret
       VEOTREX_RING_HMAC_SIGNING_KEY_REF: file:/run/secrets/ring_hmac_signing_key
@@ -93,7 +129,7 @@ services:
       # capture Auth0/JWKS and Ring OAuth.
       VEOTREX_RING_API_PROXY_URL: ${VEOTREX_RING_API_PROXY_URL:-}
     secrets:
-      - database_url
+      - api_database_url
       - vault_master_key
       - ring_client_secret
       - ring_hmac_signing_key
@@ -140,8 +176,15 @@ secrets:
   # The Ring slots may legitimately be EMPTY before the Ring portal gate: the file must exist for
   # compose to start, and the resolver then reports the secret as unavailable, so readiness shows
   # "missing" rather than the deployment failing.
+  # Admin DSN (bootstrap superuser): migration and runtime-role jobs only. Never the API.
   database_url:
     file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/database_url
+  # Runtime DSN (veotrex_api role) and its password. The API mounts only the DSN; the
+  # password file is mounted only by the runtime-role job that sets it. Both 0600 uid 10001.
+  api_database_url:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/api_database_url
+  api_database_password:
+    file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/api_database_password
   postgres_password:
     file: ${VEOTREX_HOSTINGER_SECRETS_DIR:?VEOTREX_HOSTINGER_SECRETS_DIR must be set}/postgres_password
   vault_master_key:

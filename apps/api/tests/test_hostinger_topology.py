@@ -39,7 +39,7 @@ def _directives(text: str) -> list[str]:
 # --------------------------------------------------------------------- no competing ingress
 def test_hostinger_stack_contains_no_proxy_service(compose: dict[str, Any]) -> None:
     """nginx owns :80/:443 on this host; a second ingress would take five live sites down."""
-    assert set(compose["services"]) == {"postgres", "migrate", "api", "web"}
+    assert set(compose["services"]) == {"postgres", "migrate", "runtime-role", "api", "web"}
     rendered = COMPOSE_PATH.read_text().lower()
     for forbidden in ("caddy", "traefik", "haproxy"):
         assert forbidden not in "\n".join(_directives(rendered))
@@ -111,12 +111,33 @@ def test_every_secret_is_a_reference_not_a_value(compose: dict[str, Any]) -> Non
 
 
 def test_database_url_arrives_by_reference_not_environment(compose: dict[str, Any]) -> None:
-    """Closes the R4B asymmetry: the DSN is a mounted file, not a process-environment value."""
-    for service in ("api", "migrate"):
+    """Every DSN is a file-mounted secret reference, and the identities are split (V1-00A):
+    migration and role provisioning use the admin DSN; the API mounts ONLY the runtime DSN."""
+    for service in ("migrate", "runtime-role"):
         environment = compose["services"][service]["environment"]
         assert environment["VEOTREX_DATABASE_URL_REF"] == "file:/run/secrets/database_url"
         assert "VEOTREX_DATABASE_URL" not in environment
         assert "database_url" in compose["services"][service]["secrets"]
+    api = compose["services"]["api"]
+    assert api["environment"]["VEOTREX_DATABASE_URL_REF"] == "file:/run/secrets/api_database_url"
+    assert "VEOTREX_DATABASE_URL" not in api["environment"]
+    assert "api_database_url" in api["secrets"]
+    assert "database_url" not in api["secrets"], "the API must never mount the admin DSN"
+    assert "api_database_password" not in api["secrets"]
+    assert "postgres_password" not in api["secrets"]
+
+
+def test_runtime_role_job_is_a_discrete_idempotent_profile(compose: dict[str, Any]) -> None:
+    job = compose["services"]["runtime-role"]
+    assert job["profiles"] == ["runtime-role"]
+    assert job["restart"] == "no"
+    assert job["command"][:2] == ["veotrex-db-runtime-role", "apply"]
+    assert "--password-ref" in job["command"]
+    assert "file:/run/secrets/api_database_password" in job["command"]
+    assert not any(token.startswith("postgresql") for token in job["command"])
+    assert "api_database_password" in job["secrets"]
+    assert "ports" not in job
+    assert job["networks"] == ["data"]
 
 
 def test_migration_remains_a_discrete_job(compose: dict[str, Any]) -> None:

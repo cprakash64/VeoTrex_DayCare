@@ -109,6 +109,8 @@ def webhook(account: str, event_type: str, timestamp: int) -> tuple[bytes, str]:
 
 
 async def setup(factory, vault: InMemoryCredentialVault):
+    """Seed a tenant, owner and linked connection. ``factory`` must be the ADMIN factory:
+    it clears the function-only inbox and inserts into tables the runtime cannot write."""
     tenant_id, actor_id, connection_id, owner_id = uuid4(), uuid4(), uuid4(), uuid4()
     credential = await vault.store_new(
         ring_credential_context(owner_id),
@@ -159,11 +161,14 @@ async def setup(factory, vault: InMemoryCredentialVault):
     return principal, connection_id, owner_id, credential.secret_ref
 
 
-async def test_out_of_order_status_and_explicit_removal_reappearance(settings) -> None:
+async def test_out_of_order_status_and_explicit_removal_reappearance(
+    settings, admin_settings
+) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
-    principal, connection_id, _, _ = await setup(factory, vault)
+    principal, connection_id, _, _ = await setup(make_session_factory(admin_engine), vault)
     inventory = RingInventoryService(factory, Link(), Client())  # type: ignore[arg-type]
     processor = RingWebhookService(factory, Secrets(), "test:key", vault, inventory)
     account = f"account-{connection_id}"
@@ -247,13 +252,17 @@ async def test_out_of_order_status_and_explicit_removal_reappearance(settings) -
             assert raced is not None and raced.status == "DISABLED"
     finally:
         await engine.dispose()
+        await admin_engine.dispose()
 
 
-async def test_app_integration_removal_revokes_local_credential(settings) -> None:
+async def test_app_integration_removal_revokes_local_credential(settings, admin_settings) -> None:
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     factory = make_session_factory(engine)
     vault = InMemoryCredentialVault()
-    principal, connection_id, owner_id, secret_ref = await setup(factory, vault)
+    principal, connection_id, owner_id, secret_ref = await setup(
+        make_session_factory(admin_engine), vault
+    )
     inventory = RingInventoryService(factory, Link(), Client())  # type: ignore[arg-type]
     processor = RingWebhookService(factory, Secrets(), "test:key", vault, inventory)
     try:
@@ -299,3 +308,4 @@ async def test_app_integration_removal_revokes_local_credential(settings) -> Non
             assert connection.secret_ref is None
     finally:
         await engine.dispose()
+        await admin_engine.dispose()

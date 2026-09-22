@@ -10,7 +10,13 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url.get_secret_value())
+# Migrations run as the migration identity (VEOTREX_MIGRATION_DATABASE_URL[_REF]) when one is
+# configured, never implicitly as the restricted API runtime role. The DSN is passed through
+# ``%%`` escaping because ConfigParser interpolates ``%`` in option values.
+config.set_main_option(
+    "sqlalchemy.url",
+    get_settings().effective_migration_database_url.get_secret_value().replace("%", "%%"),
+)
 target_metadata = Base.metadata
 
 

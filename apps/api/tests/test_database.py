@@ -1,3 +1,10 @@
+"""Schema and Row Level Security behaviour across the real runtime boundary.
+
+``settings`` is the restricted runtime role the API connects as; ``admin_settings`` is the cluster
+admin used only to seed fixtures and read function-only tables. Every RLS assertion below is
+made from the runtime role's own connection, never from a superuser pretending with SET ROLE.
+"""
+
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -13,6 +20,30 @@ from veotrex_api.tenant_context import (
     bind_tenant,
     reset_tenant,
 )
+
+TENANT_TABLES = [
+    "facilities",
+    "areas",
+    "zones",
+    "camera_provider_connections",
+    "cameras",
+    "camera_provider_devices",
+    "camera_provider_components",
+    "provider_events",
+    "edge_nodes",
+    "camera_assignments",
+    "actors",
+    "actor_identities",
+    "role_assignments",
+    "audit_events",
+]
+
+
+async def set_tenant(connection: AsyncConnection, tenant_id: UUID) -> None:
+    await connection.execute(
+        text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+        {"tenant_id": str(tenant_id)},
+    )
 
 
 async def test_database_connection(settings: Settings) -> None:
@@ -37,8 +68,8 @@ async def test_session_factory_scope_connects_and_closes(settings: Settings) -> 
         await engine.dispose()
 
 
-async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -> None:
-    engine = make_engine(settings)
+async def test_migration_enables_rls_on_every_tenant_table(admin_settings: Settings) -> None:
+    engine = make_engine(admin_settings)
     try:
         async with engine.connect() as connection:
             enabled = await connection.scalar(
@@ -46,145 +77,153 @@ async def test_migration_enables_rls_on_every_tenant_table(settings: Settings) -
                     "SELECT count(*) FROM pg_class "
                     "WHERE relname = ANY(:tables) AND relrowsecurity AND relforcerowsecurity"
                 ),
-                {
-                    "tables": [
-                        "facilities",
-                        "areas",
-                        "zones",
-                        "camera_provider_connections",
-                        "cameras",
-                        "camera_provider_devices",
-                        "camera_provider_components",
-                        "provider_events",
-                        "edge_nodes",
-                        "camera_assignments",
-                        "actors",
-                        "actor_identities",
-                        "role_assignments",
-                        "audit_events",
-                    ]
-                },
+                {"tables": TENANT_TABLES},
             )
             policies = await connection.scalar(
                 text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_isolation'")
             )
-        assert enabled == 14
+        assert enabled == len(TENANT_TABLES) == 14
         assert policies == 14
+        async with engine.connect() as connection:
+            tenants_rls = (
+                await connection.execute(
+                    text(
+                        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class "
+                        "WHERE relname = 'tenants'"
+                    )
+                )
+            ).one()
+            assert tuple(tenants_rls) == (True, True)
+            assert (
+                await connection.scalar(
+                    text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_self'")
+                )
+                == 1
+            )
     finally:
         await engine.dispose()
 
 
-async def test_rls_fails_closed_without_tenant_context(settings: Settings) -> None:
+async def test_tenants_table_exposes_only_the_current_tenant(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    """The runtime holds SELECT on tenants, but the self policy makes it a single-row view."""
+    admin_engine = make_engine(admin_settings)
+    engine = make_engine(settings)
+    tenant_a, tenant_b = uuid4(), uuid4()
+    try:
+        async with admin_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, status) VALUES "
+                    "(:a, 'Self A', 'ACTIVE'), (:b, 'Self B', 'ACTIVE')"
+                ),
+                {"a": tenant_a, "b": tenant_b},
+            )
+        async with engine.connect() as connection:
+            async with connection.begin():
+                assert await connection.scalar(text("SELECT count(*) FROM tenants")) == 0
+            async with connection.begin():
+                await set_tenant(connection, tenant_a)
+                names = (await connection.scalars(text("SELECT name FROM tenants"))).all()
+                assert names == ["Self A"]
+                assert (
+                    await connection.scalar(
+                        text("SELECT name FROM tenants WHERE id = :b"), {"b": tenant_b}
+                    )
+                    is None
+                )
+    finally:
+        await engine.dispose()
+        await admin_engine.dispose()
+
+
+async def test_rls_fails_closed_without_tenant_context(
+    settings: Settings, admin_settings: Settings
+) -> None:
+    """With no ``app.tenant_id`` the policy's predicate is NULL: nothing is visible and nothing
+    can be written, even for a tenant that exists."""
+    admin_engine = make_engine(admin_settings)
     engine = make_engine(settings)
     tenant_id = uuid4()
     try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "DO $$ BEGIN CREATE ROLE veotrex_test_runtime "
-                    "NOLOGIN NOSUPERUSER NOBYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await connection.execute(text("DROP OWNED BY veotrex_test_runtime"))
-            await connection.execute(text("GRANT USAGE ON SCHEMA public TO veotrex_test_runtime"))
-            await connection.execute(
-                text(
-                    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public "
-                    "TO veotrex_test_runtime"
-                )
-            )
+        async with admin_engine.begin() as connection:
             await connection.execute(
                 text("INSERT INTO tenants (id, name, status) VALUES (:id, 'Test', 'ACTIVE')"),
                 {"id": tenant_id},
             )
-        async with engine.begin() as connection:
-            await connection.execute(text("SET LOCAL ROLE veotrex_test_runtime"))
+            await set_tenant(connection, tenant_id)
+            await connection.execute(
+                text(
+                    "INSERT INTO camera_provider_connections "
+                    "(id, tenant_id, name, provider_type, status, integration_state) "
+                    "VALUES (:id, :tenant_id, 'Closed', 'RING', 'ACTIVE', 'ACTIVE')"
+                ),
+                {"id": uuid4(), "tenant_id": tenant_id},
+            )
+        async with engine.connect() as connection:
+            async with connection.begin():
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM camera_provider_connections "
+                            "WHERE tenant_id = :tenant_id"
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                    == 0
+                )
             with pytest.raises(DBAPIError):
-                await connection.execute(
-                    text(
-                        "INSERT INTO facilities "
-                        "(id, tenant_id, name, jurisdiction, timezone, status) VALUES "
-                        "(:id, :tenant_id, 'Facility', 'US-AZ', 'America/Phoenix', 'ACTIVE')"
-                    ),
-                    {"id": uuid4(), "tenant_id": tenant_id},
-                )
+                async with connection.begin():
+                    await connection.execute(
+                        text(
+                            "INSERT INTO camera_provider_connections "
+                            "(id, tenant_id, name, provider_type, status, integration_state) "
+                            "VALUES (:id, :tenant_id, 'Blocked', 'RING', 'ACTIVE', 'ACTIVE')"
+                        ),
+                        {"id": uuid4(), "tenant_id": tenant_id},
+                    )
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text("DROP OWNED BY veotrex_test_runtime"))
-            await connection.execute(text("DROP ROLE IF EXISTS veotrex_test_runtime"))
         await engine.dispose()
+        await admin_engine.dispose()
 
 
-async def test_pending_ring_table_requires_narrow_function_access(settings: Settings) -> None:
+async def test_pending_ring_table_requires_narrow_function_access(
+    settings: Settings, runtime_role_name: str
+) -> None:
     engine = make_engine(settings)
-    role = "veotrex_ring_runtime_test"
     try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            await connection.execute(
-                text(
-                    f"GRANT EXECUTE ON FUNCTION list_ring_pending_candidates(timestamptz) TO {role}"
-                )
-            )
         async with engine.begin() as connection:
             assert not await connection.scalar(
                 text("SELECT has_table_privilege(:role, 'ring_pending_links', 'SELECT')"),
-                {"role": role},
+                {"role": runtime_role_name},
             )
             assert await connection.scalar(
                 text(
                     "SELECT has_function_privilege"
                     "(:role, 'list_ring_pending_candidates(timestamptz)', 'EXECUTE')"
                 ),
-                {"role": role},
+                {"role": runtime_role_name},
             )
-            await connection.execute(text(f"SET LOCAL ROLE {role}"))
             assert (
                 await connection.execute(text("SELECT * FROM list_ring_pending_candidates(now())"))
             ).all() == []
             with pytest.raises(DBAPIError):
                 await connection.execute(text("SELECT * FROM ring_pending_links"))
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
         await engine.dispose()
 
 
-async def test_webhook_inbox_is_global_but_function_only(settings: Settings) -> None:
+async def test_webhook_inbox_is_global_but_function_only(
+    settings: Settings, runtime_role_name: str
+) -> None:
     engine = make_engine(settings)
-    role = "veotrex_webhook_runtime_test"
     try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            await connection.execute(
-                text(
-                    "GRANT EXECUTE ON FUNCTION "
-                    "ingest_ring_webhook(uuid,text,text,timestamptz,text,text,text,text,text,"
-                    f"bigint,text,json,json) TO {role}"
-                )
-            )
         async with engine.begin() as connection:
             assert not await connection.scalar(
                 text("SELECT has_table_privilege(:role, 'ring_webhook_inbox', 'SELECT')"),
-                {"role": role},
+                {"role": runtime_role_name},
             )
-            await connection.execute(text(f"SET LOCAL ROLE {role}"))
             assert await connection.scalar(
                 text(
                     "SELECT ingest_ring_webhook(:id, :request, '1.1', now(), 'account', "
@@ -195,9 +234,6 @@ async def test_webhook_inbox_is_global_but_function_only(settings: Settings) -> 
             with pytest.raises(DBAPIError):
                 await connection.execute(text("SELECT * FROM ring_webhook_inbox"))
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
         await engine.dispose()
 
 
@@ -241,8 +277,10 @@ async def test_pending_candidate_query_excludes_expired_and_archived(settings: S
         await engine.dispose()
 
 
-async def test_composite_foreign_key_rejects_cross_tenant_parent(settings: Settings) -> None:
-    engine = make_engine(settings)
+async def test_composite_foreign_key_rejects_cross_tenant_parent(
+    admin_settings: Settings,
+) -> None:
+    engine = make_engine(admin_settings)
     first_tenant, second_tenant, facility_id = uuid4(), uuid4(), uuid4()
     try:
         async with engine.begin() as connection:
@@ -253,10 +291,7 @@ async def test_composite_foreign_key_rejects_cross_tenant_parent(settings: Setti
                 ),
                 {"first": first_tenant, "second": second_tenant},
             )
-            await connection.execute(
-                text("SELECT set_config('app.tenant_id', :id, true)"),
-                {"id": str(first_tenant)},
-            )
+            await set_tenant(connection, first_tenant)
             await connection.execute(
                 text(
                     "INSERT INTO facilities "
@@ -265,10 +300,7 @@ async def test_composite_foreign_key_rejects_cross_tenant_parent(settings: Setti
                 ),
                 {"id": facility_id, "tenant_id": first_tenant},
             )
-            await connection.execute(
-                text("SELECT set_config('app.tenant_id', :id, true)"),
-                {"id": str(second_tenant)},
-            )
+            await set_tenant(connection, second_tenant)
             with pytest.raises(IntegrityError):
                 await connection.execute(
                     text(
@@ -285,39 +317,18 @@ async def test_composite_foreign_key_rejects_cross_tenant_parent(settings: Setti
         await engine.dispose()
 
 
-async def test_runtime_role_isolates_tenants_and_pool_reuse(settings: Settings) -> None:
-    admin_engine = make_engine(settings)
+async def test_runtime_role_isolates_tenants_and_pool_reuse(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """The real runtime role, over one pooled backend connection reused across transactions."""
+    admin_engine = make_engine(admin_settings)
     runtime_engine = create_async_engine(
         settings.database_url.get_secret_value(), pool_size=1, max_overflow=0
     )
-    role = "veotrex_rls_runtime_test"
     tenant_a, tenant_b = uuid4(), uuid4()
-    facility_a, facility_b = uuid4(), uuid4()
-
-    async def set_runtime_role(connection: AsyncConnection) -> None:
-        await connection.execute(text(f"SET LOCAL ROLE {role}"))
-
-    async def set_tenant(connection: AsyncConnection, tenant_id: UUID) -> None:
-        await connection.execute(
-            text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
-            {"tenant_id": str(tenant_id)},
-        )
-
+    camera_a, camera_b = uuid4(), uuid4()
     try:
         async with admin_engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            await connection.execute(
-                text(
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role}"
-                )
-            )
             await connection.execute(
                 text(
                     "INSERT INTO tenants (id, name, status) VALUES "
@@ -325,24 +336,27 @@ async def test_runtime_role_isolates_tenants_and_pool_reuse(settings: Settings) 
                 ),
                 {"tenant_a": tenant_a, "tenant_b": tenant_b},
             )
+            await set_tenant(connection, tenant_a)
             await connection.execute(
                 text(
-                    "INSERT INTO facilities "
-                    "(id, tenant_id, name, jurisdiction, timezone, status) VALUES "
-                    "(:facility_a, :tenant_a, 'Facility A', 'US-AZ', 'America/Phoenix', 'ACTIVE'), "
-                    "(:facility_b, :tenant_b, 'Facility B', 'US-AZ', 'America/Phoenix', 'ACTIVE')"
+                    "INSERT INTO camera_provider_connections "
+                    "(id, tenant_id, name, provider_type, status, integration_state) "
+                    "VALUES (:id, :tenant_id, 'Camera A', 'RING', 'ACTIVE', 'ACTIVE')"
                 ),
-                {
-                    "facility_a": facility_a,
-                    "tenant_a": tenant_a,
-                    "facility_b": facility_b,
-                    "tenant_b": tenant_b,
-                },
+                {"id": camera_a, "tenant_id": tenant_a},
+            )
+            await set_tenant(connection, tenant_b)
+            await connection.execute(
+                text(
+                    "INSERT INTO camera_provider_connections "
+                    "(id, tenant_id, name, provider_type, status, integration_state) "
+                    "VALUES (:id, :tenant_id, 'Camera B', 'RING', 'ACTIVE', 'ACTIVE')"
+                ),
+                {"id": camera_b, "tenant_id": tenant_b},
             )
 
         async with runtime_engine.connect() as connection:
             async with connection.begin():
-                await set_runtime_role(connection)
                 role_state = (
                     await connection.execute(
                         text(
@@ -351,68 +365,84 @@ async def test_runtime_role_isolates_tenants_and_pool_reuse(settings: Settings) 
                             "pg_get_userbyid(c.relowner) = current_user AS owns_table "
                             "FROM pg_roles r, pg_database d, pg_class c "
                             "WHERE r.rolname = current_user AND d.datname = current_database() "
-                            "AND c.relname = 'facilities'"
+                            "AND c.relname = 'cameras'"
                         )
                     )
                 ).one()
-                assert tuple(role_state) == (role, False, False, False, False)
-                assert (await connection.scalars(text("SELECT id FROM facilities"))).all() == []
+                assert tuple(role_state) == (runtime_role_name, False, False, False, False)
+                assert (
+                    await connection.scalars(
+                        text("SELECT id FROM camera_provider_connections WHERE id IN (:a, :b)"),
+                        {"a": camera_a, "b": camera_b},
+                    )
+                ).all() == []
                 first_backend_pid = await connection.scalar(text("SELECT pg_backend_pid()"))
 
         async with runtime_engine.connect() as connection:
             async with connection.begin():
-                await set_runtime_role(connection)
                 assert await connection.scalar(text("SELECT pg_backend_pid()")) == first_backend_pid
-                assert await connection.scalar(text("SELECT count(*) FROM facilities")) == 0
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM camera_provider_connections WHERE id IN (:a, :b)"
+                        ),
+                        {"a": camera_a, "b": camera_b},
+                    )
+                    == 0
+                )
 
             async with connection.begin():
-                await set_runtime_role(connection)
                 await set_tenant(connection, tenant_a)
                 assert (
-                    await connection.scalars(text("SELECT id FROM facilities ORDER BY id"))
-                ).all() == [facility_a]
-                assert (
-                    await connection.execute(
-                        text("UPDATE facilities SET name = 'blocked' WHERE id = :id"),
-                        {"id": facility_b},
+                    await connection.scalars(
+                        text("SELECT id FROM camera_provider_connections WHERE id IN (:a, :b)"),
+                        {"a": camera_a, "b": camera_b},
                     )
-                ).rowcount == 0
+                ).all() == [camera_a]
                 assert (
                     await connection.execute(
-                        text("DELETE FROM facilities WHERE id = :id"), {"id": facility_b}
+                        text(
+                            "UPDATE camera_provider_connections SET name = 'blocked' WHERE id = :id"
+                        ),
+                        {"id": camera_b},
                     )
                 ).rowcount == 0
 
         async with runtime_engine.connect() as connection:
             async with connection.begin():
-                await set_runtime_role(connection)
                 assert await connection.scalar(text("SELECT pg_backend_pid()")) == first_backend_pid
-                assert await connection.scalar(text("SELECT count(*) FROM facilities")) == 0
+                assert (
+                    await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM camera_provider_connections WHERE id IN (:a, :b)"
+                        ),
+                        {"a": camera_a, "b": camera_b},
+                    )
+                    == 0
+                )
 
             async with connection.begin():
-                await set_runtime_role(connection)
                 await set_tenant(connection, tenant_b)
-                assert (await connection.scalars(text("SELECT id FROM facilities"))).all() == [
-                    facility_b
-                ]
+                assert (
+                    await connection.scalars(
+                        text("SELECT id FROM camera_provider_connections WHERE id IN (:a, :b)"),
+                        {"a": camera_a, "b": camera_b},
+                    )
+                ).all() == [camera_b]
 
-            with pytest.raises(IntegrityError):
+            with pytest.raises(DBAPIError):
                 async with connection.begin():
-                    await set_runtime_role(connection)
                     await set_tenant(connection, tenant_a)
                     await connection.execute(
                         text(
-                            "INSERT INTO areas "
-                            "(id, tenant_id, facility_id, name, kind, status) VALUES "
-                            "(:id, :tenant_id, :facility_id, 'Cross tenant', 'ROOM', 'ACTIVE')"
+                            "INSERT INTO camera_provider_connections "
+                            "(id, tenant_id, name, provider_type, status, integration_state) "
+                            "VALUES (:id, :tenant_id, 'Cross', 'RING', 'ACTIVE', 'ACTIVE')"
                         ),
-                        {"id": uuid4(), "tenant_id": tenant_a, "facility_id": facility_b},
+                        {"id": uuid4(), "tenant_id": tenant_b},
                     )
     finally:
         await runtime_engine.dispose()
-        async with admin_engine.begin() as connection:
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
         await admin_engine.dispose()
 
 
@@ -446,8 +476,10 @@ async def test_tenant_context_helper_is_transaction_local(settings: Settings) ->
         await engine.dispose()
 
 
-async def test_identity_and_role_integrity_rejects_cross_tenant_links(settings: Settings) -> None:
-    engine = make_engine(settings)
+async def test_identity_and_role_integrity_rejects_cross_tenant_links(
+    admin_settings: Settings,
+) -> None:
+    engine = make_engine(admin_settings)
     tenant_a, tenant_b = uuid4(), uuid4()
     actor_a, actor_b, facility_b = uuid4(), uuid4(), uuid4()
     try:
@@ -483,10 +515,7 @@ async def test_identity_and_role_integrity_rejects_cross_tenant_links(settings: 
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
-                await connection.execute(
-                    text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
-                    {"tenant_id": str(tenant_a)},
-                )
+                await set_tenant(connection, tenant_a)
                 await connection.execute(
                     text(
                         "INSERT INTO actor_identities "
@@ -498,10 +527,7 @@ async def test_identity_and_role_integrity_rejects_cross_tenant_links(settings: 
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
-                await connection.execute(
-                    text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
-                    {"tenant_id": str(tenant_a)},
-                )
+                await set_tenant(connection, tenant_a)
                 await connection.execute(
                     text(
                         "INSERT INTO role_assignments "
@@ -520,32 +546,15 @@ async def test_identity_and_role_integrity_rejects_cross_tenant_links(settings: 
 
 
 async def test_external_organization_resolution_is_exact_and_rls_fails_closed(
-    settings: Settings,
+    settings: Settings, admin_settings: Settings
 ) -> None:
-    admin_engine = make_engine(settings)
-    runtime_engine = create_async_engine(
-        settings.database_url.get_secret_value(), pool_size=1, max_overflow=0
-    )
-    role = "veotrex_identity_runtime_test"
+    admin_engine = make_engine(admin_settings)
+    runtime_engine = make_engine(settings)
     tenant_a, tenant_b = uuid4(), uuid4()
     organization_a = f"org_{uuid4().hex}"
     organization_b = f"org_{uuid4().hex}"
     try:
         async with admin_engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; "
-                    "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-                )
-            )
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
-            await connection.execute(
-                text(
-                    f"GRANT EXECUTE ON FUNCTION "
-                    f"resolve_tenant_identity_binding(text, text, text) TO {role}"
-                )
-            )
             await connection.execute(
                 text(
                     "INSERT INTO tenants (id, name, status) VALUES "
@@ -572,7 +581,6 @@ async def test_external_organization_resolution_is_exact_and_rls_fails_closed(
 
         async with runtime_engine.connect() as connection:
             async with connection.begin():
-                await connection.execute(text(f"SET LOCAL ROLE {role}"))
                 assert (
                     await connection.scalar(
                         text(
@@ -595,11 +603,7 @@ async def test_external_organization_resolution_is_exact_and_rls_fails_closed(
                 )
             with pytest.raises(DBAPIError):
                 async with connection.begin():
-                    await connection.execute(text(f"SET LOCAL ROLE {role}"))
                     await connection.scalar(text("SELECT count(*) FROM tenant_identity_bindings"))
     finally:
         await runtime_engine.dispose()
-        async with admin_engine.begin() as connection:
-            await connection.execute(text(f"DROP OWNED BY {role}"))
-            await connection.execute(text(f"DROP ROLE IF EXISTS {role}"))
         await admin_engine.dispose()

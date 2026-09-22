@@ -28,6 +28,7 @@ build-backend = "hatchling.build"
 [project.scripts]
 veotrex-ring-readiness = "veotrex_api.ring_readiness:main"
 veotrex-provision = "veotrex_api.provision_cli:main"
+veotrex-db-runtime-role = "veotrex_api.runtime_role:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/veotrex_api"]

@@ -353,7 +353,7 @@ class RingWebhookService:
                 )
         if secret is not None:
             try:
-                await self._vault.delete(secret[0], ring_credential_context(secret[1]))
+                await self._vault.delete(secret[0], ring_credential_context(secret[1], tenant_id))
             except CredentialVaultError as exc:
                 raise RingWebhookError("credential_delete_failed") from exc
             async with self._factory() as session, session.begin():

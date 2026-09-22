@@ -39,10 +39,10 @@ case "$1" in
         for a in "$@"; do LAST=$a; done
         case "$LAST" in
           *CREATE\\ ROLE*) exit 0 ;;
-          *alembic_version*) printf '%s\\n' "${STUB_HEAD:-0005_encrypted_credentials}" ;;
+          *alembic_version*) printf '%s\\n' "${STUB_HEAD:-0006_vault_boundary}" ;;
           *information_schema.tables*) printf '%s\\n' "${STUB_TABLES:-22}" ;;
-          *pg_policies*) printf '%s\\n' "${STUB_POLICIES:-14}" ;;
-          *relrowsecurity*) printf '%s\\n' "${STUB_RLS:-14}" ;;
+          *pg_policies*) printf '%s\\n' "${STUB_POLICIES:-15}" ;;
+          *relrowsecurity*) printf '%s\\n' "${STUB_RLS:-15}" ;;
           *encrypted_credentials*)
             [ -n "${STUB_CREDS_RC:-}" ] && exit "$STUB_CREDS_RC"
             printf '0\\n' ;;
@@ -141,10 +141,10 @@ def test_a_good_archive_qualifies(workspace: Path) -> None:
     status, output = _run(workspace)
     assert "DB_RESTORE_VERIFY=QUALIFIED" in output, output
     assert status == 0
-    assert "MIGRATION_HEAD=0005_encrypted_credentials" in output
+    assert "MIGRATION_HEAD=0006_vault_boundary" in output
     assert "PUBLIC_TABLES=22" in output
-    assert "RLS_POLICIES=14" in output
-    assert "RLS_ENABLED_TABLES=14" in output
+    assert "RLS_POLICIES=15" in output
+    assert "RLS_ENABLED_TABLES=15" in output
     assert "RESTORE_ERROR_LINES=0" in output
     assert re.search(r"bytes=\d+", output), "the decrypted size is part of the evidence"
 
@@ -225,7 +225,7 @@ def test_a_missing_rls_policy_refuses(workspace: Path) -> None:
 
 
 def test_a_table_with_rls_switched_off_refuses(workspace: Path) -> None:
-    status, output = _run(workspace, STUB_RLS="13")
+    status, output = _run(workspace, STUB_RLS="14")
     assert "RLS-enabled table count mismatch" in output
     assert status != 0
 

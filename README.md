@@ -21,8 +21,14 @@ mkdir -p infra/local/secrets && chmod 700 infra/local/secrets
 umask 077
 python3 -c "import secrets; print(secrets.token_urlsafe(32))" > infra/local/secrets/postgres_password
 python3 -c "import secrets; print(secrets.token_urlsafe(32))" > infra/local/secrets/postgres_test_password
-chmod 600 infra/local/secrets/postgres_password infra/local/secrets/postgres_test_password
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" > infra/local/secrets/postgres_api_password
+chmod 600 infra/local/secrets/postgres_password infra/local/secrets/postgres_test_password \
+  infra/local/secrets/postgres_api_password
 ```
+
+`postgres_api_password` is the credential of the restricted `veotrex_api` role the API process
+connects as. It is distinct from the bootstrap password on purpose: the bootstrap role is a
+PostgreSQL superuser, and superusers are exempt from Row Level Security.
 
 Then copy `.env.example` to `.env` and replace each `REPLACE_WITH_*` placeholder with the matching
 value you just generated. `infra/local/secrets/` and `.env` are both git-ignored.
@@ -31,7 +37,8 @@ value you just generated. `infra/local/secrets/` and `.env` are both git-ignored
 cp .env.example .env
 make bootstrap
 make db-up
-make migrate
+make migrate           # as the bootstrap/migration identity (VEOTREX_MIGRATION_DATABASE_URL)
+make db-runtime-role   # create/refresh the restricted veotrex_api role the API connects as
 ```
 
 The `.env.example` values are placeholders only. Replace them through the deployment secret manager
@@ -101,9 +108,19 @@ See [system overview](docs/architecture/system-overview.md),
 
 Alembic owns schema changes. Tenant-owned transactions must call
 `apply_tenant_to_transaction(session)` after resolving an authenticated tenant through a trusted
-server-side binding. PostgreSQL RLS fails closed when `app.tenant_id` is absent. Production must use
-a non-superuser, non-table-owner, `NOBYPASSRLS` runtime role; migration ownership and runtime access
-are intentionally separate deployment concerns.
+server-side binding. PostgreSQL RLS fails closed when `app.tenant_id` is absent.
+
+Three database identities are kept apart (ADR 0018). The bootstrap superuser (`POSTGRES_USER`)
+and the migration identity provision and migrate; the API connects only as the restricted
+`veotrex_api` role - `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION
+NOINHERIT`, owning nothing and holding only the table and function privileges enumerated in
+`veotrex_api.runtime_role`. Nothing is granted by default: a new table, function or sequence
+is inaccessible to the API until it is classified there and `apply` is re-run, and CI fails on an
+unclassified ORM table. `veotrex-db-runtime-role apply` provisions and converges it, `verify`
+audits it, and `probe` exercises the boundary from the runtime role's own connection. The API
+refuses to start, and readiness reports `privileged_database_role`, if it is ever connected as a
+superuser or `BYPASSRLS` role. The automated suite runs application code as a role provisioned
+the same way (`veotrex_api_test`) and uses the admin identity only to seed and inspect.
 
 ## Identity bootstrap
 

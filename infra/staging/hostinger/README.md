@@ -88,6 +88,92 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8100/health/live
 The migration is a one-shot job behind a profile, so an ordinary `up` never triggers it and API
 replicas cannot race `alembic upgrade head`.
 
+## 2a. Runtime database role (V1-00A)
+
+The API must connect as `veotrex_api`, a `NOSUPERUSER NOBYPASSRLS` role, never as the
+bootstrap superuser in `database_url`. Superusers bypass Row Level Security, so without this
+step tenant isolation is not enforced by PostgreSQL. The API refuses to start, and readiness
+reports `privileged_database_role`, when connected as a privileged role.
+
+Two more secret files, owned by uid 10001 (the API's user inside the container) like the
+existing API secrets. All lines below stay under 78 characters; run them as root.
+
+```bash
+umask 077
+python3 - <<'PY'
+import os, secrets, stat
+d = "/etc/veotrex-daycare/secrets"
+ref = os.stat(os.path.join(d, "vault_master_key"))   # API-readable exemplar
+pw_path = os.path.join(d, "api_database_password")
+url_path = os.path.join(d, "api_database_url")
+if not os.path.lexists(pw_path):
+    fd = os.open(pw_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_urlsafe(32))
+with open(pw_path) as f:
+    pw = f.read().strip()
+fd = os.open(url_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(f"postgresql+psycopg://veotrex_api:{pw}@postgres:5432/veotrex")
+for p in (pw_path, url_path):
+    os.chown(p, ref.st_uid, ref.st_gid)
+    os.chmod(p, 0o600)
+    st = os.stat(p)
+    print(p, stat.filemode(st.st_mode), st.st_uid, st.st_gid, st.st_size)
+PY
+```
+
+Migration 0006 must be applied first (`--profile migrate run --rm migrate`, step 2 of the
+deploy order): it creates the vault functions the runtime role is granted. Then provision the
+role (idempotent; safe and *required* to re-run after every migration):
+
+```bash
+cd /srv/veotrex-daycare/repo/infra/staging/hostinger
+export ENVFILE=/etc/veotrex-daycare/deploy.env
+docker compose --env-file "$ENVFILE" --profile runtime-role \
+  run --rm runtime-role
+```
+
+Expected: `applied N statements for role veotrex_api` and no `PROBLEM` line. Verify from
+both sides before switching the API over:
+
+```bash
+docker compose --env-file "$ENVFILE" --profile runtime-role run --rm \
+  runtime-role veotrex-db-runtime-role verify --role veotrex_api
+docker compose --env-file "$ENVFILE" run --rm --no-deps \
+  -e VEOTREX_DATABASE_URL_REF=file:/run/secrets/api_database_url \
+  api veotrex-db-runtime-role probe --migration-role veotrex
+```
+
+The first prints `verified`; the second prints only `PASS` lines. The compose file already
+points the `api` service at `api_database_url`, so the switch is:
+
+```bash
+docker compose --env-file "$ENVFILE" up -d --wait api
+curl -s http://127.0.0.1:8100/health/ready
+```
+
+Readiness must return `"status":"ready"` with no `reason`. The deploy order in section 2 is
+therefore: `postgres` -> `migrate` -> `runtime-role` -> `api web`.
+
+### Rollback
+
+Prepare before switching: record the running image id and the deployed commit
+(`docker compose --env-file "$ENVFILE" images api`;
+`git -C /srv/veotrex-daycare/repo rev-parse HEAD`). The new build refuses to start as the
+bootstrap superuser by design, so "point the API back at `database_url`" is not a rollback.
+Roll the code back instead, which restores the previous DSN wiring with it:
+
+```bash
+cd /srv/veotrex-daycare/repo && git checkout <previous commit>
+cd infra/staging/hostinger
+docker compose --env-file "$ENVFILE" up -d --build --wait api
+curl -s http://127.0.0.1:8100/health/ready
+```
+
+Leave the `veotrex_api` role and its two secret files in place: an unused locked-down role is
+harmless, and dropping objects during an incident is not. PostgreSQL is never restarted.
+
 ## 3. nginx integration (never touch existing sites)
 
 ```bash

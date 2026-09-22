@@ -1,7 +1,9 @@
 """Production credential vault: AES-256-GCM envelope records behind the existing contract.
 
 Implements the `CredentialVault` protocol so `RingLinkService` and `RingWebhookService` are
-unchanged. Ciphertext is bound by AEAD associated data to the record's non-secret context
+unchanged. Storage is reached only through the SECURITY DEFINER functions of migration 0006; the
+API runtime role has no privilege on the table itself. Ciphertext is bound by AEAD associated
+data to the record's non-secret context
 (schema version, provider, owner kind, owner id, credential version), so a ciphertext copied to a
 different provider, owner, or version fails to decrypt rather than silently authorising.
 
@@ -14,13 +16,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from veotrex_api.credential_vault import (
@@ -30,7 +32,6 @@ from veotrex_api.credential_vault import (
     CredentialVersionConflict,
     VaultCredential,
 )
-from veotrex_api.models import EncryptedCredential
 from veotrex_api.secrets import SecretResolutionError, SecretResolver
 
 SCHEMA_VERSION = 1
@@ -52,6 +53,20 @@ class _Envelope:
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
         return "_Envelope(REDACTED)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _Sealed:
+    """One stored envelope as returned by ``vault_credential_open``; never printed."""
+
+    id: UUID
+    version: int
+    schema_version: int
+    nonce: bytes
+    ciphertext: bytes
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive
+        return "_Sealed(REDACTED)"
 
 
 def canonical_aad(
@@ -155,12 +170,10 @@ class EncryptedCredentialVault:
             del plaintext
         return _Envelope(nonce, ciphertext)
 
-    def _open(self, record: EncryptedCredential, context: CredentialContext) -> CredentialMaterial:
-        aad = canonical_aad(context, record.id, record.version, int(record.schema_version))
+    def _open(self, record: _Sealed, context: CredentialContext) -> CredentialMaterial:
+        aad = canonical_aad(context, record.id, record.version, record.schema_version)
         try:
-            plaintext = AESGCM(self._keys.key()).decrypt(
-                bytes(record.nonce), bytes(record.ciphertext), aad
-            )
+            plaintext = AESGCM(self._keys.key()).decrypt(record.nonce, record.ciphertext, aad)
         except InvalidTag:
             # Wrong tenant/provider/owner/version, tampered ciphertext or nonce, or wrong key.
             raise CredentialVaultError("credential could not be authenticated") from None
@@ -178,49 +191,89 @@ class EncryptedCredentialVault:
         except ValueError:
             raise CredentialVaultError("credential is unavailable") from None
 
-    async def _load(
-        self, session: AsyncSession, secret_ref: str, context: CredentialContext
-    ) -> EncryptedCredential:
-        record = await session.scalar(
-            select(EncryptedCredential).where(
-                EncryptedCredential.id == self._identifier(secret_ref)
+    @staticmethod
+    async def _present_tenant(session: AsyncSession, context: CredentialContext) -> None:
+        """Expose the caller's tenant to PostgreSQL for this transaction only.
+
+        The credential functions authorize against ``app.tenant_id`` exactly as Row Level
+        Security does; a pre-tenant operation presents no tenant and is authorized only where
+        the function allows a tenant-less step (creation and RECEIVED-state clean-up).
+        """
+        if context.tenant_id is not None:
+            await session.execute(
+                text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+                {"tenant_id": str(context.tenant_id)},
             )
-        )
-        if record is None:
-            raise CredentialVaultError("credential is unavailable")
-        # Cheap non-cryptographic pre-check; AEAD remains the authority.
-        if record.provider != context.provider or record.owner_kind != context.owner_kind:
+
+    @staticmethod
+    def _raise_for(outcome: str) -> NoReturn:
+        if outcome == "context_mismatch":
             raise CredentialVaultError("credential context mismatch")
-        if record.owner_id != context.owner_id:
-            raise CredentialVaultError("credential context mismatch")
-        return record
+        if outcome == "version_conflict":
+            raise CredentialVersionConflict("credential generation changed")
+        raise CredentialVaultError("credential is unavailable")
 
     # ------------------------------------------------------------------ protocol
+    # Every database operation goes through a SECURITY DEFINER function; the runtime role holds
+    # no privilege on encrypted_credentials itself. Each function addresses one credential by
+    # primary key, checks the (provider, owner_kind, owner_id) binding, and authorizes the
+    # operation against the pending-link state and the tenant-scoped connection that owns the
+    # credential once claimed. See migration 0006 and ADR 0018.
     async def store_new(
         self, context: CredentialContext, material: CredentialMaterial
     ) -> VaultCredential:
         credential_id = uuid4()
         envelope = self._seal(context, credential_id, 1, material)
         async with self._factory() as session, session.begin():
-            session.add(
-                EncryptedCredential(
-                    id=credential_id,
-                    provider=context.provider,
-                    owner_kind=context.owner_kind,
-                    owner_id=context.owner_id,
-                    version=1,
-                    schema_version=self._schema_version,
-                    nonce=envelope.nonce,
-                    ciphertext=envelope.ciphertext,
-                )
+            await self._present_tenant(session, context)
+            version = await session.scalar(
+                text(
+                    "SELECT vault_credential_create(:id, :provider, :owner_kind, :owner_id, "
+                    ":schema_version, :nonce, :ciphertext)"
+                ),
+                {
+                    "id": credential_id,
+                    "provider": context.provider,
+                    "owner_kind": context.owner_kind,
+                    "owner_id": context.owner_id,
+                    "schema_version": self._schema_version,
+                    "nonce": envelope.nonce,
+                    "ciphertext": envelope.ciphertext,
+                },
             )
+        if version != 1:
+            raise CredentialVaultError("credential could not be stored")
         return VaultCredential(f"{SECRET_REF_PREFIX}{credential_id}", 1, material)
 
     async def get(self, secret_ref: str, context: CredentialContext) -> VaultCredential:
-        async with self._factory() as session:
-            record = await self._load(session, secret_ref, context)
-            material = self._open(record, context)
-            return VaultCredential(secret_ref, record.version, material)
+        credential_id = self._identifier(secret_ref)
+        async with self._factory() as session, session.begin():
+            await self._present_tenant(session, context)
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT outcome, version, schema_version, nonce, ciphertext "
+                        "FROM vault_credential_open(:id, :provider, :owner_kind, :owner_id)"
+                    ),
+                    {
+                        "id": credential_id,
+                        "provider": context.provider,
+                        "owner_kind": context.owner_kind,
+                        "owner_id": context.owner_id,
+                    },
+                )
+            ).one_or_none()
+        if row is None or row.outcome != "ok":
+            self._raise_for("unavailable" if row is None else str(row.outcome))
+        record = _Sealed(
+            credential_id,
+            int(row.version),
+            int(row.schema_version),
+            bytes(row.nonce),
+            bytes(row.ciphertext),
+        )
+        material = self._open(record, context)
+        return VaultCredential(secret_ref, record.version, material)
 
     async def replace_if_version(
         self,
@@ -231,45 +284,48 @@ class EncryptedCredentialVault:
     ) -> VaultCredential:
         """Compare-and-swap rotation. A stale writer can never overwrite a newer refresh token."""
         credential_id = self._identifier(secret_ref)
+        next_version = expected_version + 1
+        envelope = self._seal(context, credential_id, next_version, material)
         async with self._factory() as session, session.begin():
-            record = await session.scalar(
-                select(EncryptedCredential)
-                .where(EncryptedCredential.id == credential_id)
-                .with_for_update()
-            )
-            if record is None:
-                raise CredentialVaultError("credential is unavailable")
-            if (
-                record.provider != context.provider
-                or record.owner_kind != context.owner_kind
-                or record.owner_id != context.owner_id
-            ):
-                raise CredentialVaultError("credential context mismatch")
-            if record.version != expected_version:
-                raise CredentialVersionConflict("credential generation changed")
-            next_version = record.version + 1
-            envelope = self._seal(context, credential_id, next_version, material)
-            record.version = next_version
-            record.schema_version = self._schema_version
-            record.nonce = envelope.nonce
-            record.ciphertext = envelope.ciphertext
+            await self._present_tenant(session, context)
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT outcome, version FROM vault_credential_replace("
+                        ":id, :provider, :owner_kind, :owner_id, :expected_version, "
+                        ":schema_version, :nonce, :ciphertext)"
+                    ),
+                    {
+                        "id": credential_id,
+                        "provider": context.provider,
+                        "owner_kind": context.owner_kind,
+                        "owner_id": context.owner_id,
+                        "expected_version": expected_version,
+                        "schema_version": self._schema_version,
+                        "nonce": envelope.nonce,
+                        "ciphertext": envelope.ciphertext,
+                    },
+                )
+            ).one_or_none()
+        if row is None or row.outcome != "ok":
+            self._raise_for("unavailable" if row is None else str(row.outcome))
+        if int(row.version) != next_version:
+            raise CredentialVaultError("credential rotation produced an unexpected version")
         return VaultCredential(secret_ref, next_version, material)
 
     async def delete(self, secret_ref: str, context: CredentialContext) -> None:
+        credential_id = self._identifier(secret_ref)
         async with self._factory() as session, session.begin():
-            record = await session.scalar(
-                select(EncryptedCredential).where(
-                    EncryptedCredential.id == self._identifier(secret_ref)
-                )
+            await self._present_tenant(session, context)
+            outcome = await session.scalar(
+                text("SELECT vault_credential_delete(:id, :provider, :owner_kind, :owner_id)"),
+                {
+                    "id": credential_id,
+                    "provider": context.provider,
+                    "owner_kind": context.owner_kind,
+                    "owner_id": context.owner_id,
+                },
             )
-            if record is None:
-                return
-            if (
-                record.provider != context.provider
-                or record.owner_kind != context.owner_kind
-                or record.owner_id != context.owner_id
-            ):
-                raise CredentialVaultError("credential context mismatch")
-            await session.execute(
-                delete(EncryptedCredential).where(EncryptedCredential.id == record.id)
-            )
+        if outcome in ("deleted", "absent"):
+            return
+        self._raise_for(str(outcome))
