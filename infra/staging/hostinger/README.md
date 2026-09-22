@@ -139,13 +139,17 @@ both sides before switching the API over:
 
 ```bash
 docker compose --env-file "$ENVFILE" --profile runtime-role run --rm \
-  runtime-role veotrex-db-runtime-role verify --role veotrex_api
+  runtime-role veotrex-db-runtime-role verify --role veotrex_api \
+  --migration-role veotrex
 docker compose --env-file "$ENVFILE" run --rm --no-deps \
   -e VEOTREX_DATABASE_URL_REF=file:/run/secrets/api_database_url \
   api veotrex-db-runtime-role probe --migration-role veotrex
 ```
 
-The first prints `verified`; the second prints only `PASS` lines. The compose file already
+The first prints `verified`; the second prints only `PASS` lines. `verify` must run with
+the admin identity (the `runtime-role` job) or be told the migration role explicitly; when
+it is connected as `veotrex_api` itself (for example from the `api` container) it refuses to
+guess and exits 2, because it cannot tell which role owns the schema. The compose file already
 points the `api` service at `api_database_url`, so the switch is:
 
 ```bash

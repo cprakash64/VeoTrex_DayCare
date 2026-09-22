@@ -547,6 +547,17 @@ def build_plan(
                 ),
             )
         )
+    # Defense in depth for the runtime role's OWN defaults. It cannot create functions today
+    # (no CREATE anywhere), but if it ever gains creation rights in some schema, PostgreSQL
+    # would grant PUBLIC EXECUTE on what it creates. Global, like the migration role's revoke.
+    steps.append(
+        PlanStep(
+            f"functions created by {role} itself would not be PUBLIC-executable",
+            sql.SQL(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC"
+            ).format(_ident(role)),
+        )
+    )
     return RuntimeRolePlan(role, owner, inventory.database, tuple(steps))
 
 
@@ -626,6 +637,14 @@ def verify(
             problems.append(f"role has {flag}")
 
     inventory = inspect_schema(connection, role)
+    if migration_role is None and inventory.connected_role == role:
+        # The migration role cannot be inferred from the runtime role's own connection, and
+        # evaluating the migration-role invariants against the runtime role would be wrong in
+        # both directions. Fail loudly rather than guess.
+        raise RuntimeRoleError(
+            "verify is connected as the runtime role; run it with the admin identity or pass "
+            "--migration-role explicitly"
+        )
     owner = migration_role or inventory.connected_role
     with connection.cursor() as cursor:
         cursor.execute(
@@ -721,6 +740,19 @@ def verify(
                     problems.append(f"functions created by {owner} still default to PUBLIC")
         if not function_default_seen:
             problems.append(f"functions created by {owner} still default to PUBLIC EXECUTE")
+        # The runtime role's own creator defaults, independent of the migration role's.
+        cursor.execute(
+            "SELECT d.defaclacl::text FROM pg_default_acl d "
+            "WHERE pg_get_userbyid(d.defaclrole) = %s AND d.defaclnamespace = 0 "
+            "AND d.defaclobjtype = 'f'",
+            (role,),
+        )
+        own_default = cursor.fetchone()
+        own_acl = "" if own_default is None else str(own_default[0])
+        if own_default is None or "{=" in own_acl or ",=" in own_acl:
+            problems.append(
+                f"functions created by the runtime role {role} would default to PUBLIC EXECUTE"
+            )
     return problems
 
 
@@ -872,6 +904,14 @@ def probe(
         "SELECT count(*) FROM public.cameras",
     )
     expect_refused("cannot delete audit rows", "DELETE FROM public.audit_events")
+    expect_count(
+        "own function defaults exclude PUBLIC EXECUTE",
+        "SELECT count(*) FROM pg_default_acl d JOIN pg_roles r ON r.oid = d.defaclrole "
+        "WHERE r.rolname = current_user AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f' "
+        "AND NOT EXISTS (SELECT 1 FROM aclexplode(d.defaclacl) a "
+        "WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')",
+        1,
+    )
     if migration_role:
         expect_refused(
             f"cannot SET ROLE to {migration_role}",
