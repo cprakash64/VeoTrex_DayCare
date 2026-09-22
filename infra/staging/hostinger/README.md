@@ -69,13 +69,13 @@ Then create `/etc/veotrex-daycare/web.env` (root-owned, `0600`) with the Auth0 v
 `AUTH0_DOMAIN`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET`, `AUTH0_SECRET`, `AUTH0_AUDIENCE`.
 No value from this repository belongs in it.
 
-Copy `hostinger.env.example` to `/etc/veotrex-daycare/deploy.env` and fill it in.
+Copy `hostinger.env.example` to `/etc/veotrex-daycare/hostinger.env` and fill it in.
 
 ## 2. Deployment order
 
 ```bash
 cd /srv/veotrex-daycare/infra/staging/hostinger
-export ENVFILE=/etc/veotrex-daycare/deploy.env
+export ENVFILE=/etc/veotrex-daycare/hostinger.env
 
 docker compose --env-file "$ENVFILE" up -d --wait postgres          # 1. database
 docker compose --env-file "$ENVFILE" --profile migrate run --rm migrate   # 2. migrate once
@@ -129,7 +129,7 @@ role (idempotent; safe and *required* to re-run after every migration):
 
 ```bash
 cd /srv/veotrex-daycare/repo/infra/staging/hostinger
-export ENVFILE=/etc/veotrex-daycare/deploy.env
+export ENVFILE=/etc/veotrex-daycare/hostinger.env
 docker compose --env-file "$ENVFILE" --profile runtime-role \
   run --rm runtime-role
 ```
@@ -177,6 +177,45 @@ curl -s http://127.0.0.1:8100/health/ready
 
 Leave the `veotrex_api` role and its two secret files in place: an unused locked-down role is
 harmless, and dropping objects during an incident is not. PostgreSQL is never restarted.
+
+## 2b. Ring pending-link expiry (V1-00A-PROD-R2)
+
+An expired `RECEIVED`/`UNCLAIMED` Ring pending link can never be claimed, but it still holds a
+sealed refresh token that Ring honours for about thirty days. `veotrex-ring-pending-expiry`
+archives such links and deletes their credential rows in one bounded transaction. It is a
+one-shot job with the ADMIN DSN, like `migrate` and `runtime-role`; it refuses the API runtime
+role, never decrypts anything, and prints counts only. Run it after each deployment and on a
+regular cadence (daily is sufficient: an abandoned link becomes expirable about four hours
+after receipt, and nothing else ever converges it). Always dry-run first:
+
+```bash
+cd /srv/veotrex-daycare/repo/infra/staging/hostinger
+export ENVFILE=/etc/veotrex-daycare/hostinger.env
+docker compose --env-file "$ENVFILE" --profile maintenance \
+  run --rm --build ring-pending-expiry
+```
+
+The default command is `dry-run --limit 100`. It changes nothing (`READ ONLY` transaction)
+and reports, per state, how many expired links exist and what `apply` would do:
+`candidates`, `archived`, `credentials_removed`, `already_clean`, `archived_orphans_removed`,
+`skipped_by_state` (expired `CLAIMING` / `RING_CONFIRMATION_UNCERTAIN` /
+`RING_CONFIRMED_UNBOUND`, which are never modified) and `inconsistent` (a pre-claim link whose
+credential a connection owns, never modified). Exit status 3 means the last two are non-zero
+and need a human; 2 means the job refused to run (wrong identity or configuration).
+
+Then apply, bounded, and dry-run again to confirm convergence (`candidates=0`):
+
+```bash
+docker compose --env-file "$ENVFILE" --profile maintenance \
+  run --rm ring-pending-expiry \
+  veotrex-ring-pending-expiry apply --limit 100
+docker compose --env-file "$ENVFILE" --profile maintenance \
+  run --rm ring-pending-expiry
+```
+
+`apply` is idempotent and safe to repeat; a second run reports zeros. It never touches
+`CLAIMED` links or any credential a `camera_provider_connections` row references, so an
+ACTIVE Ring connection cannot be unlinked by it. No SQL is ever run by hand for this.
 
 ## 3. nginx integration (never touch existing sites)
 

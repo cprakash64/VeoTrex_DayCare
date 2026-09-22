@@ -102,8 +102,8 @@ active/reauth-required counts. IDs and credential identifiers must never be metr
 
 - Exchange succeeded but `/users/me` failed: the credential remains safely vaulted in `RECEIVED`
   with a safe failure category. Never replay the authorization code. An operator may retry only
-  `/users/me` before access expiry; expired records must have vault material deleted and be archived.
-  The operator command is intentionally not Internet-exposed in Stage 1B.
+  `/users/me` before access expiry; expired records have their vault material deleted and are
+  archived by `veotrex-ring-pending-expiry` (below). Nothing about it is Internet-exposed.
 - App Integrations POST ambiguous: `RING_CONFIRMATION_UNCERTAIN`; never auto-repeat POST.
 - POST succeeded but persistence failed: `RING_CONFIRMED_UNBOUND`; never report ACTIVE.
 - PATCH failed: keep the connection `CONFIGURING`; the protected resume endpoint safely retries PATCH
@@ -114,7 +114,43 @@ active/reauth-required counts. IDs and credential identifiers must never be metr
 Operators must alert on all uncertain/unbound states and stale `RECEIVED` records. Before real
 onboarding, install a managed vault, create distinct migration/runtime database roles, verify the
 runtime role is non-owner `NOSUPERUSER NOBYPASSRLS`, grant only required functions/tables, configure
-proactive refresh, and approve retention/cleanup procedures.
+proactive refresh, and run the pending-link expiry job on a schedule.
+
+### Expiry of abandoned pending links (V1-00A-PROD-R2)
+
+`access_expires_at` bounds the **access** token only. The sealed record also holds the refresh
+token, which Ring honours for roughly thirty days and which VeoTrex never uses for a pending
+link, so an expired pending link is unclaimable yet still holds live provider authorization
+material. Nothing in the request path removes it: the candidate query and
+`start_ring_pending_claim` merely stop returning the row. The first real Ring attempts left
+expired `RECEIVED` and `UNCLAIMED` rows, each with its credential, in production for days.
+
+`veotrex-ring-pending-expiry` (`veotrex_api.ring_pending_expiry`) is the bounded, idempotent
+maintenance command that converges them. It runs with the admin/migration identity as a
+one-shot job, exactly like `migrate` and `runtime-role`, and refuses any role Row Level Security
+applies to: the API runtime role keeps no privilege on `encrypted_credentials` or
+`ring_pending_links`, the vault delete predicate keeps authorizing pre-tenant deletion only in
+`RECEIVED`, and no grant changed. The age condition is `access_expires_at <= now()` on the
+database clock, the exact complement of the claim predicate.
+
+| State | Expired link |
+|---|---|
+| `RECEIVED`, `UNCLAIMED`, `FAILED` | credential row deleted, link `ARCHIVED` (`archived_at` set; account, failure category and timestamps preserved) |
+| `CLAIMING` | never modified; counted for attention (ownership transaction may be in flight, Ring POST may have been sent) |
+| `RING_CONFIRMATION_UNCERTAIN`, `RING_CONFIRMED_UNBOUND` | never modified; counted for attention (remote evidence) |
+| `CLAIMED` | not examined; the credential belongs to the tenant connection |
+| `ARCHIVED` | terminal; a credential still attached and owned by no connection is removed as an orphan |
+
+A credential referenced by any `camera_provider_connections.credential_owner_id` is never
+deleted, whatever the link state; a pre-claim link in that situation is reported as
+`inconsistent` and left alone. `apply` is one transaction: candidates are locked with
+`FOR UPDATE SKIP LOCKED`, credentials are deleted, links are archived, then commit, so two
+workers never take the same row, a run that dies leaves nothing half-done, and a claim that
+started first is already `CLAIMING` and out of reach. `dry-run` executes in a `READ ONLY`
+transaction and takes no lock. Output is counts only (examined, per-state expired, archived,
+credentials removed, already clean, skipped by state, inconsistent, remaining); exit status 3
+signals rows that need operator attention. No identifier, reference, ciphertext, nonce, token
+or DSN is ever printed.
 
 ## Hostile review
 

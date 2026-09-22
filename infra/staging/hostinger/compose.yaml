@@ -96,6 +96,31 @@ services:
       postgres:
         condition: service_healthy
 
+  # One-shot, bounded Ring pending-link expiry (V1-00A-PROD-R2). Archives expired, abandoned
+  # pending links and deletes their sealed credential material in one transaction. Runs with
+  # the ADMIN DSN like `migrate` and `runtime-role`: the API runtime role is refused by the
+  # command itself. The default command is the read-only dry run; apply is an explicit
+  # override (see the runbook). Mounts ONLY the admin DSN: it never decrypts anything, so it
+  # has no business holding the vault master key.
+  ring-pending-expiry:
+    profiles: ["maintenance"]
+    build:
+      context: ../../..
+      dockerfile: infra/staging/Dockerfile.api
+    restart: "no"
+    environment:
+      VEOTREX_ENVIRONMENT: staging
+      VEOTREX_APP_VERSION: ${VEOTREX_APP_VERSION:-0.1.0-staging}
+      VEOTREX_PUBLIC_ORIGIN: ${VEOTREX_PUBLIC_ORIGIN:?VEOTREX_PUBLIC_ORIGIN must be set}
+      VEOTREX_DATABASE_URL_REF: file:/run/secrets/database_url
+    secrets:
+      - database_url
+    command: ["veotrex-ring-pending-expiry", "dry-run", "--limit", "100"]
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: ../../..
