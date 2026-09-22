@@ -766,80 +766,173 @@ class ProbeResult:
     detail: str
 
 
-def probe(
-    connection: psycopg.Connection[tuple[object, ...]], *, migration_role: str | None = None
-) -> list[ProbeResult]:
-    """Isolation probes executed AS the runtime role over its own connection.
+PROBE_ARTIFACT = "zz_runtime_probe"
+PROBE_ABORTED = "probe aborted before mutation-capable checks"
+INSUFFICIENT_PRIVILEGE = "42501"
 
-    Each negative probe runs in its own transaction so an expected failure never poisons the
-    next check. Nothing here prints a row of tenant data; only counts and outcomes.
+# The identity gate. Read-only catalog facts about the CONNECTED role, compared against the
+# name the operator asked for. Everything the probe later tries (DDL, ALTER, DELETE, SET ROLE)
+# is only ever attempted once this has passed, so a superuser, the migration role, or simply a
+# role other than the one named can never reach a mutation-capable statement.
+_IDENTITY_SQL = (
+    "SELECT r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, "
+    "r.rolreplication, r.rolinherit, has_schema_privilege(current_user, %s, 'CREATE'), "
+    "(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    " WHERE n.nspname = %s AND c.relkind IN ('r','p','S','v','m') "
+    " AND c.relowner = r.oid), "
+    "(SELECT count(*) FROM pg_auth_members m WHERE m.member = r.oid) "
+    "FROM pg_roles r WHERE r.rolname = current_user"
+)
+
+_ARTIFACT_SQL = (
+    "SELECT "
+    "(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    " WHERE n.nspname = %s AND c.relname = %s), "
+    "(SELECT count(*) FROM pg_roles WHERE rolname = %s), "
+    "(SELECT count(*) FROM pg_database WHERE datname = %s)"
+)
+
+
+def probe_identity_gate(
+    connection: psycopg.Connection[tuple[object, ...]], *, role: str
+) -> ProbeResult:
+    """Read-only: is the connected role exactly the restricted runtime identity ``role``?
+
+    Any deviation fails the gate: a different role name, SUPERUSER, BYPASSRLS, CREATEROLE,
+    CREATEDB, REPLICATION, INHERIT, CREATE on the application schema, owning any application
+    relation, or membership in any role. "Restricted enough" is not accepted.
     """
-    results: list[ProbeResult] = []
     connection.rollback()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(_IDENTITY_SQL, (SCHEMA, SCHEMA))
+            row = cursor.fetchone()
+    finally:
+        connection.rollback()
+    if row is None:
+        return ProbeResult("runtime role identity", False, "current_user not found in pg_roles")
+    name = str(row[0])
+    flags = [bool(value) for value in row[1:8]]
+    owned = _scalar_int((row[8],))
+    memberships = _scalar_int((row[9],))
+    detail = (
+        f"current_user={name} expected={role} superuser={flags[0]} bypassrls={flags[1]} "
+        f"createrole={flags[2]} createdb={flags[3]} replication={flags[4]} inherit={flags[5]} "
+        f"schema_create={flags[6]} owned_relations={owned} role_memberships={memberships}"
+    )
+    passed = name == role and not any(flags) and owned == 0 and memberships == 0
+    return ProbeResult("runtime role identity", passed, detail)
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, "
-            "r.rolreplication, has_schema_privilege(current_user, %s, 'CREATE'), "
-            "(SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            " WHERE n.nspname = %s AND c.relkind IN ('r','p','S','v','m') "
-            " AND c.relowner = r.oid), "
-            "(SELECT count(*) FROM pg_auth_members m WHERE m.member = r.oid) "
-            "FROM pg_roles r WHERE r.rolname = current_user",
-            (SCHEMA, SCHEMA),
-        )
-        row = cursor.fetchone() or ("", True, True, True, True, True, True, 1, 1)
+
+def probe_artifacts(connection: psycopg.Connection[tuple[object, ...]]) -> ProbeResult:
+    """Read-only: does a table, role or database named ``zz_runtime_probe`` already exist?
+
+    Their presence means an earlier run persisted a negative test (the V1-01A-2 incident).
+    The probe reports and stops; it never drops anything - it is a verifier, not a cleanup.
+    """
     connection.rollback()
-    flags = [bool(value) for value in row[1:7]]
-    owned = _scalar_int((row[7],))
-    memberships = _scalar_int((row[8],))
-    results.append(
-        ProbeResult(
-            "runtime role attributes",
-            not any(flags) and owned == 0 and memberships == 0,
-            f"current_user={row[0]} superuser={flags[0]} bypassrls={flags[1]} "
-            f"createrole={flags[2]} createdb={flags[3]} replication={flags[4]} "
-            f"schema_create={flags[5]} owned_relations={owned} role_memberships={memberships}",
-        )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(_ARTIFACT_SQL, (SCHEMA, PROBE_ARTIFACT, PROBE_ARTIFACT, PROBE_ARTIFACT))
+            row = cursor.fetchone() or (1, 1, 1)
+    finally:
+        connection.rollback()
+    table, role, database = (_scalar_int((value,)) for value in row)
+    return ProbeResult(
+        "no prior probe artifacts",
+        table == 0 and role == 0 and database == 0,
+        f"table={table} role={role} database={database} (name {PROBE_ARTIFACT}; "
+        "leftovers are never dropped by the probe)",
     )
 
-    INSUFFICIENT_PRIVILEGE = "42501"
 
-    def expect_refused(check: str, *statements: str, autocommit: bool = False) -> None:
+def execute_rollback_only(
+    connection: psycopg.Connection[tuple[object, ...]], *statements: str
+) -> tuple[str, str | None]:
+    """Run ``statements`` in one transaction that is ALWAYS rolled back.
+
+    Returns ``("refused", sqlstate)`` when PostgreSQL raised, or ``("succeeded", None)``
+    when every statement ran. The rollback is explicit and unconditional: a protection that
+    is accidentally missing yields a FAIL result and an unchanged database, never a committed
+    change. ``SET LOCAL``/``SET LOCAL ROLE`` effects end with the transaction too, and
+    ``RESET ROLE`` is issued afterwards as belt and braces.
+    """
+    connection.rollback()
+    outcome: tuple[str, str | None]
+    try:
+        with connection.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+        outcome = ("succeeded", None)
+    except psycopg.Error as exc:
+        outcome = ("refused", exc.sqlstate or "unknown")
+    finally:
+        connection.rollback()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("RESET ROLE")
+    except psycopg.Error:
+        pass
+    finally:
+        connection.rollback()
+    return outcome
+
+
+def probe(
+    connection: psycopg.Connection[tuple[object, ...]],
+    *,
+    role: str = DEFAULT_RUNTIME_ROLE,
+    migration_role: str | None = None,
+) -> list[ProbeResult]:
+    """Isolation probes executed AS the runtime role over its own connection - fail closed.
+
+    Phase 1 is a read-only identity gate: the connected role must be exactly ``role`` with
+    every restricted attribute. Phase 2 is a read-only artifact check. Only when both pass do
+    the active checks run, and every active negative check executes in a transaction that is
+    unconditionally rolled back, so an unexpectedly permitted statement is reported as FAIL
+    and leaves the database untouched. A wrong or privileged identity therefore never reaches
+    CREATE, ALTER, DELETE or SET ROLE. Nothing here prints a row of tenant data.
+    """
+    results: list[ProbeResult] = []
+    identity = probe_identity_gate(connection, role=role)
+    results.append(identity)
+    if not identity.passed:
+        results.append(
+            ProbeResult(PROBE_ABORTED, False, "identity gate failed; 0 active checks run")
+        )
+        return results
+    artifacts = probe_artifacts(connection)
+    results.append(artifacts)
+    if not artifacts.passed:
+        results.append(
+            ProbeResult(PROBE_ABORTED, False, "artifact check failed; 0 active checks run")
+        )
+        return results
+
+    def expect_refused(check: str, *statements: str) -> None:
         """PASS only when PostgreSQL refuses with insufficient_privilege (SQLSTATE 42501).
 
-        Any other error is reported as a failure too: a probe that "fails" for an unrelated
-        reason (a syntax error, a transaction-block restriction) proves nothing about privilege.
+        Any other error is a failure too: a probe that "fails" for an unrelated reason (a
+        syntax error, a transaction-block restriction) proves nothing about privilege. An
+        unexpected success is a failure whose effect has already been rolled back.
         """
-        try:
-            if autocommit:
-                # CREATE DATABASE cannot run inside a transaction block; without autocommit the
-                # refusal would be 25001, which says nothing about the role's privileges.
-                connection.autocommit = True
-                try:
-                    with connection.cursor() as cursor:
-                        for statement in statements:
-                            cursor.execute(statement)
-                finally:
-                    connection.autocommit = False
-            else:
-                with connection.transaction(), connection.cursor() as cursor:
-                    for statement in statements:
-                        cursor.execute(statement)
-        except psycopg.Error as exc:
-            code = exc.sqlstate or "unknown"
+        outcome, code = execute_rollback_only(connection, *statements)
+        if outcome == "refused":
             results.append(ProbeResult(check, code == INSUFFICIENT_PRIVILEGE, f"refused ({code})"))
-            return
-        results.append(ProbeResult(check, False, "statement succeeded"))
+        else:
+            results.append(ProbeResult(check, False, "statement succeeded (rolled back)"))
 
     def expect_count(check: str, statement: str, expected: int) -> None:
+        connection.rollback()
         try:
-            with connection.transaction(), connection.cursor() as cursor:
+            with connection.cursor() as cursor:
                 cursor.execute(statement)
                 value = _scalar_int(cursor.fetchone(), default=-1)
         except psycopg.Error as exc:
             results.append(ProbeResult(check, False, f"query failed ({exc.sqlstate})"))
             return
+        finally:
+            connection.rollback()
         results.append(ProbeResult(check, value == expected, f"rows={value}"))
 
     expect_count(
@@ -881,9 +974,18 @@ def probe(
         "gen_random_uuid(), 'RING', 'ring_pending_link', gen_random_uuid()) WHERE outcome = 'ok'",
         0,
     )
-    expect_refused("cannot create tables", "CREATE TABLE public.zz_runtime_probe (id int)")
-    expect_refused("cannot create roles", "CREATE ROLE zz_runtime_probe NOLOGIN")
-    expect_refused("cannot create databases", "CREATE DATABASE zz_runtime_probe", autocommit=True)
+    expect_refused("cannot create tables", f"CREATE TABLE public.{PROBE_ARTIFACT} (id int)")
+    expect_refused("cannot create roles", f"CREATE ROLE {PROBE_ARTIFACT} NOLOGIN")
+    # CREATE DATABASE cannot run inside a transaction, so it can never be rolled back. The
+    # privilege it needs is exactly rolcreatedb or SUPERUSER, both proven false by the gate
+    # above; that catalog fact is the check, and no database is ever created by the probe.
+    results.append(
+        ProbeResult(
+            "cannot create databases",
+            True,
+            "catalog: rolcreatedb=false superuser=false (never executed; not transactional)",
+        )
+    )
     expect_refused(
         "cannot disable row level security",
         "ALTER TABLE public.cameras DISABLE ROW LEVEL SECURITY",
@@ -913,9 +1015,11 @@ def probe(
         1,
     )
     if migration_role:
+        # SET LOCAL ROLE is transaction-scoped; the rollback (and RESET ROLE) undoes it even
+        # if the switch were permitted.
         expect_refused(
             f"cannot SET ROLE to {migration_role}",
-            sql.SQL("SET ROLE {}").format(_ident(migration_role)).as_string(),
+            sql.SQL("SET LOCAL ROLE {}").format(_ident(migration_role)).as_string(),
         )
     return results
 
@@ -975,7 +1079,9 @@ def parser() -> argparse.ArgumentParser:
         prog="veotrex-db-runtime-role",
         description=(
             "Provision, verify or probe the restricted PostgreSQL role the VeoTrex API runs as. "
-            "plan/apply/verify connect with the ADMIN identity; probe connects AS the runtime role."
+            "plan/apply/verify connect with the ADMIN identity and inspect the role named by "
+            "--role; probe must connect AS that runtime role (--url-ref to the API runtime DSN) "
+            "and refuses, before any active check, when the connected identity is anything else."
         ),
     )
     command.add_argument("action", choices=("plan", "apply", "verify", "probe"))
@@ -1006,12 +1112,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         url = _resolve_url(arguments.url_ref, _settings_database_url())
         if arguments.action == "probe":
-            with psycopg.connect(psycopg_dsn(url)) as connection:
-                results = probe(connection, migration_role=arguments.migration_role)
+            with psycopg.connect(psycopg_dsn(url), autocommit=False) as connection:
+                results = probe(
+                    connection, role=arguments.role, migration_role=arguments.migration_role
+                )
+                connection.rollback()
             failed = False
             for result in results:
                 print(f"{'PASS' if result.passed else 'FAIL'}  {result.check}: {result.detail}")
                 failed = failed or not result.passed
+            if any(result.check == PROBE_ABORTED for result in results):
+                print(
+                    "probe refused: connect with the API runtime DSN "
+                    "(--url-ref file:/run/secrets/api_database_url), never the admin one",
+                    file=sys.stderr,
+                )
             return 1 if failed else 0
 
         verifier: str | None = None

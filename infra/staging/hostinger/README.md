@@ -142,11 +142,19 @@ docker compose --env-file "$ENVFILE" --profile runtime-role run --rm \
   runtime-role veotrex-db-runtime-role verify --role veotrex_api \
   --migration-role veotrex
 docker compose --env-file "$ENVFILE" run --rm --no-deps \
-  -e VEOTREX_DATABASE_URL_REF=file:/run/secrets/api_database_url \
-  api veotrex-db-runtime-role probe --migration-role veotrex
+  api veotrex-db-runtime-role probe --role veotrex_api \
+  --migration-role veotrex --url-ref file:/run/secrets/api_database_url
 ```
 
-The first prints `verified`; the second prints only `PASS` lines. `verify` must run with
+The first prints `verified`; the second prints only `PASS` lines (21 checks). `probe` must
+be run from the `api` service with the API runtime DSN named explicitly, never from the
+`runtime-role` job: that job mounts the admin DSN. Since V1-01A-2-R1 the probe fails closed
+anyway - it first checks, read-only, that the connected role is exactly `--role` with every
+restricted attribute and that no `zz_runtime_probe` table, role or database exists, and it
+runs no CREATE, ALTER, DELETE or SET ROLE unless both checks pass; every active negative
+check is rolled back unconditionally, and CREATE DATABASE is never executed (its privilege is
+read from the catalog). An abort prints `FAIL  probe aborted before mutation-capable checks`
+and exits 1 having changed nothing. `verify` must run with
 the admin identity (the `runtime-role` job) or be told the migration role explicitly; when
 it is connected as `veotrex_api` itself (for example from the `api` container) it refuses to
 guess and exits 2, because it cannot tell which role owns the schema. The compose file already
