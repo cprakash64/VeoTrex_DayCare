@@ -1,17 +1,26 @@
 import { redirect } from "next/navigation";
 
 import { auth0 } from "../../../../../lib/auth0";
-import { providerStatus } from "../../../../../lib/ring-inventory";
+import { connectionPanels, providerStatus } from "../../../../../lib/ring-inventory";
 import { protectedRouteRedirect } from "../../../../../lib/session-policy";
-import { getApplicationIdentity, getRingInventory } from "../../../../../lib/veotrex-api";
+import {
+  getApplicationIdentity,
+  getRingConnections,
+  getRingInventory,
+  type RingInventoryCamera,
+} from "../../../../../lib/veotrex-api";
 import { SyncButton } from "./sync-button";
 
 export default async function RingDevicesPage() {
   const destination = protectedRouteRedirect(await auth0.getSession());
   if (destination) redirect(destination);
-  const [identity, cameras] = await Promise.all([getApplicationIdentity(), getRingInventory()]);
+  const [identity, connections, cameras] = await Promise.all([
+    getApplicationIdentity(),
+    getRingConnections(),
+    getRingInventory(),
+  ]);
   const canSynchronize = identity.permissions.includes("manage:integrations");
-  const connectionIds = [...new Set(cameras.map((camera) => camera.connection_id))];
+  const panels = connectionPanels(connections, cameras);
 
   return (
     <main>
@@ -26,28 +35,56 @@ export default async function RingDevicesPage() {
         Discovery does not assign a camera to a room. Physical assignment remains an explicit
         VeoTrex administrator action.
       </p>
-      {canSynchronize ? connectionIds.map((id) => <SyncButton key={id} connectionId={id} />) : null}
-      {cameras.length === 0 ? (
-        <section><h2>No Ring cameras discovered</h2><p>Connect and synchronize a Ring account.</p></section>
-      ) : (
-        <section className="inventory-grid" aria-label="Ring camera inventory">
-          {cameras.map((camera) => (
-            <article className="camera-card" key={camera.camera_id}>
-              <p className="eyebrow">{camera.provider}</p>
-              <h2>{camera.display_name}</h2>
-              <p>{providerStatus(camera.provider_online)} · {camera.assigned ? "Assigned" : "Discovered, unassigned"}</p>
-              <p>{camera.capabilities.length ? camera.capabilities.join(" · ") : "No camera capabilities reported"}</p>
-              {camera.privacy_controls_configured ? <p>Ring privacy controls configured</p> : null}
-              <p>
-                {camera.last_synchronized_at
-                  ? `Last synchronized ${new Date(camera.last_synchronized_at).toLocaleString()}`
-                  : "Not synchronized yet"}
-              </p>
-              <small>Camera {camera.camera_id}</small>
-            </article>
-          ))}
+      {panels.length === 0 ? (
+        <section>
+          <h2>No Ring account connected</h2>
+          <p>Connect a Ring account from the Ring app, then synchronize its devices here.</p>
         </section>
+      ) : (
+        panels.map((panel) => (
+          <section
+            className="connection-panel"
+            key={panel.connectionId}
+            aria-label={`Ring connection ${panel.displayName}`}
+          >
+            <h2>{panel.displayName}</h2>
+            <p>{panel.statusLabel}</p>
+            {panel.canSync && canSynchronize ? (
+              <SyncButton connectionId={panel.connectionId} />
+            ) : null}
+            {panel.cameras.length === 0 ? (
+              <p>
+                {panel.neverSynchronized
+                  ? "Connected, but the device inventory has not been synchronized yet."
+                  : "No Ring cameras discovered on this connection."}
+              </p>
+            ) : (
+              <div className="inventory-grid" aria-label="Ring camera inventory">
+                {panel.cameras.map((camera) => (
+                  <CameraCard key={camera.camera_id} camera={camera} />
+                ))}
+              </div>
+            )}
+          </section>
+        ))
       )}
     </main>
+  );
+}
+
+function CameraCard({ camera }: { camera: RingInventoryCamera }) {
+  return (
+    <article className="camera-card">
+      <p className="eyebrow">{camera.provider}</p>
+      <h3>{camera.display_name}</h3>
+      <p>{providerStatus(camera.provider_online)} · {camera.assigned ? "Assigned" : "Discovered, unassigned"}</p>
+      <p>{camera.capabilities.length ? camera.capabilities.join(" · ") : "No camera capabilities reported"}</p>
+      {camera.privacy_controls_configured ? <p>Ring privacy controls configured</p> : null}
+      <p>
+        {camera.last_synchronized_at
+          ? `Last synchronized ${new Date(camera.last_synchronized_at).toLocaleString()}`
+          : "Not synchronized yet"}
+      </p>
+    </article>
   );
 }

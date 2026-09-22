@@ -35,6 +35,24 @@ class SyncResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectionSummary:
+    """Operator-facing view of one Ring connection: lifecycle and sync state only.
+
+    Deliberately excludes ``secret_ref``, ``credential_owner_id`` and
+    ``external_account_id``: the dashboard needs to know that a connection exists and whether
+    it can be synchronized, never how its credential is stored or which Ring account it is.
+    """
+
+    connection_id: UUID
+    display_name: str
+    status: str
+    integration_state: str
+    operational_health: str
+    last_synchronized_at: datetime | None
+    last_sync_failure_category: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class InventoryCamera:
     camera_id: UUID
     connection_id: UUID
@@ -275,6 +293,43 @@ class RingInventoryService:
                 if removed_camera is not None:
                     removed_camera.status = "DISABLED"
         return created
+
+    async def list_connections(
+        self, principal: AuthenticatedPrincipal
+    ) -> tuple[ConnectionSummary, ...]:
+        """Every Ring connection of the caller's tenant, including ones with no inventory yet.
+
+        The devices page used to infer connections from camera rows, so a freshly linked
+        connection with zero cameras was invisible and its first sync could not be started
+        from the dashboard (V1-01A-0 finding). Tenant scope is both the RLS context and the
+        explicit predicate; ordering is deterministic so several connections render stably.
+        """
+        if Permission.READ_OPERATIONAL not in principal.permissions:
+            raise RingInventoryError("access_denied")
+        async with self._factory() as session, session.begin():
+            await self._set_tenant(session, principal.tenant_id)
+            rows = (
+                await session.scalars(
+                    select(CameraProviderConnection)
+                    .where(
+                        CameraProviderConnection.tenant_id == principal.tenant_id,
+                        CameraProviderConnection.provider_type == "RING",
+                    )
+                    .order_by(CameraProviderConnection.name, CameraProviderConnection.id)
+                )
+            ).all()
+        return tuple(
+            ConnectionSummary(
+                row.id,
+                row.name,
+                row.status,
+                row.integration_state,
+                row.operational_health,
+                row.last_sync_at,
+                row.last_sync_failure_category,
+            )
+            for row in rows
+        )
 
     async def list_inventory(
         self, principal: AuthenticatedPrincipal
