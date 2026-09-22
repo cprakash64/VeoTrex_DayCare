@@ -43,6 +43,11 @@ in one transaction; a failure leaves the cluster unchanged. `verify` audits the 
 from catalog metadata and `probe` connects *as* the runtime role and proves the boundary from the
 inside (no rows without context, no direct access to function-only tables, no DDL, no role or
 policy changes, no `SET ROLE` to the admin, `row_security = off` refused rather than honoured).
+Since V1-01A-2-R1 `probe` fails closed: a read-only identity gate (connected role equals
+`--role`, every restricted attribute, no ownership or membership) and an artifact guard run
+before any active check; every active negative check is executed in a transaction that is
+rolled back unconditionally, and `CREATE DATABASE` is asserted from the catalog rather than
+executed. Running `probe` with the admin DSN therefore aborts after the gate and mutates nothing.
 
 ### Privilege inventory
 

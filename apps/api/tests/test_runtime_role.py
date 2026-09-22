@@ -29,6 +29,8 @@ from veotrex_api.db import (
 )
 from veotrex_api.models import Base
 from veotrex_api.runtime_role import (
+    PROBE_ABORTED,
+    PROBE_ARTIFACT,
     RUNTIME_FUNCTION_GRANTS,
     TABLE_CLASSIFICATION,
     RuntimeRoleError,
@@ -38,9 +40,12 @@ from veotrex_api.runtime_role import (
     _normalise_signature,
     apply_plan,
     build_plan,
+    execute_rollback_only,
     inspect_schema,
     main,
     probe,
+    probe_artifacts,
+    probe_identity_gate,
     psycopg_dsn,
     replace_credentials,
     role_attributes,
@@ -695,15 +700,20 @@ def test_fresh_provision_hardens_own_function_default_and_it_holds_when_creating
 
 
 def test_probe_from_the_runtime_role_passes_every_check(
-    settings: Settings, admin_settings: Settings
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
 ) -> None:
     with _connect(admin_settings) as admin:
         migration_role = inspect_schema(admin, "unused").connected_role
     with _connect(settings) as connection:
-        results = probe(connection, migration_role=migration_role)
+        results = probe(connection, role=runtime_role_name, migration_role=migration_role)
     failed = [result for result in results if not result.passed]
     assert not failed, [(result.check, result.detail) for result in failed]
-    assert len(results) >= 20
+    # V1-01A-2-R1: identity gate, artifact guard, then the active checks (21 in total).
+    assert len(results) == 21
+    assert results[0].check == "runtime role identity" and results[1].check.startswith("no prior")
+    assert not any(result.check == PROBE_ABORTED for result in results)
+    databases = [result for result in results if result.check == "cannot create databases"]
+    assert databases[0].detail.startswith("catalog:"), "never executed"
 
 
 async def test_engine_guard_accepts_runtime_and_refuses_admin(
@@ -1046,3 +1056,249 @@ async def test_security_definer_surface_is_exact_and_does_not_cross_tenants(
                 )
     finally:
         await engine.dispose()
+
+
+# ------------------------------------------------------------- V1-01A-2-R1: probe fails closed
+
+
+def _security_snapshot(admin: psycopg.Connection[tuple[object, ...]]) -> tuple[object, ...]:
+    """cameras RLS flags, owner, tenant_isolation USING/WITH CHECK, audit row count,
+    and the three probe artifacts. Everything the incident changed, in one tuple."""
+    with admin.cursor() as cursor:
+        cursor.execute(
+            "SELECT c.relrowsecurity, c.relforcerowsecurity, pg_get_userbyid(c.relowner) "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relname = 'cameras'"
+        )
+        rls = cursor.fetchone()
+        cursor.execute(
+            "SELECT qual, with_check FROM pg_policies "
+            "WHERE tablename = 'cameras' AND policyname = 'tenant_isolation'"
+        )
+        policy = cursor.fetchone()
+        cursor.execute("SELECT count(*) FROM public.audit_events")
+        audits = cursor.fetchone()
+        cursor.execute(
+            "SELECT (SELECT count(*) FROM pg_class WHERE relname = %s), "
+            "(SELECT count(*) FROM pg_roles WHERE rolname = %s), "
+            "(SELECT count(*) FROM pg_database WHERE datname = %s)",
+            (PROBE_ARTIFACT, PROBE_ARTIFACT, PROBE_ARTIFACT),
+        )
+        artifacts = cursor.fetchone()
+    admin.rollback()
+    return (rls, policy, audits, artifacts)
+
+
+def _seed_audit_sentinel(admin: psycopg.Connection[tuple[object, ...]]) -> UUID:
+    tenant_id, sentinel = uuid4(), uuid4()
+    with admin.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO tenants (id, name, status) VALUES (%s, %s, 'ACTIVE')",
+            (tenant_id, f"Probe sentinel {tenant_id.hex[:8]}"),
+        )
+        cursor.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cursor.execute(
+            "INSERT INTO audit_events (id, tenant_id, actor_id, action, target_type, "
+            "target_id, request_id, metadata) VALUES (%s, %s, NULL, 'probe.sentinel', "
+            "'test', NULL, 'probe-sentinel', '{}'::json)",
+            (sentinel, tenant_id),
+        )
+    admin.commit()
+    return sentinel
+
+
+def _audit_row_exists(admin: psycopg.Connection[tuple[object, ...]], sentinel: UUID) -> bool:
+    with admin.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM public.audit_events WHERE id = %s", (sentinel,))
+        row = cursor.fetchone()
+    admin.rollback()
+    return bool(row and int(str(row[0])) == 1)
+
+
+def test_probe_with_the_admin_identity_aborts_before_any_mutation(
+    admin_settings: Settings, runtime_role_name: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator mistake of V1-01A-2, reproduced: probe over the ADMIN DSN. It must report
+    the identity failure, abort, and change nothing - no artifacts, no RLS/policy/owner change,
+    no audit deletion."""
+    with _connect(admin_settings) as admin:
+        sentinel = _seed_audit_sentinel(admin)
+        before = _security_snapshot(admin)
+        assert before[3] == (0, 0, 0), "test cluster must start without probe artifacts"
+
+        results = probe(admin, role=runtime_role_name, migration_role="anything")
+
+        assert [result.check for result in results] == ["runtime role identity", PROBE_ABORTED]
+        assert results[0].passed is False and results[1].passed is False
+        assert f"expected={runtime_role_name}" in results[0].detail
+        assert "superuser=True" in results[0].detail or "createdb=True" in results[0].detail
+        assert "0 active checks run" in results[1].detail
+        assert _security_snapshot(admin) == before
+        assert _audit_row_exists(admin, sentinel)
+
+        # The console entry point behaves the same and exits non-zero.
+        admin_url = admin_settings.database_url.get_secret_value()
+        import os
+
+        os.environ["VEOTREX_PROBE_TEST_ADMIN_URL"] = admin_url
+        try:
+            code = main(
+                [
+                    "probe",
+                    "--role",
+                    runtime_role_name,
+                    "--migration-role",
+                    "anything",
+                    "--url-ref",
+                    "env:VEOTREX_PROBE_TEST_ADMIN_URL",
+                ]
+            )
+        finally:
+            os.environ.pop("VEOTREX_PROBE_TEST_ADMIN_URL", None)
+        captured = capsys.readouterr()
+        assert code == 1
+        assert f"FAIL  {PROBE_ABORTED}" in captured.out
+        assert captured.out.count("\n") == 2, "exactly the gate line and the abort line"
+        assert "never the admin one" in captured.err
+        assert admin_url not in captured.out + captured.err
+        assert _security_snapshot(admin) == before
+        assert _audit_row_exists(admin, sentinel)
+
+
+def test_probe_with_a_restricted_but_differently_named_role_aborts(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """Wrong identity alone is sufficient: the real restricted test role, asked to prove it is
+    the production role name, stops at the gate even though every attribute is restricted."""
+    assert runtime_role_name != "veotrex_api"
+    with _connect(admin_settings) as admin:
+        before = _security_snapshot(admin)
+    with _connect(settings) as connection:
+        results = probe(connection, role="veotrex_api", migration_role="anything")
+    assert [result.check for result in results] == ["runtime role identity", PROBE_ABORTED]
+    assert "superuser=False" in results[0].detail and "expected=veotrex_api" in results[0].detail
+    with _connect(admin_settings) as admin:
+        assert _security_snapshot(admin) == before
+
+
+def test_probe_stops_when_prior_artifacts_exist_and_never_drops_them(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    with _connect(admin_settings) as admin:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE TABLE public.{PROBE_ARTIFACT} (id int)")
+        admin.commit()
+        try:
+            assert probe_artifacts(admin).passed is False
+            with _connect(settings) as connection:
+                results = probe(connection, role=runtime_role_name)
+            assert [result.check for result in results] == [
+                "runtime role identity",
+                "no prior probe artifacts",
+                PROBE_ABORTED,
+            ]
+            assert results[0].passed and not results[1].passed
+            assert "table=1" in results[1].detail
+            with admin.cursor() as cursor:
+                cursor.execute(
+                    "SELECT count(*) FROM pg_class WHERE relname = %s", (PROBE_ARTIFACT,)
+                )
+                assert cursor.fetchone() == (1,), "the probe must not clean up"
+            admin.rollback()
+        finally:
+            with admin.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS public.{PROBE_ARTIFACT}")
+            admin.commit()
+    assert probe_artifacts(admin if not admin.closed else _connect(admin_settings)).passed
+
+
+def test_probe_never_persists_an_audit_delete_even_when_delete_is_granted(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """Mandatory acceptance: DELETE accidentally granted, sentinel row present, identity
+    otherwise correct. The check must FAIL and the sentinel must survive."""
+    with _connect(admin_settings) as admin:
+        sentinel = _seed_audit_sentinel(admin)
+        with admin.cursor() as cursor:
+            cursor.execute(f'GRANT DELETE ON public.audit_events TO "{runtime_role_name}"')
+        admin.commit()
+        try:
+            with _connect(settings) as connection:
+                results = probe(connection, role=runtime_role_name)
+            by_check = {result.check: result for result in results}
+            assert by_check["cannot delete audit rows"].passed is False
+            assert (
+                by_check["cannot delete audit rows"].detail == "statement succeeded (rolled back)"
+            )
+            assert by_check["runtime role identity"].passed
+            assert PROBE_ABORTED not in by_check
+            assert _audit_row_exists(admin, sentinel), "the rollback must preserve every row"
+        finally:
+            with admin.cursor() as cursor:
+                cursor.execute(f'REVOKE DELETE ON public.audit_events FROM "{runtime_role_name}"')
+            admin.commit()
+        with _connect(settings) as connection:
+            assert all(result.passed for result in probe(connection, role=runtime_role_name))
+
+
+def test_rollback_only_executor_never_persists_rls_policy_or_ownership_changes(
+    admin_settings: Settings,
+) -> None:
+    """The probe's own executor, driven with an identity that CAN perform the mutation: each
+    forbidden statement succeeds (FAIL outcome) and every security control is unchanged."""
+    with _connect(admin_settings) as admin:
+        before = _security_snapshot(admin)
+        with admin.cursor() as cursor:
+            cursor.execute("SELECT current_user")
+            me = str((cursor.fetchone() or ("",))[0])
+        admin.rollback()
+        for statements in (
+            ("ALTER TABLE public.cameras DISABLE ROW LEVEL SECURITY",),
+            ("ALTER TABLE public.cameras NO FORCE ROW LEVEL SECURITY",),
+            ("ALTER POLICY tenant_isolation ON public.cameras USING (true)",),
+            ("ALTER POLICY tenant_isolation ON public.cameras WITH CHECK (true)",),
+            ("ALTER TABLE public.cameras OWNER TO CURRENT_USER",),
+            ("DELETE FROM public.audit_events",),
+            (f"CREATE TABLE public.{PROBE_ARTIFACT} (id int)",),
+            (f"CREATE ROLE {PROBE_ARTIFACT} NOLOGIN",),
+            (f'SET LOCAL ROLE "{me}"',),
+            ("SET LOCAL row_security = off", "SELECT count(*) FROM public.cameras"),
+        ):
+            assert execute_rollback_only(admin, *statements) == ("succeeded", None), statements
+            assert _security_snapshot(admin) == before, statements
+        # A refusal is classified by SQLSTATE and also leaves nothing behind.
+        assert execute_rollback_only(admin, "SELECT * FROM public.does_not_exist") == (
+            "refused",
+            "42P01",
+        )
+        assert _security_snapshot(admin) == before
+        # The connection is usable and not left inside a transaction or a switched role.
+        with admin.cursor() as cursor:
+            cursor.execute("SELECT current_user, txid_current_if_assigned()")
+            row = cursor.fetchone()
+        admin.rollback()
+        assert row is not None and row[0] == me and row[1] is None
+
+
+def test_identity_gate_is_read_only_and_names_every_invariant(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    with _connect(settings) as connection:
+        gate = probe_identity_gate(connection, role=runtime_role_name)
+    assert gate.passed
+    for key in (
+        f"current_user={runtime_role_name}",
+        f"expected={runtime_role_name}",
+        "superuser=False",
+        "bypassrls=False",
+        "createrole=False",
+        "createdb=False",
+        "replication=False",
+        "inherit=False",
+        "schema_create=False",
+        "owned_relations=0",
+        "role_memberships=0",
+    ):
+        assert key in gate.detail, key
+    with _connect(admin_settings) as admin:
+        assert probe_identity_gate(admin, role=runtime_role_name).passed is False
