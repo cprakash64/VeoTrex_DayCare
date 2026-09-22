@@ -12,6 +12,9 @@ class EdgeSettings(BaseSettings):
     node_id: UUID
     environment: str = Field(default="local", min_length=1)
     version: str = Field(default="0.1.0", min_length=1)
+    # Provenance of the running build, supplied by the release the service was started from
+    # (see infra/jetson: release.env). "unknown" when run from a working tree by hand.
+    source_commit: str = Field(default="unknown", min_length=1, max_length=64)
     log_level: str = "INFO"
     heartbeat_interval_seconds: int = Field(default=30, ge=5, le=300)
     service_name: str = "veotrex-edge-agent"
