@@ -95,3 +95,43 @@ def test_entry_points_the_deployment_relies_on_are_console_scripts(dockerfile: s
     assert '"uvicorn"' in dockerfile
     compose = (REPOSITORY / "infra" / "staging" / "hostinger" / "compose.yaml").read_text()
     assert '"alembic"' in compose
+
+
+# ----------------------------------------------- no evaluation-only dependency in the image
+def test_opencv_is_a_dependency_group_and_never_a_runtime_dependency() -> None:
+    """The control-plane image must not contain OpenCV (V1-02B0).
+
+    The evaluation face backend is refused in staging and production, so shipping its 90 MB
+    dependency there would add attack surface for a capability that cannot be used. Declaring
+    it as a PEP 735 group rather than a project dependency is what keeps it out, because the
+    image builds with ``--no-dev`` and uv installs no groups by default.
+    """
+    manifest = (REPOSITORY / "apps" / "api" / "pyproject.toml").read_text()
+    # Comments are stripped: both halves discuss OpenCV, and only the declarations decide.
+    declarations = "\n".join(
+        line for line in manifest.splitlines() if not line.lstrip().startswith("#")
+    )
+    runtime, separator, groups = declarations.partition("[dependency-groups]")
+    assert separator, "the face-eval dependency group is expected to exist"
+    assert "opencv" in groups, "the face-eval group is expected to declare OpenCV"
+    assert "opencv" not in runtime, "OpenCV must not be a runtime dependency of veotrex-api"
+    assert "numpy" not in runtime, "NumPy must not be a runtime dependency of veotrex-api"
+
+
+def test_the_image_installs_no_dependency_groups(dockerfile: str) -> None:
+    """Both sync steps must keep ``--no-dev``; dropping it would pull the default group in and
+    is the single edit that would put an evaluation-only dependency into production."""
+    syncs = [line for line in _instructions(dockerfile) if "uv sync" in line]
+    assert syncs, "the image is expected to install dependencies with uv sync"
+    for statement in syncs:
+        assert "--no-dev" in statement
+        assert "--all-groups" not in statement
+        assert "--group" not in statement
+
+
+def test_no_face_model_weight_is_copied_into_the_image(dockerfile: str) -> None:
+    """Weights are fetched by an operator into a git-ignored directory for local evaluation
+    only; nothing may carry one onto the control plane."""
+    for statement in _instructions(dockerfile):
+        assert ".onnx" not in statement
+        assert "artifacts/models" not in statement

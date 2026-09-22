@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -87,21 +87,68 @@ class Settings(BaseSettings):
     staff_media_dir: str = Field(default="/var/lib/veotrex/staff-media", min_length=1)
     staff_enrollment_image_bytes: int = Field(default=8_388_608, ge=65_536, le=33_554_432)
     staff_enrollment_upload_rate_limit_per_minute: int = Field(default=60, ge=1, le=600)
-    # Face-template backend: "unavailable" (production default until a licence-approved model
-    # is adopted; uploads are refused with a bounded category) or "fake" (deterministic,
-    # test/local only; never a real biometric). A real backend is a later, explicit decision.
-    staff_face_backend: str = Field(default="unavailable", pattern=r"^(unavailable|fake)$")
+    # Face backend (V1-02A, extended by V1-02B0):
+    #   "unavailable"  production default. Uploads are refused with a bounded category; no
+    #                  template is ever fabricated and no model is ever loaded.
+    #   "fake"         deterministic, dependency-free, NOT a biometric. CI and local only.
+    #   "opencv_eval"  real YuNet + SFace over audited weights, producing REAL adult biometric
+    #                  templates. SFace's weight provenance is unresolved upstream and face
+    #                  templates are not yet encrypted at rest, so it is LOCAL EVALUATION ONLY
+    #                  (ADR 0020) and refused outside local/development/test/ci below.
+    staff_face_backend: str = Field(
+        default="unavailable", pattern=r"^(unavailable|fake|opencv_eval)$"
+    )
+    # Directory holding the audited model weights. The file names inside it come from the
+    # in-code registry, never from configuration, and each file's SHA-256 is verified before it
+    # is loaded, so this names a location and grants no ability to choose a different model.
+    # Empty is the correct value everywhere the backend is not "opencv_eval".
+    staff_face_model_dir: str = Field(default="")
+    staff_face_detection_confidence: float = Field(default=0.9, gt=0.0, lt=1.0)
+    staff_face_min_area_ratio: float = Field(default=0.015, gt=0.0, le=1.0)
+    staff_face_min_sharpness: float = Field(default=20.0, ge=0.0, le=10_000.0)
+    # Evaluation recognition thresholds, specific to the opencv_eval model version. Upstream
+    # verifies SFace pairs at cosine 0.363; both defaults here are deliberately stricter,
+    # because a false UNKNOWN is always preferable to a false identity. Neither number is
+    # production-calibrated and neither may be presented as one.
+    staff_recognition_threshold: float = Field(default=0.45, gt=0.0, lt=1.0)
+    staff_recognition_margin: float = Field(default=0.06, ge=0.0, lt=1.0)
+
+    # Environments in which a real-biometric evaluation backend, and the recognition-test
+    # endpoint that goes with it, may exist at all.
+    FACE_EVALUATION_ENVIRONMENTS: ClassVar[frozenset[str]] = frozenset(
+        {"local", "development", "test", "ci"}
+    )
 
     @model_validator(mode="after")
-    def fake_face_backend_only_outside_production(self) -> "Settings":
-        if self.staff_face_backend == "fake" and self.environment not in {
-            "test",
-            "local",
-            "development",
-            "ci",
-        }:
-            raise ValueError("the fake face backend is permitted only in test/local environments")
+    def evaluation_face_backends_only_outside_production(self) -> "Settings":
+        """Refuse a non-production face backend anywhere but a permitted environment.
+
+        This is the first of three independent refusals (see ``face_opencv``): a misconfigured
+        VEOTREX_STAFF_FACE_BACKEND in staging or production fails at settings construction, so
+        the process never starts rather than starting with real recognition enabled.
+        """
+        if (
+            self.staff_face_backend in {"fake", "opencv_eval"}
+            and self.environment not in self.FACE_EVALUATION_ENVIRONMENTS
+        ):
+            raise ValueError(
+                f"the {self.staff_face_backend} face backend is permitted only in "
+                "local/development/test/ci environments"
+            )
+        if self.staff_face_backend == "opencv_eval" and not self.staff_face_model_dir.strip():
+            raise ValueError("the opencv_eval face backend requires VEOTREX_STAFF_FACE_MODEL_DIR")
         return self
+
+    @property
+    def face_evaluation_permitted(self) -> bool:
+        """Whether this environment may run face evaluation at all.
+
+        Necessary but not sufficient for the recognition-test route: ``main`` also requires a
+        backend that can actually answer "who is this", so a permitted environment running the
+        fail-closed backend still registers no route. In staging and production this is false,
+        so the route does not exist and its path 404s like any unknown path.
+        """
+        return self.environment in self.FACE_EVALUATION_ENVIRONMENTS
 
     @model_validator(mode="before")
     @classmethod

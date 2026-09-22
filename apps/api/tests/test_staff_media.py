@@ -143,12 +143,16 @@ def test_fake_backend_is_deterministic_and_the_unavailable_backend_fails_closed(
         second = fake.extract_template(one)
     assert first.data == second.data and len(first.data) == 128 * 4 and first.dtype == "float32"
     assert "REDACTED" in repr(first) and first.data[:8] not in repr(first).encode()
+    # V1-02B0: extraction refuses with the same bounded categories the enrollment API exposes,
+    # rather than a private "no single face" that no caller has a message for.
     with Image.open(io.BytesIO(solid((250, 10, 10)))) as none:
         assert fake.analyze(none).face_count == 0
-        with pytest.raises(FaceBackendError, match="no_single_face"):
+        with pytest.raises(FaceBackendError, match="no_face_detected"):
             fake.extract_template(none)
     with Image.open(io.BytesIO(solid((10, 10, 250)))) as two:
         assert fake.analyze(two).face_count == 2
+        with pytest.raises(FaceBackendError, match="multiple_faces"):
+            fake.extract_template(two)
     unavailable = UnavailableFaceBackend()
     assert unavailable.ready is False
     with Image.open(io.BytesIO(solid((128, 128, 128)))) as image:

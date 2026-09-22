@@ -30,7 +30,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from veotrex_api.access import AuthenticatedPrincipal
 from veotrex_api.authorization import Permission
-from veotrex_api.face_backend import MIN_FACE_SIZE_PX, FaceBackendError, FaceEnrollmentBackend
+from veotrex_api.face_backend import (
+    FaceBackendError,
+    FaceEnrollmentBackend,
+    reject_unusable_face,
+)
 from veotrex_api.models import AuditEvent, StaffEnrollmentImage, StaffFaceTemplate, StaffProfile
 from veotrex_api.staff_media import (
     EnrollmentImageRejected,
@@ -55,6 +59,9 @@ REJECTION_CATEGORIES = frozenset(
         "no_face_detected",
         "multiple_faces",
         "face_too_small",
+        # V1-02B0: a real detector can find a face in a photo with no usable detail. Only
+        # extreme blur is refused, and only by a backend that measures it deterministically.
+        "face_too_blurry",
         "duplicate_image",
         "enrollment_limit_reached",
         "face_backend_unavailable",
@@ -437,18 +444,17 @@ class StaffEnrollmentService:
         validated = validate_enrollment_image(data, max_bytes=self._max_image_bytes)
         try:
             observation = self._backend.analyze(validated.image)
+            reject_unusable_face(observation)
         except FaceBackendError as exc:
             raise EnrollmentImageRejected(exc.category) from None
-        if observation.face_count == 0:
-            raise EnrollmentImageRejected("no_face_detected")
-        if observation.face_count > 1:
-            raise EnrollmentImageRejected("multiple_faces")
-        if observation.face_size_px is not None and observation.face_size_px < MIN_FACE_SIZE_PX:
-            raise EnrollmentImageRejected("face_too_small")
         try:
             template = self._backend.extract_template(validated.image)
-        except FaceBackendError:
-            raise EnrollmentImageRejected("template_failed") from None
+        except FaceBackendError as exc:
+            # A backend that refuses at extraction says why in the same bounded vocabulary;
+            # anything it does not name is reported as a generic processing failure.
+            raise EnrollmentImageRejected(
+                exc.category if exc.category in REJECTION_CATEGORIES else "template_failed"
+            ) from None
 
         stored_key: str | None = None
         try:

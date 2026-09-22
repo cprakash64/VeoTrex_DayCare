@@ -175,3 +175,16 @@ export async function getStaffImageContent(staffId: string, imageId: string): Pr
     `/v1/staff/${encodeURIComponent(staffId)}/enrollment-images/${encodeURIComponent(imageId)}/content`,
   );
 }
+
+/**
+ * Local recognition evaluation (V1-02B0). The route exists on the API only in an evaluation
+ * environment; elsewhere this call reaches a path that is not registered and fails, which is
+ * the intended outcome rather than something to handle specially.
+ */
+export async function runRecognitionTest(bytes: ArrayBuffer, mediaType: string): Promise<Response> {
+  return authorizedFetch("/v1/staff/recognition-test", {
+    method: "POST",
+    headers: { "Content-Type": mediaType },
+    body: bytes,
+  });
+}
