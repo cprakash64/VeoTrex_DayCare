@@ -39,7 +39,14 @@ def _directives(text: str) -> list[str]:
 # --------------------------------------------------------------------- no competing ingress
 def test_hostinger_stack_contains_no_proxy_service(compose: dict[str, Any]) -> None:
     """nginx owns :80/:443 on this host; a second ingress would take five live sites down."""
-    assert set(compose["services"]) == {"postgres", "migrate", "runtime-role", "api", "web"}
+    assert set(compose["services"]) == {
+        "postgres",
+        "migrate",
+        "runtime-role",
+        "ring-pending-expiry",
+        "api",
+        "web",
+    }
     rendered = COMPOSE_PATH.read_text().lower()
     for forbidden in ("caddy", "traefik", "haproxy"):
         assert forbidden not in "\n".join(_directives(rendered))
@@ -113,7 +120,7 @@ def test_every_secret_is_a_reference_not_a_value(compose: dict[str, Any]) -> Non
 def test_database_url_arrives_by_reference_not_environment(compose: dict[str, Any]) -> None:
     """Every DSN is a file-mounted secret reference, and the identities are split (V1-00A):
     migration and role provisioning use the admin DSN; the API mounts ONLY the runtime DSN."""
-    for service in ("migrate", "runtime-role"):
+    for service in ("migrate", "runtime-role", "ring-pending-expiry"):
         environment = compose["services"][service]["environment"]
         assert environment["VEOTREX_DATABASE_URL_REF"] == "file:/run/secrets/database_url"
         assert "VEOTREX_DATABASE_URL" not in environment
@@ -136,6 +143,25 @@ def test_runtime_role_job_is_a_discrete_idempotent_profile(compose: dict[str, An
     assert "file:/run/secrets/api_database_password" in job["command"]
     assert not any(token.startswith("postgresql") for token in job["command"])
     assert "api_database_password" in job["secrets"]
+    assert "ports" not in job
+    assert job["networks"] == ["data"]
+
+
+def test_pending_expiry_job_is_a_read_only_by_default_maintenance_profile(
+    compose: dict[str, Any],
+) -> None:
+    """V1-00A-PROD-R2: the janitor is a discrete admin-identity job whose default invocation
+    is the dry run. It deletes ciphertext rows and never decrypts, so it must not hold the
+    vault master key, and it never needs the runtime role's password."""
+    job = compose["services"]["ring-pending-expiry"]
+    assert job["profiles"] == ["maintenance"]
+    assert job["restart"] == "no"
+    assert job["command"][:2] == ["veotrex-ring-pending-expiry", "dry-run"]
+    assert "--limit" in job["command"]
+    assert "apply" not in job["command"]
+    assert not any(token.startswith("postgresql") for token in job["command"])
+    assert job["secrets"] == ["database_url"]
+    assert "VEOTREX_VAULT_MASTER_KEY_REF" not in job["environment"]
     assert "ports" not in job
     assert job["networks"] == ["data"]
 

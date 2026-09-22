@@ -74,6 +74,8 @@ jobs:
             uvicorn --version
             command -v veotrex-ring-readiness
             command -v veotrex-provision
+            command -v veotrex-db-runtime-role
+            command -v veotrex-ring-pending-expiry
             python -c "import veotrex_api, veotrex_api.main"
             if grep -rl "/build" /app/.venv/lib/python3.12/site-packages/*.pth 2>/dev/null; then
               echo "builder-only path leaked into the virtualenv"; exit 1
