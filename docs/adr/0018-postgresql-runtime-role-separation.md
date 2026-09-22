@@ -79,6 +79,11 @@ and sequences that state the intent. Tests create a `future_sensitive_table`, a 
 sequence as the migration role and prove the runtime is refused every privilege until a
 deliberate classification grants exactly the intended ones.
 
+The same global function-default revoke is applied for the runtime role *itself*
+(V1-00A-PROD-R1). It cannot create functions today, but if it ever gains creation rights in some
+schema, what it creates must not become PUBLIC-executable either; `verify` checks both creator
+roles' defaults and refuses to infer the migration role when connected as the runtime role.
+
 ### Classification model
 
 | Class | Privileges | Tables |

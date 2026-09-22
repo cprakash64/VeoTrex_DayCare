@@ -188,6 +188,10 @@ def test_plan_never_grants_by_default_and_revokes_unclassified_objects() -> None
         'ALTER DEFAULT PRIVILEGES FOR ROLE "veotrex_test" REVOKE ALL ON FUNCTIONS FROM PUBLIC'
         in rendered
     )
+    assert (
+        'ALTER DEFAULT PRIVILEGES FOR ROLE "veotrex_api" REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC'
+        in rendered
+    )
     assert "ALL PRIVILEGES" not in rendered
     existing = build_plan(_inventory(role_exists=True))
     assert "ALTER ROLE" in existing.render() and "CREATE ROLE" not in existing.render()
@@ -319,7 +323,10 @@ def test_apply_converges_an_over_privileged_role_down_to_the_allow_list(
     with _connect(admin_settings) as connection:
         owner = inspect_schema(connection, role).connected_role
         with connection.transaction(), connection.cursor() as cursor:
-            cursor.execute(f"DROP ROLE IF EXISTS {role}")
+            cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            if cursor.fetchone():
+                cursor.execute(f"DROP OWNED BY {role}")
+                cursor.execute(f"DROP ROLE {role}")
             cursor.execute(f"CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS")
             cursor.execute(f"GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {role}")
             cursor.execute(f"GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO {role}")
@@ -350,14 +357,17 @@ def test_apply_converges_an_over_privileged_role_down_to_the_allow_list(
                     )
                     assert (cursor.fetchone() or (True,))[0] is False, privilege
                 cursor.execute(
-                    "SELECT count(*) FROM pg_default_acl WHERE defaclacl::text LIKE %s",
-                    (f"%{role}=%",),
+                    "SELECT count(*) FROM pg_default_acl WHERE defaclacl::text LIKE %s "
+                    "AND pg_get_userbyid(defaclrole) <> %s",
+                    (f"%{role}=%", role),
                 )
                 assert (cursor.fetchone() or (1,))[0] == 0
         finally:
+            connection.rollback()
             with connection.transaction(), connection.cursor() as cursor:
                 cursor.execute(f"DROP OWNED BY {role}")
                 cursor.execute(f"DROP ROLE IF EXISTS {role}")
+            connection.commit()
 
 
 def test_future_table_is_inaccessible_until_classified(
@@ -493,6 +503,197 @@ def test_future_sequence_is_inaccessible_until_allowed(
                 cursor.execute(f"DROP SEQUENCE IF EXISTS public.{sequence}")
 
 
+def test_verify_refuses_to_infer_the_migration_role_from_a_runtime_connection(
+    settings: Settings, admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """V1-00A-PROD-R1: production ran verify from the API container, connected as the runtime
+    role and without --migration-role, and evaluated the migration-role invariants against
+    veotrex_api. verify must refuse to guess in that situation and must pass when told."""
+    with _connect(settings) as runtime:
+        with pytest.raises(RuntimeRoleError, match="connected as the runtime role"):
+            verify(runtime, role=runtime_role_name)
+    with _connect(admin_settings) as admin:
+        migration_role = inspect_schema(admin, "unused").connected_role
+    with _connect(settings) as runtime:
+        assert verify(runtime, role=runtime_role_name, migration_role=migration_role) == []
+
+
+def test_apply_converges_the_runtime_roles_own_function_default(
+    admin_settings: Settings, runtime_role_name: str
+) -> None:
+    """V1-00A-PROD-R1 convergence: reproduce the production state (correct grants, but the
+    runtime role's own creator defaults left at PostgreSQL's PUBLIC EXECUTE), prove verify
+    reports exactly that, then prove apply removes it without touching anything else."""
+
+    def snapshot(connection: psycopg.Connection[tuple[object, ...]]) -> tuple[object, ...]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication, "
+                "rolinherit, rolcanlogin FROM pg_roles WHERE rolname = %s",
+                (runtime_role_name,),
+            )
+            attributes = cursor.fetchone()
+            cursor.execute(
+                "SELECT table_name, privilege_type FROM information_schema.role_table_grants "
+                "WHERE grantee = %s ORDER BY 1, 2",
+                (runtime_role_name,),
+            )
+            table_grants = tuple(cursor.fetchall())
+            cursor.execute(
+                "SELECT routine_name FROM information_schema.role_routine_grants "
+                "WHERE grantee = %s ORDER BY 1",
+                (runtime_role_name,),
+            )
+            routine_grants = tuple(cursor.fetchall())
+            cursor.execute(
+                "SELECT tablename, policyname FROM pg_policies WHERE schemaname = 'public' "
+                "ORDER BY 1, 2"
+            )
+            policies = tuple(cursor.fetchall())
+            cursor.execute(
+                "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+                "WHERE relnamespace = 'public'::regnamespace AND relkind = 'r' ORDER BY 1"
+            )
+            rls = tuple(cursor.fetchall())
+            cursor.execute(
+                "SELECT has_schema_privilege(%s, 'public', 'CREATE')", (runtime_role_name,)
+            )
+            create = cursor.fetchone()
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                cursor.execute(
+                    "SELECT has_table_privilege(%s, 'public.encrypted_credentials', %s)",
+                    (runtime_role_name, privilege),
+                )
+                assert (cursor.fetchone() or (True,))[0] is False, privilege
+        return (attributes, table_grants, routine_grants, policies, rls, create)
+
+    def own_function_default(connection: psycopg.Connection[tuple[object, ...]]) -> str | None:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT d.defaclacl::text FROM pg_default_acl d JOIN pg_roles r "
+                "ON r.oid = d.defaclrole WHERE r.rolname = %s AND d.defaclnamespace = 0 "
+                "AND d.defaclobjtype = 'f'",
+                (runtime_role_name,),
+            )
+            row = cursor.fetchone()
+        return None if row is None else str(row[0])
+
+    with _connect(admin_settings) as admin:
+        migration_role = inspect_schema(admin, "unused").connected_role
+        # Production-equivalent state: grants correct, own function default back to PUBLIC.
+        with admin.transaction(), admin.cursor() as cursor:
+            cursor.execute(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE {runtime_role_name} "
+                "GRANT EXECUTE ON FUNCTIONS TO PUBLIC"
+            )
+        admin.commit()
+        assert own_function_default(admin) is None, "PUBLIC default must be the built-in one"
+        before = snapshot(admin)
+        problems = verify(admin, role=runtime_role_name, migration_role=migration_role)
+        assert problems == [
+            f"functions created by the runtime role {runtime_role_name} would default to "
+            "PUBLIC EXECUTE"
+        ]
+        apply_plan(
+            admin,
+            build_plan(
+                inspect_schema(admin, runtime_role_name),
+                role=runtime_role_name,
+                migration_role=migration_role,
+            ),
+        )
+        admin.commit()
+        assert verify(admin, role=runtime_role_name, migration_role=migration_role) == []
+        after_default = own_function_default(admin)
+        assert after_default is not None and "{=" not in after_default and ",=" not in after_default
+        assert snapshot(admin) == before
+
+
+def test_fresh_provision_hardens_own_function_default_and_it_holds_when_creating(
+    admin_settings: Settings,
+) -> None:
+    """V1-00A-PROD-R1 fresh provision: a brand-new runtime role gets its own function default
+    hardened. To prove the default is effective, the test grants CREATE in an ISOLATED schema
+    (never public), creates a function AS the role, and checks that neither PUBLIC nor an
+    unrelated role may execute it. Everything the test created is removed afterwards."""
+    role = "veotrex_api_fresh_test"
+    other = "veotrex_other_fresh_test"
+    schema = "zz_runtime_owned_test"
+    password = "fresh-test-only-" + uuid4().hex
+    with _connect(admin_settings) as admin:
+        migration_role = inspect_schema(admin, "unused").connected_role
+        with admin.transaction(), admin.cursor() as cursor:
+            cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            for name in (role, other):
+                cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,))
+                if cursor.fetchone():
+                    cursor.execute(f"DROP OWNED BY {name}")
+                    cursor.execute(f"DROP ROLE {name}")
+            cursor.execute(f"CREATE ROLE {other} NOLOGIN NOSUPERUSER NOBYPASSRLS")
+        admin.commit()
+        try:
+            plan = build_plan(
+                inspect_schema(admin, role),
+                role=role,
+                migration_role=migration_role,
+                password_verifier=scram_sha256_verifier(password),
+            )
+            apply_plan(admin, plan)
+            admin.commit()
+            assert verify(admin, role=role, migration_role=migration_role) == []
+            with admin.cursor() as cursor:
+                cursor.execute(
+                    "SELECT d.defaclacl::text FROM pg_default_acl d JOIN pg_roles r "
+                    "ON r.oid = d.defaclrole WHERE r.rolname = %s AND d.defaclnamespace = 0 "
+                    "AND d.defaclobjtype = 'f'",
+                    (role,),
+                )
+                acl = str((cursor.fetchone() or ("<none>",))[0])
+            assert acl != "<none>" and "{=" not in acl and ",=" not in acl
+            # Isolated schema with CREATE for the test only; public stays untouched.
+            with admin.transaction(), admin.cursor() as cursor:
+                cursor.execute(f"CREATE SCHEMA {schema}")
+                cursor.execute(f"GRANT USAGE, CREATE ON SCHEMA {schema} TO {role}")
+                cursor.execute(f"GRANT USAGE ON SCHEMA {schema} TO {other}")
+            admin.commit()
+            runtime_url = replace_credentials(
+                admin_settings.database_url.get_secret_value(), role, password
+            )
+            with psycopg.connect(psycopg_dsn(runtime_url)) as runtime:
+                with runtime.transaction(), runtime.cursor() as cursor:
+                    cursor.execute(
+                        f"CREATE FUNCTION {schema}.zz_created_by_runtime() RETURNS int "
+                        "LANGUAGE sql AS 'SELECT 7'"
+                    )
+                assert (
+                    _refused(
+                        runtime,
+                        "CREATE FUNCTION public.zz_never() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                    )
+                    == INSUFFICIENT_PRIVILEGE
+                )
+            created = f"{schema}.zz_created_by_runtime()"
+            with admin.cursor() as cursor:
+                cursor.execute("SELECT has_function_privilege('public', %s, 'EXECUTE')", (created,))
+                assert (cursor.fetchone() or (True,))[0] is False, "PUBLIC must not execute"
+                cursor.execute("SELECT has_function_privilege(%s, %s, 'EXECUTE')", (other, created))
+                assert (cursor.fetchone() or (True,))[0] is False, "unrelated role must not execute"
+                cursor.execute("SELECT has_function_privilege(%s, %s, 'EXECUTE')", (role, created))
+                assert (cursor.fetchone() or (False,))[0] is True, "the owner keeps EXECUTE"
+                cursor.execute("SELECT has_schema_privilege(%s, 'public', 'CREATE')", (role,))
+                assert (cursor.fetchone() or (True,))[0] is False
+        finally:
+            admin.rollback()
+            with admin.transaction(), admin.cursor() as cursor:
+                cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+                for name in (role, other):
+                    cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,))
+                    if cursor.fetchone():
+                        cursor.execute(f"DROP OWNED BY {name}")
+                        cursor.execute(f"DROP ROLE {name}")
+            admin.commit()
+
+
 def test_probe_from_the_runtime_role_passes_every_check(
     settings: Settings, admin_settings: Settings
 ) -> None:
@@ -502,7 +703,7 @@ def test_probe_from_the_runtime_role_passes_every_check(
         results = probe(connection, migration_role=migration_role)
     failed = [result for result in results if not result.passed]
     assert not failed, [(result.check, result.detail) for result in failed]
-    assert len(results) >= 19
+    assert len(results) >= 20
 
 
 async def test_engine_guard_accepts_runtime_and_refuses_admin(
