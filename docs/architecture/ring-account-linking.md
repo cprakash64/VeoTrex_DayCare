@@ -23,6 +23,22 @@ Ring OAuth and Amazon Vision are server-to-server only. The browser cannot suppl
 tenant ID and never receives credentials, signing keys, vault references, candidate records, or raw
 Ring errors. No device, webhook, media, camera-assignment, or streaming API is part of this stage.
 
+## Partner API request contract (V1-01A-2)
+
+Every JSON API request sends exactly the documented headers: `Authorization: Bearer <token>`
+(the raw token text, no quoting or masking), `Accept: application/json` and
+`Content-Type: application/json`, with a `VeoTrex-ControlPlane/<version>` product User-Agent.
+The reference's own GET examples send `Content-Type` too, so `GET /v1/users/me` does as well;
+it has no body and no query. Only `data.id` of the users document is retained; name, email and
+phone attributes are discarded. `POST /v1/accounts/me/app-integrations` sends
+`{"account_identifier", "nonce"}` and requires a JSON:API `app-integrations` resource with
+`attributes.status = "awaiting"`; `PATCH` sends `{"account_identifier", "status": "completed"}`
+and requires `attributes.status = "completed"`. The `account_identifier` is the obfuscated
+partner account the Ring user sees: the signed-in actor's display name masked to its first and
+last character (`C***y@veotrex`), or a masked actor id, never an email, subject or tenant id.
+A non-2xx provider response yields a `ring_provider_request_failed` log event carrying only the
+operation, category, HTTP status, the JSON:API error title or code and a gateway correlation id.
+
 ## Pre-tenant and tenant data
 
 `ring_pending_links` has no tenant column. It contains an opaque ID, stable Ring Account ID when

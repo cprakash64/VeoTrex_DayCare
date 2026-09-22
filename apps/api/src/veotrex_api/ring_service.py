@@ -57,6 +57,29 @@ class LinkContext:
     eligible: bool
 
 
+ACCOUNT_IDENTIFIER_MAX = 64
+
+
+def partner_account_identifier(principal: AuthenticatedPrincipal) -> str:
+    """The obfuscated partner account identifier Ring shows the user during linking.
+
+    The Partner API documents it as "an obfuscated identifier for the partner user account
+    (e.g., masked email) ... must be derived from the user's actual signed-in session". The
+    VeoTrex principal carries no email (the Auth0 access token has ``sub`` and ``org_id`` only),
+    so the identifier is the signed-in actor's display name masked to its first and last
+    character, or a masked actor id when no display name exists. Deterministic for one actor,
+    printable ASCII, bounded, and never a raw name, email, subject or tenant id.
+    """
+    name = (principal.display_name or "").strip()
+    printable = "".join(ch for ch in name if 33 <= ord(ch) <= 126)
+    if len(printable) >= 2:
+        masked = f"{printable[0]}***{printable[-1]}"
+    else:
+        digest = principal.actor_id.hex
+        masked = f"{digest[:2]}***{digest[-2:]}"
+    return f"{masked}@veotrex"[:ACCOUNT_IDENTIFIER_MAX]
+
+
 def _credential_context(owner_id: UUID, tenant_id: UUID | None = None) -> CredentialContext:
     return CredentialContext(
         provider="RING", owner_kind="ring_pending_link", owner_id=owner_id, tenant_id=tenant_id
@@ -173,7 +196,9 @@ class RingLinkService:
             raise RingLinkError("credential_unavailable") from exc
 
         try:
-            await self._client.confirm_app_integration(credential.material.access_token, nonce)
+            await self._client.confirm_app_integration(
+                credential.material.access_token, nonce, partner_account_identifier(principal)
+            )
         except RingAmbiguousResult as exc:
             await self._transition_pending(
                 candidate.id,
@@ -237,7 +262,9 @@ class RingLinkService:
             raise RingLinkError("connection_conflict") from exc
 
         try:
-            await self._client.complete_app_integration(credential.material.access_token)
+            await self._client.complete_app_integration(
+                credential.material.access_token, partner_account_identifier(principal)
+            )
         except RingClientError as exc:
             await self._record_connection_failure(principal.tenant_id, connection_id, exc.category)
             return ClaimResult(connection_id, ConnectionState.CONFIGURING)
@@ -270,7 +297,9 @@ class RingLinkService:
             raise RingLinkError("access_denied")
         access_token = await self.get_valid_access_token(principal.tenant_id, connection_id)
         try:
-            await self._client.complete_app_integration(access_token)
+            await self._client.complete_app_integration(
+                access_token, partner_account_identifier(principal)
+            )
         except RingClientError as exc:
             await self._record_connection_failure(principal.tenant_id, connection_id, exc.category)
             raise RingLinkError("completion_failed") from exc
