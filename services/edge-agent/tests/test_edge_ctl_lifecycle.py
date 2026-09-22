@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import stat
 import subprocess
 from pathlib import Path
@@ -149,7 +150,9 @@ class Host:
     def releases(self) -> Path:
         return self.prefix / "opt/veotrex-edge/releases"
 
-    def run(self, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *args: str, expect: int | tuple[int, ...] = 0
+    ) -> subprocess.CompletedProcess[str]:
         env = {
             **os.environ,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -165,7 +168,8 @@ class Host:
         result = subprocess.run(  # noqa: S603 - repository script under test
             [str(CTL), *args], env=env, capture_output=True, text=True, check=False
         )
-        assert result.returncode == expect, (args, result.stdout, result.stderr)
+        allowed = expect if isinstance(expect, tuple) else (expect,)
+        assert result.returncode in allowed, (args, result.stdout, result.stderr)
         return result
 
     def calls(self) -> list[str]:
@@ -201,6 +205,11 @@ def operator() -> str:
             ["/usr/bin/id", "-un"], capture_output=True, text=True, check=True
         ).stdout.strip()
     )
+
+
+# preflight reports host facts and returns 1 on a non-Jetson host (wrong architecture or no
+# /usr/bin/python3.12); the config/enabled lines under test are printed either way.
+PREFLIGHT_RC = (0,) if platform.machine() == "aarch64" else (0, 1)
 
 
 def sha256(path: Path) -> str:
@@ -384,17 +393,17 @@ def test_update_and_rollback_keep_boot_enablement_and_a_failed_b_never_destroys_
 
 
 def test_preflight_distinguishes_absent_visible_and_protected_config(host: Host) -> None:
-    out = host.run("preflight").stdout
+    out = host.run("preflight", expect=PREFLIGHT_RC).stdout
     assert "config: absent" in out
     host.run("install", "--operator", operator())
-    out = host.run("preflight").stdout
+    out = host.run("preflight", expect=PREFLIGHT_RC).stdout
     assert "config: -rw-r-----" in out and "edge.env" in out
     assert "NODE_ID" not in out
     if os.geteuid() == 0:  # pragma: no cover - root can always search
         return
     host.config.parent.chmod(0o000)
     try:
-        out = host.run("preflight").stdout
+        out = host.run("preflight", expect=PREFLIGHT_RC).stdout
         assert "config: protected (presence not observable as" in out
         assert "not installed" not in out
         status = host.run("status").stdout
@@ -404,7 +413,7 @@ def test_preflight_distinguishes_absent_visible_and_protected_config(host: Host)
 
 
 def test_preflight_enabled_line_is_a_single_state(host: Host) -> None:
-    out = host.run("preflight").stdout
+    out = host.run("preflight", expect=PREFLIGHT_RC).stdout
     lines = [line for line in out.splitlines() if line.startswith("veotrex-edge-ctl: enabled:")]
     assert lines == ["veotrex-edge-ctl: enabled: disabled"]
     assert "\nno\n" not in out and "\ninactive\n" not in out
