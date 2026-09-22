@@ -1,0 +1,95 @@
+# VeoTrex childcare edge agent - Jetson Orin Nano production unit (V1-00B).
+#
+# Installed to /etc/systemd/system/veotrex-edge.service by infra/jetson/veotrex-edge-ctl.sh.
+# The process it owns is the `veotrex-edge-agent` console script of a detached, non-editable
+# release under /opt/veotrex-edge/releases/<commit>, selected by the /opt/veotrex-edge/current
+# symlink. That agent is a foreground asyncio process; it spawns exactly one child, the
+# TensorRT GPU worker (/usr/bin/python3 -I ... worker.py), and stops it itself on SIGTERM.
+#
+# Configuration comes from two EnvironmentFiles and nothing else: the release's provenance
+# (release.env, written at build time) and the operator's non-secret settings (edge.env).
+# No secret exists for the edge agent today; when one does, it is delivered with
+# LoadCredential= (root-owned 0600 file exposed under $CREDENTIALS_DIRECTORY), never with
+# Environment= in this file.
+
+[Unit]
+Description=VeoTrex childcare edge agent (Jetson)
+Documentation=https://github.com/cprakash64/VeoTrex_DayCare/blob/main/infra/jetson/README.md
+# Offline-capable: the agent opens no network connection at startup, so it must not gate on
+# network-online.target. A daycare LAN without Internet still gets a running edge agent.
+After=local-fs.target network.target
+# Crash-loop bound: at most 5 start attempts in 10 minutes; then the unit stays failed
+# (Result=start-limit-hit) until `systemctl reset-failed veotrex-edge` or the window passes.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=veotrex-edge
+Group=veotrex-edge
+# Measured on the Orin Nano Super (L4T 39.2): the worker opens /dev/nvmap and
+# /dev/nvgpu/igpu0/ctrl (group video) and /dev/dri/renderD128 (group render). Nothing else.
+SupplementaryGroups=video render
+UMask=0077
+WorkingDirectory=/var/lib/veotrex-edge
+StateDirectory=veotrex-edge
+StateDirectoryMode=0750
+EnvironmentFile=/opt/veotrex-edge/current/release.env
+EnvironmentFile=/etc/veotrex-edge/edge.env
+ExecStart=/opt/veotrex-edge/current/venv/bin/veotrex-edge-agent
+
+# Restart on a real failure (crash, signal, watchdog, timeout) after a pause; never on a
+# clean exit, and never on EX_CONFIG (78): the agent exits 78 when its configuration is
+# invalid or missing, which a restart cannot fix.
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=78
+TimeoutStartSec=90s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+# SIGTERM goes to the agent alone; it shuts its own worker down (SHUTDOWN, then SIGTERM, then
+# SIGKILL, 2 s each). Whatever is still alive at TimeoutStopSec gets SIGKILL from the cgroup,
+# so a stuck worker can never outlive the unit.
+KillMode=mixed
+# Liveness: the agent pings WATCHDOG=1 from its event loop every 30 s. Silence for 60 s means
+# the loop is wedged; systemd aborts the process and Restart= applies.
+WatchdogSec=60s
+# Leak guards, not capacity claims. The agent plus worker measure ~0.4 GiB RSS at rest.
+MemoryMax=3G
+TasksMax=128
+
+# --- hardening (each directive validated against the real agent and GPU worker) -----------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RemoveIPC=yes
+# ProcSubset=pid, ProtectProc=invisible and this syscall filter were each validated against
+# the real GPU worker's CUDA/TensorRT probe on the Orin Nano Super (device count 1, READY).
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Deliberately NOT enabled (see README "Hardening exceptions"):
+#   PrivateDevices=        would hide /dev/nvmap and /dev/nvgpu: no GPU.
+#   DevicePolicy=closed    device-cgroup filtering cannot be validated without root on the
+#                          bench used for V1-00B; tighten in a follow-up once proven on-host.
+#   MemoryDenyWriteExecute CUDA/TensorRT map W+X pages.
+
+[Install]
+WantedBy=multi-user.target
