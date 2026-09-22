@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import httpx
+import structlog
 from pydantic import SecretStr
 from socksio.exceptions import SOCKSError
 
@@ -26,13 +27,38 @@ from veotrex_api.secrets import SecretResolver
 # otherwise escape this client's error contract. socksio is a declared dependency (httpx[socks]).
 _TRANSPORT_FAILURES = (httpx.TimeoutException, httpx.TransportError, SOCKSError)
 
+# The documented Partner API request contract (developer.amazon.com/docs/ring, re-read
+# 2026-09-22): every JSON API example - curl, JavaScript and Python, GET included - sends
+# ``Authorization: Bearer <token>`` and ``Content-Type: application/json``; the reference states
+# "Content Types - JSON APIs: application/json". These are the only media types this client
+# ever declares. Media (SDP, MP4, JPEG) endpoints are not used.
+JSON_MEDIA_TYPE = "application/json"
+# A product token per RFC 9110 rather than the HTTP library's default. Bounded ASCII.
+USER_AGENT_PRODUCT = "VeoTrex-ControlPlane"
+# Safe diagnostics captured from a provider failure: a JSON:API error title/code (short,
+# printable ASCII) and a correlation header if the gateway supplies one. Never the body.
+_ERROR_TITLE_MAX = 80
+_REQUEST_ID_MAX = 128
+_REQUEST_ID_HEADERS = ("x-request-id", "x-amzn-requestid", "x-amz-request-id")
+
 
 class RingClientError(Exception):
-    def __init__(self, operation: str, category: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        operation: str,
+        category: str,
+        status_code: int | None = None,
+        *,
+        error_title: str | None = None,
+        provider_request_id: str | None = None,
+    ) -> None:
         super().__init__(f"Ring operation failed: {operation}/{category}")
         self.operation = operation
         self.category = category
         self.status_code = status_code
+        # Safe, bounded provider diagnostics (see ``safe_error_summary``); never a secret.
+        self.error_title = error_title
+        self.provider_request_id = provider_request_id
 
 
 class RingAmbiguousResult(RingClientError):
@@ -45,6 +71,45 @@ class RingTokenSet:
     refresh_token: SecretStr
     expires_in: int
     scopes: tuple[str, ...]
+
+
+def user_agent(app_version: str) -> str:
+    """``VeoTrex-ControlPlane/<version>``: printable ASCII, bounded, no host or secret."""
+    version = "".join(
+        ch for ch in app_version if 33 <= ord(ch) <= 126 and ch not in '()<>@,;:\\"/[]?={}'
+    )
+    return f"{USER_AGENT_PRODUCT}/{version[:32] or 'unknown'}"
+
+
+def safe_error_summary(response: httpx.Response) -> tuple[str | None, str | None]:
+    """The only two things ever kept from a failed provider response.
+
+    ``title``: ``errors[0].title`` (or ``code``) of a JSON:API error document, restricted to
+    printable ASCII and bounded; anything else, including a body that is not an error document,
+    yields None. ``request_id``: the first correlation header Ring's gateway supplies, bounded.
+    Tokens, nonces, account ids and profile attributes never appear in either field.
+    """
+    title: str | None = None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        errors = payload.get("errors")
+        first = errors[0] if isinstance(errors, list) and errors else None
+        if isinstance(first, dict):
+            for key in ("title", "code"):
+                value = first.get(key)
+                if isinstance(value, str) and value.strip():
+                    title = "".join(ch for ch in value if 32 <= ord(ch) <= 126)[:_ERROR_TITLE_MAX]
+                    break
+    request_id: str | None = None
+    for header in _REQUEST_ID_HEADERS:
+        value = response.headers.get(header)
+        if value:
+            request_id = "".join(ch for ch in value if 33 <= ord(ch) <= 126)[:_REQUEST_ID_MAX]
+            break
+    return title or None, request_id or None
 
 
 class RingClient:
@@ -72,7 +137,10 @@ class RingClient:
             pool=settings.ring_connect_timeout_seconds,
         )
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
-        self._http = http_client or httpx.AsyncClient(timeout=timeout, limits=limits)
+        self._default_headers = {"User-Agent": user_agent(settings.app_version)}
+        self._http = http_client or httpx.AsyncClient(
+            timeout=timeout, limits=limits, headers=self._default_headers
+        )
         # Requests to the configured Ring API origin may leave through a separate client so an
         # optional egress proxy applies to them and to nothing else - Ring OAuth token exchange
         # keeps using ``self._http`` and stays direct. With no proxy configured the two names
@@ -85,7 +153,10 @@ class RingClient:
             self._api_http = api_http_client
         elif http_client is None and settings.ring_api_proxy_url:
             self._api_http = httpx.AsyncClient(
-                timeout=timeout, limits=limits, proxy=settings.ring_api_proxy_url
+                timeout=timeout,
+                limits=limits,
+                proxy=settings.ring_api_proxy_url,
+                headers=self._default_headers,
             )
             self._owns_api_client = True
 
@@ -130,17 +201,47 @@ class RingClient:
             error_type = RingAmbiguousResult if ambiguous_on_transport_failure else RingClientError
             raise error_type(operation, "transport_failure") from exc
         if len(response.content) > self._settings.ring_max_response_bytes:
-            raise RingClientError(operation, "response_too_large", response.status_code)
+            raise self._failure(operation, "response_too_large", response)
         if response.status_code == 429:
-            raise RingClientError(operation, "rate_limited", 429)
+            raise self._failure(operation, "rate_limited", response)
         if 400 <= response.status_code < 500:
-            raise RingClientError(operation, "provider_rejected", response.status_code)
+            raise self._failure(operation, "provider_rejected", response)
         if response.status_code >= 500:
             error_type = RingAmbiguousResult if ambiguous_on_transport_failure else RingClientError
-            raise error_type(operation, "provider_unavailable", response.status_code)
+            raise self._failure(operation, "provider_unavailable", response, error_type)
         if response.status_code != 200:
-            raise RingClientError(operation, "unexpected_status", response.status_code)
+            raise self._failure(operation, "unexpected_status", response)
         return response
+
+    @staticmethod
+    def _failure(
+        operation: str,
+        category: str,
+        response: httpx.Response,
+        error_type: type[RingClientError] = RingClientError,
+    ) -> RingClientError:
+        """Build the error for a non-2xx provider response and log its safe summary.
+
+        The log event carries the operation, category, HTTP status, the JSON:API error title or
+        code when Ring supplies one, and a gateway correlation id. It never carries the request
+        or response headers, the body, a token, a nonce, an account id or any profile field.
+        """
+        title, request_id = safe_error_summary(response)
+        structlog.get_logger().warning(
+            "ring_provider_request_failed",
+            operation=operation,
+            category=category,
+            status_code=response.status_code,
+            error_title=title,
+            provider_request_id=request_id,
+        )
+        return error_type(
+            operation,
+            category,
+            response.status_code,
+            error_title=title,
+            provider_request_id=request_id,
+        )
 
     @staticmethod
     def _json_object(response: httpx.Response, operation: str) -> dict[str, Any]:
@@ -220,7 +321,17 @@ class RingClient:
 
     @staticmethod
     def _bearer(access_token: SecretStr) -> dict[str, str]:
-        return {"Authorization": f"Bearer {access_token.get_secret_value()}"}
+        """Exactly the documented JSON API request headers, for GET and for JSON bodies alike.
+
+        The Authorization value is the raw token text after ``Bearer `` - no quoting, escaping,
+        masking or whitespace. Accept and Content-Type are the reference's single JSON media
+        type; the reference's own GET examples send Content-Type as well.
+        """
+        return {
+            "Authorization": f"Bearer {access_token.get_secret_value()}",
+            "Accept": JSON_MEDIA_TYPE,
+            "Content-Type": JSON_MEDIA_TYPE,
+        }
 
     async def get_account_id(self, access_token: SecretStr) -> str:
         operation = "users_me"
@@ -280,21 +391,21 @@ class RingClient:
                     raise RingClientError(operation, "transport_failure") from exc
             else:
                 if len(response.content) > self._settings.ring_max_response_bytes:
-                    raise RingClientError(operation, "response_too_large", response.status_code)
+                    raise self._failure(operation, "response_too_large", response)
                 if response.status_code == 200:
                     return self._json_object(response, operation)
                 if response.status_code in {401, 403, 404}:
                     category = {401: "unauthorized", 403: "forbidden", 404: "not_found"}[
                         response.status_code
                     ]
-                    raise RingClientError(operation, category, response.status_code)
+                    raise self._failure(operation, category, response)
                 if response.status_code != 429 and response.status_code < 500:
-                    raise RingClientError(operation, "provider_rejected", response.status_code)
+                    raise self._failure(operation, "provider_rejected", response)
                 if attempt + 1 == attempts:
                     category = (
                         "rate_limited" if response.status_code == 429 else "provider_unavailable"
                     )
-                    raise RingClientError(operation, category, response.status_code)
+                    raise self._failure(operation, category, response)
             delay = min(
                 self._settings.ring_inventory_backoff_max_seconds,
                 (2**attempt) + self._random(),
@@ -412,27 +523,41 @@ class RingClient:
             )
         return tuple(enriched_devices)
 
-    async def confirm_app_integration(self, access_token: SecretStr, nonce: str) -> None:
+    async def confirm_app_integration(
+        self, access_token: SecretStr, nonce: str, account_identifier: str | None = None
+    ) -> None:
+        """POST /v1/accounts/me/app-integrations: ``nonce`` (required) plus the optional
+        obfuscated partner account identifier Ring shows the user. Expects ``awaiting``."""
         operation = "app_integration_post"
+        body: dict[str, str] = {"nonce": nonce}
+        if account_identifier:
+            body = {"account_identifier": account_identifier, "nonce": nonce}
         response = await self._request(
             operation,
             "POST",
             f"{self._settings.ring_api_base_url.rstrip('/')}/v1/accounts/me/app-integrations",
             ambiguous_on_transport_failure=True,
             headers=self._bearer(access_token),
-            json_body={"nonce": nonce},
+            json_body=body,
         )
         self._require_integration_status(response, operation, "awaiting")
 
-    async def complete_app_integration(self, access_token: SecretStr) -> None:
+    async def complete_app_integration(
+        self, access_token: SecretStr, account_identifier: str | None = None
+    ) -> None:
+        """PATCH /v1/accounts/me/app-integrations with ``status: completed`` (mandatory after
+        POST) and the same obfuscated identifier. Expects ``completed``."""
         operation = "app_integration_patch"
+        body: dict[str, str] = {"status": "completed"}
+        if account_identifier:
+            body = {"account_identifier": account_identifier, "status": "completed"}
         response = await self._request(
             operation,
             "PATCH",
             f"{self._settings.ring_api_base_url.rstrip('/')}/v1/accounts/me/app-integrations",
             ambiguous_on_transport_failure=True,
             headers=self._bearer(access_token),
-            json_body={"status": "completed"},
+            json_body=body,
         )
         self._require_integration_status(response, operation, "completed")
 

@@ -20,6 +20,7 @@ class FakeRingClient:
         self.refresh_calls = 0
         self.confirm_calls = 0
         self.complete_calls = 0
+        self.account_identifiers: list[str | None] = []
         self.users_error: RingClientError | None = None
         self.confirm_error: RingClientError | None = None
         self.complete_error: RingClientError | None = None
@@ -43,13 +44,19 @@ class FakeRingClient:
             raise self.users_error
         return self.account_id
 
-    async def confirm_app_integration(self, access_token: SecretStr, nonce: str) -> None:
+    async def confirm_app_integration(
+        self, access_token: SecretStr, nonce: str, account_identifier: str | None = None
+    ) -> None:
         self.confirm_calls += 1
+        self.account_identifiers.append(account_identifier)
         if self.confirm_error:
             raise self.confirm_error
 
-    async def complete_app_integration(self, access_token: SecretStr) -> None:
+    async def complete_app_integration(
+        self, access_token: SecretStr, account_identifier: str | None = None
+    ) -> None:
         self.complete_calls += 1
+        self.account_identifiers.append(account_identifier)
         if self.complete_error:
             raise self.complete_error
 

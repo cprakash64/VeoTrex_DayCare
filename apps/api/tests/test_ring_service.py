@@ -91,6 +91,9 @@ async def test_successful_claim_is_atomic_audited_and_replay_safe(
         )
         assert result.state is ConnectionState.ACTIVE
         assert client.confirm_calls == client.complete_calls == 1
+        # V1-01A-2: both App Integrations calls carry the masked partner identifier derived from
+        # the signed-in principal ("Owner" -> "O***r@veotrex"), never a raw name or subject.
+        assert client.account_identifiers == ["O***r@veotrex", "O***r@veotrex"]
         with pytest.raises(RingLinkError, match="invalid_or_expired_link"):
             await subject.claim(principal, timestamp_ms=timestamp, nonce=nonce, request_id="replay")
 
