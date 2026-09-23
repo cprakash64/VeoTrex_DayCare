@@ -10,6 +10,13 @@ Contents: one tenant; only profiles that are ACTIVE and READY; only ACTIVE templ
 model identity and version match the requested backend; opaque ids and display names;
 deterministic ordering; a ``revision`` derived from every included row so a consumer can
 detect change without polling row by row; bounded size. No enrollment image bytes.
+
+V1-02B0 hardened how the package leaves the process, because from this stage on the templates
+in it are real adult biometrics rather than a fake backend's hashes. The package is written to
+a file the tool creates itself, exclusively, following no symlink, at mode 0600; it refuses a
+path that already exists, a character device and a symlink, so ``--output /dev/stdout`` or
+``--output ~/notes.json`` cannot spill template material into a terminal, a shell history, a
+pipeline or a file someone else can read. Only counts and a truncated revision are printed.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import hashlib
 import json
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -113,6 +121,42 @@ async def build_recognition_package(
     }
 
 
+class PackageOutputRefused(Exception):
+    """The requested destination cannot hold biometric material safely."""
+
+
+def write_package(package: dict[str, Any], output: Path) -> None:
+    """Write the package to a file this process creates, or refuse.
+
+    ``O_CREAT | O_EXCL`` means the file did not exist a moment ago and this process made it, so
+    there is no pre-existing mode, owner or symlink to inherit and no ``/dev/stdout`` to write
+    through: every one of those fails here rather than after the templates have been written.
+    ``O_NOFOLLOW`` closes the same hole on the final path component for platforms where a
+    symlink could otherwise be created between the check and the open.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(output, flags, 0o600)
+    except FileExistsError:
+        raise PackageOutputRefused(
+            "the output path already exists; choose a new path rather than overwriting one"
+        ) from None
+    except OSError as exc:
+        raise PackageOutputRefused(f"the output path cannot be created: {exc.strerror}") from None
+    try:
+        # The descriptor is a regular file this process just created; chmod is belt-and-braces
+        # against a umask that somehow widened the creation mode.
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(package, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        # A partial file holding real templates must not survive a failed write.
+        output.unlink(missing_ok=True)
+        raise
+
+
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(
         prog="veotrex-staff-recognition-package",
@@ -122,7 +166,14 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     command.add_argument("--tenant-id", required=True, type=UUID)
-    command.add_argument("--output", required=True, help="path of the JSON package to write")
+    command.add_argument(
+        "--output",
+        required=True,
+        help=(
+            "path of the JSON package to write. Must not already exist; it is created 0600. "
+            "Writing to a terminal, a pipe or /dev/stdout is refused."
+        ),
+    )
     command.add_argument("--model-id", required=True)
     command.add_argument("--model-version", required=True)
     command.add_argument("--template-version", required=True, type=int)
@@ -144,9 +195,7 @@ async def run(arguments: argparse.Namespace) -> int:
         )
     finally:
         await engine.dispose()
-    descriptor = os.open(arguments.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w") as handle:
-        json.dump(package, handle, separators=(",", ":"), sort_keys=True)
+    write_package(package, Path(arguments.output))
     print(
         f"wrote {arguments.output}: staff={len(package['staff'])} "
         f"revision={package['revision'][:16]}"
@@ -155,4 +204,7 @@ async def run(arguments: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    raise SystemExit(asyncio.run(run(parser().parse_args())))
+    try:
+        raise SystemExit(asyncio.run(run(parser().parse_args())))
+    except PackageOutputRefused as exc:
+        raise SystemExit(f"refused: {exc}") from None

@@ -34,7 +34,11 @@ from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
     VaultKeyProvider,
 )
-from veotrex_api.face_backend import FaceEnrollmentBackend, backend_for
+from veotrex_api.face_backend import (
+    FaceEnrollmentBackend,
+    backend_for,
+    supports_recognition,
+)
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.request_media import (
@@ -50,8 +54,13 @@ from veotrex_api.ring_inventory_service import RingInventoryError, RingInventory
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
 from veotrex_api.secrets import DefaultSecretResolver, SecretResolver
-from veotrex_api.staff_api import is_enrollment_upload, register_staff_routes
+from veotrex_api.staff_api import (
+    is_enrollment_upload,
+    register_recognition_test_route,
+    register_staff_routes,
+)
 from veotrex_api.staff_media import ALLOWED_MEDIA_TYPES, StaffMediaStore
+from veotrex_api.staff_recognition import StaffRecognitionService
 from veotrex_api.staff_service import StaffEnrollmentService
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
@@ -178,6 +187,21 @@ def _default_vault(
     return EncryptedCredentialVault(session_factory, key_provider)
 
 
+def _face_backend_for(settings: Settings) -> FaceEnrollmentBackend:
+    """Select the configured face backend.
+
+    ``opencv_eval`` produces real adult biometric templates, so it is built through
+    ``face_opencv.build``, which refuses a forbidden environment itself. That import is local
+    to this branch: the control-plane image installs no OpenCV, and the module must not even
+    be imported where the backend can never be selected.
+    """
+    if settings.staff_face_backend == "opencv_eval":
+        from veotrex_api.face_opencv import build
+
+        return build(settings)
+    return backend_for(settings.staff_face_backend)
+
+
 def create_app(
     settings: Settings | None = None,
     engine: AsyncEngine | None = None,
@@ -216,12 +240,25 @@ def create_app(
         inventory_service,
     )
     resolved_media = staff_media or StaffMediaStore(Path(resolved_settings.staff_media_dir))
+    resolved_face_backend = face_backend or _face_backend_for(resolved_settings)
     staff_service = StaffEnrollmentService(
         resolved_factory,
         resolved_media,
-        face_backend or backend_for(resolved_settings.staff_face_backend),
+        resolved_face_backend,
         max_image_bytes=resolved_settings.staff_enrollment_image_bytes,
     )
+    # EVALUATION ONLY (V1-02B0). Built only where settings permit it, and only when the backend
+    # in use can actually recognise; staging and production reach neither condition, so no
+    # recognition service exists there and no route is registered for one.
+    recognition_service: StaffRecognitionService | None = None
+    if resolved_settings.face_evaluation_permitted and supports_recognition(resolved_face_backend):
+        recognition_service = StaffRecognitionService(
+            resolved_factory,
+            resolved_face_backend,
+            max_image_bytes=resolved_settings.staff_enrollment_image_bytes,
+            threshold=resolved_settings.staff_recognition_threshold,
+            margin=resolved_settings.staff_recognition_margin,
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -247,6 +284,19 @@ def create_app(
         except OSError:
             logger.error("staff_media_dir_unavailable")
             raise
+        # A backend with weights to verify loads them here, so a bad digest, a missing file or
+        # an environment that must not have real recognition stops the process at startup
+        # rather than at the first upload.
+        preparing = getattr(resolved_face_backend, "ensure_ready", None)
+        if callable(preparing):
+            try:
+                preparing()
+            except Exception:
+                logger.error(
+                    "face_backend_unavailable",
+                    backend=resolved_settings.staff_face_backend,
+                )
+                raise
         logger.info(
             "service_started",
             service=resolved_settings.service_name,
@@ -271,6 +321,7 @@ def create_app(
         window_seconds=60,
     )
     app.state.staff_service = staff_service
+    app.state.staff_recognition_service = recognition_service
     register_staff_routes(
         app,
         staff_service,
@@ -279,6 +330,15 @@ def create_app(
             window_seconds=60,
         ),
     )
+    if recognition_service is not None:
+        register_recognition_test_route(
+            app,
+            recognition_service,
+            AuthenticationFailureLogLimiter(
+                limit=resolved_settings.staff_enrollment_upload_rate_limit_per_minute,
+                window_seconds=60,
+            ),
+        )
 
     @app.middleware("http")
     async def request_context(

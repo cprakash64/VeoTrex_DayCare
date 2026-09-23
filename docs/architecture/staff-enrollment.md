@@ -73,9 +73,48 @@ Only ACTIVE + READY profiles, only ACTIVE templates for the named model, ordered
 changes, so a consumer compares one string instead of polling rows. Deactivation, photo
 removal below the minimum and deletion all remove a teacher from the next package.
 
+The package is written to a file the tool creates itself, exclusively, following no symlink,
+at mode 0600, and it refuses a path that already exists. `--output /dev/stdout` therefore fails
+rather than printing real templates to a terminal or a shell history (V1-02B0); only counts and
+a truncated revision are printed.
+
 ## Face backend
 
-`VEOTREX_STAFF_FACE_BACKEND=unavailable` (production default) refuses uploads with
-`face_backend_unavailable`; `fake` is deterministic and allowed only in test/local
-environments. Real template generation is NOT READY until a licence-reviewed model is adopted
-(ADR 0019).
+| `VEOTREX_STAFF_FACE_BACKEND` | Where it may run | What it produces |
+|---|---|---|
+| `unavailable` | anywhere; the production default | nothing — every upload is refused with `face_backend_unavailable`, and it cannot recognise at all |
+| `fake` | local, development, test, ci | deterministic hash vectors. Not a biometric |
+| `opencv_eval` | local, development, test, ci | **real adult biometric templates** — YuNet 2023mar + SFace 2021dec |
+
+`opencv_eval` (V1-02B0, ADR 0020) is LOCAL_EVALUATION_ONLY: SFace's commercial weight
+provenance is unresolved upstream, and face templates are not yet encrypted at rest. It is
+refused outside the permitted environments three times over — by `Settings`, by the backend's
+own constructor, and by `ensure_ready` refusing an evaluation-only weight — each asserted by
+`apps/api/tests/test_face_environment_gate.py`. Weights are installed by the operator with
+`infra/local/fetch-face-eval-models.sh` and verified by SHA-256 against the in-code registry
+before loading; the application never downloads a model. OpenCV is a dependency group, so the
+control-plane image does not contain it.
+
+Templates are 128 × float32, L2-normalised, under the composite model identity
+`yunet+sface` / `2023mar+2021dec`. Production remains `unavailable`; encryption at rest is a
+precondition for changing that, not a later improvement.
+
+## Local recognition test (V1-02B0, evaluation only)
+
+`POST /v1/staff/recognition-test` takes a raw JPEG or PNG body and answers MATCH or UNKNOWN.
+It is registered only where the environment permits evaluation *and* the running backend can
+recognise, so in staging and production the route does not exist. It requires `manage:staff`,
+is bounded by the same body and media-type middleware as an enrollment upload, persists
+nothing, and returns a decision, a bounded score, the model identity, the thresholds and
+`evaluation_only: true` — never an embedding, and never the identity of a candidate it declined
+to name.
+
+Candidates are ACTIVE profiles with READY enrollment and ACTIVE templates matching the running
+model, selected in SQL under the caller's RLS context. A teacher's score is the mean of their
+two best template similarities; naming anyone requires clearing an absolute threshold (0.45)
+*and* a best-versus-second-best margin across distinct staff (0.06). Both are evaluation
+values, not production-calibrated, and the dashboard says so wherever it shows one. The
+dashboard panel is gated again, server-side, by `VEOTREX_FACE_EVALUATION_UI=1`.
+
+See `docs/qualification/v1-02b0-face-model-licence-audit.md` for the licence evidence, the
+measured Jetson figures and the operator test procedure.

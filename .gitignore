@@ -33,6 +33,11 @@ reports/qualification/
 recordings/
 temporary-clips/
 artifacts/models/candidates/
+# Audited face-recognition weights (V1-02B0). Fetched by the operator with
+# infra/local/fetch-face-eval-models.sh, which verifies the SHA-256 recorded in
+# veotrex_api.face_models; never committed - SFace alone is 37 MiB and its commercial
+# weight provenance is unresolved upstream.
+artifacts/models/face/
 artifacts/validation/
 dist/
 *.egg-info/

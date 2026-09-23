@@ -3,15 +3,19 @@ import { redirect } from "next/navigation";
 
 import { auth0 } from "../../../lib/auth0";
 import { protectedRouteRedirect } from "../../../lib/session-policy";
-import { staffPresentation } from "../../../lib/staff";
+import { faceEvaluationEnabled, staffPresentation } from "../../../lib/staff";
 import { getApplicationIdentity, getStaff } from "../../../lib/veotrex-api";
 import { CreateTeacherForm } from "./create-teacher-form";
+import { RecognitionTestPanel } from "./recognition-test-panel";
 
 export default async function StaffPage() {
   const destination = protectedRouteRedirect(await auth0.getSession());
   if (destination) redirect(destination);
   const [identity, staff] = await Promise.all([getApplicationIdentity(), getStaff()]);
   const canManage = identity.permissions.includes("manage:staff");
+  // Evaluation builds only (V1-02B0). Read on the server so the panel is absent from the
+  // rendered page in staging and production rather than merely hidden in the browser.
+  const evaluating = faceEvaluationEnabled(process.env);
 
   return (
     <main>
@@ -28,6 +32,7 @@ export default async function StaffPage() {
         camera footage; it requires an authorized operator to add photos here.
       </p>
       {canManage ? <CreateTeacherForm /> : null}
+      {canManage && evaluating ? <RecognitionTestPanel /> : null}
       {staff.length === 0 ? (
         <section>
           <h2>No teachers enrolled</h2>

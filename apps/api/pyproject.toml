@@ -37,3 +37,18 @@ veotrex-staff-recognition-package = "veotrex_api.staff_package:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/veotrex_api"]
+
+# Local face-recognition qualification only (V1-02B0). Deliberately a dependency GROUP and not
+# a project dependency: the control-plane image builds with `uv sync --no-dev`, which installs
+# no groups, so OpenCV never reaches staging or production - where the opencv_eval backend is
+# refused anyway. CI installs it with --all-groups so the evaluation code is linted, typed and
+# import-tested, but CI never needs a model weight.
+[dependency-groups]
+face-eval = [
+  # numpy is imported directly by veotrex_api.face_opencv, so it is declared rather than
+  # relied on as an OpenCV transitive. Same pin as the edge agent, one resolution for both.
+  "numpy==2.4.6",
+  # Headless: the control plane has no display stack and must not pull GTK/Qt/FFmpeg.
+  # 4.x keeps the FaceDetectorYN / FaceRecognizerSF API the audited zoo weights pair with.
+  "opencv-python-headless==4.14.0.94",
+]

@@ -4,6 +4,11 @@ Routes follow the existing conventions: bearer principal, permission dependency,
 the identity mapping only, unknown and other-tenant identifiers both answer 404, bounded
 generic error bodies. Templates have no route. Image bytes are served only as the canonical
 JPEG to a principal of the owning tenant.
+
+V1-02B0 adds one evaluation-only route, ``POST /v1/staff/recognition-test``. It is registered
+by ``register_recognition_test_route`` and ``main`` calls that only when settings permit it, so
+in staging and production the path does not exist at all rather than existing and refusing -
+there is nothing to misconfigure into life. It persists nothing and returns no embedding.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from veotrex_api.access import (
 )
 from veotrex_api.authorization import Permission
 from veotrex_api.staff_media import ALLOWED_MEDIA_TYPES, EnrollmentImageRejected
+from veotrex_api.staff_recognition import StaffRecognitionService
 from veotrex_api.staff_service import (
     EnrollmentImageSummary,
     StaffEnrollmentService,
@@ -33,13 +39,22 @@ require_read_operational = require_permission(Permission.READ_OPERATIONAL)
 
 UPLOAD_PATH_PREFIX = "/v1/staff/"
 UPLOAD_PATH_SUFFIX = "/enrollment-images"
+RECOGNITION_TEST_PATH = "/v1/staff/recognition-test"
 
 
 def is_enrollment_upload(method: str, path: str) -> bool:
-    """The one route that carries an image body, matched exactly for the body-limit guard."""
-    if method != "POST" or not path.startswith(UPLOAD_PATH_PREFIX):
+    """A route that carries a raw image body, matched exactly for the body-limit guard.
+
+    The recognition-test route is included: its body is an image of exactly the same shape and
+    must be bounded and media-type checked by the same middleware, before any of it is read.
+    When the route is not registered the guard still matches, and the request then 404s having
+    been bounded - which is the safe order.
+    """
+    if method != "POST":
         return False
-    if not path.endswith(UPLOAD_PATH_SUFFIX):
+    if path == RECOGNITION_TEST_PATH:
+        return True
+    if not path.startswith(UPLOAD_PATH_PREFIX) or not path.endswith(UPLOAD_PATH_SUFFIX):
         return False
     middle = path[len(UPLOAD_PATH_PREFIX) : -len(UPLOAD_PATH_SUFFIX)]
     try:
@@ -70,6 +85,25 @@ class StaffResponse(BaseModel):
     recognition_ready: bool
     created_at: str
     updated_at: str
+
+
+class RecognitionTestResponse(BaseModel):
+    """Evaluation output. ``staff_id`` and ``display_name`` are present only on a MATCH, so an
+    UNKNOWN answer cannot leak the closest candidate's identity; ``score`` is a bounded
+    similarity, never an embedding."""
+
+    decision: str
+    staff_id: str | None = None
+    display_name: str | None = None
+    score: float
+    runner_up_score: float | None = None
+    reason: str | None = None
+    candidates: int
+    model_id: str
+    model_version: str
+    threshold: float
+    margin: float
+    evaluation_only: bool = True
 
 
 class EnrollmentImageResponse(BaseModel):
@@ -297,3 +331,57 @@ def register_staff_routes(
             )
         except StaffError as exc:
             raise _http(exc) from None
+
+
+def register_recognition_test_route(
+    app: FastAPI,
+    service: StaffRecognitionService,
+    upload_limiter: AuthenticationFailureLogLimiter,
+) -> None:
+    """Register the local recognition-test route. EVALUATION ONLY.
+
+    ``main`` calls this only when ``Settings.recognition_test_enabled`` is true, which requires
+    both a permitted environment and a backend that can recognise. Declared before the
+    ``/v1/staff/{staff_id}`` routes would match it is unnecessary - "recognition-test" is not a
+    UUID, so the typed path parameter rejects it - but the literal path is registered here in
+    full rather than nested under a staff id, because the query is about the tenant's whole
+    roster and belongs to no single profile.
+    """
+
+    @app.post(RECOGNITION_TEST_PATH, response_model=RecognitionTestResponse)
+    async def recognition_test(
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_manage_staff)],
+    ) -> RecognitionTestResponse:
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type not in ALLOWED_MEDIA_TYPES:
+            raise HTTPException(status_code=415, detail="image/jpeg or image/png required")
+        if not upload_limiter.allow():
+            raise HTTPException(status_code=429, detail="upload limit exceeded")
+        data = await request.body()
+        try:
+            result = await service.recognize_image(context.principal, data)
+        except EnrollmentImageRejected as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "recognition image rejected", "category": exc.category},
+            ) from None
+        except StaffError as exc:
+            raise _http(exc) from None
+        finally:
+            # The request body is not referenced past this point. Dropping the local name is
+            # the only disposal Python can offer; the bytes are never written anywhere.
+            del data
+        return RecognitionTestResponse(
+            decision=result.decision,
+            staff_id=None if result.staff_id is None else str(result.staff_id),
+            display_name=result.display_name,
+            score=result.score,
+            runner_up_score=result.runner_up_score,
+            reason=result.reason,
+            candidates=result.candidates,
+            model_id=result.model_id,
+            model_version=result.model_version,
+            threshold=result.threshold,
+            margin=result.margin,
+        )
