@@ -25,3 +25,10 @@ packages = ["src/veotrex_edge_agent"]
 qualification = [
     "pillow==12.3.0",
 ]
+# Recorded-video person tracking (V1-02B1A). A dependency GROUP, not a project dependency:
+# the edge runtime that ships to the Jetson has no need to decode recorded files, and the
+# control-plane image must never acquire OpenCV. Same pin as the API's face-eval group, so the
+# workspace resolves one OpenCV for both. Headless: the edge has no display stack.
+recorded-video = [
+    "opencv-python-headless==4.14.0.94",
+]

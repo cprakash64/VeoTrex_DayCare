@@ -1051,6 +1051,9 @@ dependencies = [
 qualification = [
     { name = "pillow" },
 ]
+recorded-video = [
+    { name = "opencv-python-headless" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1062,6 +1065,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 qualification = [{ name = "pillow", specifier = "==12.3.0" }]
+recorded-video = [{ name = "opencv-python-headless", specifier = "==4.14.0.94" }]
 
 [[package]]
 name = "watchfiles"
