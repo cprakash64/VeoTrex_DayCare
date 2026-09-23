@@ -42,6 +42,8 @@ from veotrex_edge_agent.qualification.webrtc_qualification import (
 from veotrex_edge_agent.qualification.webrtc_qualification import (
     run_webrtc_cli,
 )
+from veotrex_edge_agent.recorded.cli import add_arguments as add_recorded_arguments
+from veotrex_edge_agent.recorded.cli import run_cli as run_recorded_cli
 
 
 class ManualPromptTokenProvider:
@@ -88,6 +90,13 @@ def parser() -> argparse.ArgumentParser:
     transport.add_argument("--fps", type=int, choices=(10, 15, 20, 25, 30), default=15)
     transport.add_argument("--duration", type=float)
     transport.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
+    # V1-02B1A: recorded-video person tracking. Local files only; no URL option exists.
+    add_recorded_arguments(
+        commands.add_parser(
+            "track-recording",
+            help="detect and track people in one local recorded video (local evaluation)",
+        )
+    )
     webrtc = commands.add_parser(
         "qualify-webrtc",
         help="R5A-R2 local WebRTC media qualification; synthetic media only, retains nothing",
@@ -222,6 +231,8 @@ def main() -> None:  # pragma: no cover - console wrapper verified by smoke comm
         raise SystemExit(run_transport_cli(arguments))
     if arguments.command == "qualify-webrtc":
         raise SystemExit(run_webrtc_cli(arguments))
+    if arguments.command == "track-recording":
+        raise SystemExit(run_recorded_cli(arguments))
     try:
         raise SystemExit(asyncio.run(_run_qualification(arguments)))
     except QualificationEnvironmentError as exc:
