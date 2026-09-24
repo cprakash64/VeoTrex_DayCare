@@ -7,7 +7,11 @@ export function validRingLinkParameters(nonce: unknown, time: unknown): boolean 
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-export function isSameOriginPost(requestUrl: string, origin: string | null): boolean {
-  if (!origin) return false;
-  return new URL(requestUrl).origin === origin;
+export function isSameOriginPost(appBaseUrl: string | undefined, origin: string | null): boolean {
+  if (!appBaseUrl || !origin) return false;
+  try {
+    return new URL(appBaseUrl).origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
 }
