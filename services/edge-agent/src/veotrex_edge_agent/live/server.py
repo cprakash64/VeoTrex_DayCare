@@ -18,6 +18,13 @@ browser fetches a picture; it is given no way to ask for a past one, because non
 Overlays are drawn server-side, so the page does not redraw geometry in JavaScript and image
 and boxes cannot drift apart.
 
+The browser loads the frame by its own same-origin URL into an off-screen ``<img>`` and shows
+it only once the browser has decoded it. R1 fetched the bytes and handed the element a ``blob:``
+URL instead; this page's own Content-Security-Policy does not allow ``blob:``, so every load was
+refused while the ``fetch`` behind it kept succeeding - the page believed it had a picture and
+displayed a broken image indefinitely. Loading the URL directly removes the blob, removes the
+object-URL bookkeeping, and makes a decode failure something the page can actually observe.
+
 No names are shown, no identity is shown, and an unidentified person is labelled as a track
 number and nothing else.
 """
@@ -29,6 +36,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -80,7 +88,7 @@ PAGE = """<!doctype html>
           border-radius:10px; overflow:hidden; display:flex; align-items:center;
           justify-content:center; min-height:280px; }
  /* contain, never cover: the camera image must not be stretched or cropped. */
- #feed { width:100%; height:auto; display:block; object-fit:contain; }
+ .feed { width:100%; height:auto; display:block; object-fit:contain; }
  #placeholder { position:absolute; inset:0; display:flex; flex-direction:column; gap:8px;
                 align-items:center; justify-content:center; text-align:center; padding:24px; }
  #placeholder.hidden { display:none; }
@@ -98,8 +106,9 @@ PAGE = """<!doctype html>
 <main>
   <div>
     <div id="stage">
-      <img id="feed" alt="Live camera view with tracking overlay" hidden>
-      <div id="placeholder"><div class="big" id="phtitle">Waiting for the camera\u2026</div>
+      <img id="feedA" class="feed" alt="Live camera view with tracking overlay" hidden>
+      <img id="feedB" class="feed" alt="Live camera view with tracking overlay" hidden>
+      <div id="placeholder"><div class="big" id="phtitle">Waiting for live camera\u2026</div>
         <div class="muted" id="phdetail">No frame has arrived yet.</div></div>
     </div>
     <p class="muted" id="geometry">&nbsp;</p>
@@ -123,35 +132,86 @@ function pill(el, text, cls){ el.textContent = text; el.className = "pill " + (c
 
 // The overlay is drawn server-side onto the frame the tracker processed, so this page never
 // redraws geometry: it just shows the picture it is given. Image and boxes cannot disagree.
-let feedOk = false;
+//
+// Two <img> elements, one visible and one loading. A frame becomes visible only once the
+// browser has actually decoded it, so a failed or refused load can never put a broken-image
+// icon on screen - the previous good frame stays, and a placeholder takes over if the failures
+// persist. R1 fetched the frame and handed the <img> an object URL, which this page's own
+// Content-Security-Policy does not permit; the fetch succeeded, the decode never happened, and
+// the page had no way to tell the difference. The frame is now loaded by its own same-origin
+// URL, so there is no object URL to permit, to track or to revoke.
+const FRAME_URL = "/api/live/frame.jpg";
+// The server encodes at ~8 fps; asking faster only re-fetches bytes that have not changed.
+const PREVIEW_INTERVAL_MS = 120;
+const PREVIEW_RETRY_MS = 400;
+// Tolerate one lost frame before replacing the picture: a single 503 between encodes is normal,
+// two in a row means there is nothing fresh to show and a still image would be a lie.
+const FAILURES_BEFORE_PLACEHOLDER = 2;
+const STATE_INTERVAL_MS = 250;
+
+let visibleFeed = null;
+let previewFailures = 0;
+let lastHealth = null;
+let reachable = true;
+let previewTimer = null;
+let stateTimer = null;
+let stopped = false;
+// Distinguishes one preview request from the next. Not a cache-buster - the endpoint already
+// sends no-store and the browser honours it - but assigning an unchanged src string starts no
+// load and fires no event, which would stall this loop the second time an element is reused.
+let previewRequest = 0;
+
 function showPlaceholder(title, detail){
-  feedOk = false;
-  $("feed").hidden = true;
+  visibleFeed = null;
+  $("feedA").hidden = true;
+  $("feedB").hidden = true;
   $("placeholder").classList.remove("hidden");
   $("phtitle").textContent = title;
   $("phdetail").textContent = detail;
 }
-function showFeed(){
-  if (feedOk) return;
-  feedOk = true;
-  $("feed").hidden = false;
-  $("placeholder").classList.add("hidden");
+function waitingPlaceholder(){
+  // Both loops can want the placeholder at once. An unreachable server is the more specific
+  // diagnosis, so it wins; otherwise the two would alternate once a second and read as a fault
+  // of their own.
+  if (!reachable)
+    showPlaceholder("Dashboard cannot reach the demo", "Is the SSH tunnel still up?");
+  else if (lastHealth === "FAILED")
+    showPlaceholder("Camera reconnecting\u2026", "The feed stopped; still trying.");
+  else if (lastHealth === "RECONNECTING")
+    showPlaceholder("Camera reconnecting\u2026", "Waiting for the camera.");
+  else if (lastHealth === "STOPPED") showPlaceholder("Session stopped", "No live feed.");
+  else showPlaceholder("Waiting for live camera\u2026", "No frame has arrived yet.");
 }
-async function pullFrame(){
-  try {
-    const r = await fetch("/api/live/frame.jpg", {cache:"no-store"});
-    if (!r.ok) { return false; }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const previous = $("feed").dataset.url;
-    $("feed").src = url;
-    // Exactly one object URL is alive at a time; the previous is revoked immediately, so a
-    // long session cannot accumulate blobs in the browser either.
-    if (previous) URL.revokeObjectURL(previous);
-    $("feed").dataset.url = url;
-    showFeed();
-    return true;
-  } catch (err) { return false; }
+function schedulePreview(delay){
+  // One pending timer and one in-flight request at a time, always. Nothing queues up behind a
+  // slow or dead endpoint, and a page that has gone away schedules nothing at all.
+  if (stopped || previewTimer !== null) return;
+  previewTimer = setTimeout(() => { previewTimer = null; pullPreview(); }, delay);
+}
+function pullPreview(){
+  if (stopped) return;
+  const loader = (visibleFeed === $("feedA")) ? $("feedB") : $("feedA");
+  const settle = (decoded) => {
+    loader.onload = null;
+    loader.onerror = null;
+    if (decoded) {
+      previewFailures = 0;
+      if (visibleFeed && visibleFeed !== loader) visibleFeed.hidden = true;
+      loader.hidden = false;
+      visibleFeed = loader;
+      $("placeholder").classList.add("hidden");
+      schedulePreview(PREVIEW_INTERVAL_MS);
+      return;
+    }
+    previewFailures += 1;
+    loader.hidden = true;
+    if (previewFailures >= FAILURES_BEFORE_PLACEHOLDER) waitingPlaceholder();
+    schedulePreview(PREVIEW_RETRY_MS);
+  };
+  loader.onload = () => settle(true);
+  loader.onerror = () => settle(false);
+  previewRequest += 1;
+  loader.src = FRAME_URL + "?sequence=" + previewRequest;
 }
 function rows(m){
   const p = (o) => (o && o.p50 != null) ? o.p50.toFixed(1)+" / "+o.p95.toFixed(1)+" ms" : "\u2013";
@@ -169,7 +229,10 @@ function rows(m){
     ["Reconnects", m.camera_reconnect_count ?? 0],
   ];
 }
-async function tick(){
+// Counts, metrics and the timeline are on their own timer. The preview is the slowest and the
+// most likely thing to fail, and it must not be able to hold up the numbers.
+async function pullState(){
+  if (stopped) return;
   try {
     const r = await fetch("/api/state", {cache:"no-store"});
     const d = await r.json();
@@ -179,6 +242,8 @@ async function tick(){
     pill($("kind"), s.source.is_live ? s.source.kind : s.source.kind + " (not live)",
          s.source.is_live ? "ok" : "warn");
     const h = s.source.health;
+    lastHealth = h;
+    reachable = true;
     pill($("health"), h, h === "RUNNING" ? "ok" : (h === "FAILED" ? "bad" : "warn"));
     $("geometry").textContent = s.width
       ? (s.width+"\u00d7"+s.height+" \u00b7 frame "+s.frame_index) : "";
@@ -188,19 +253,23 @@ async function tick(){
       .map(e => "<li><b>"+e.kind+"</b>"+(e.track_id!=null?" track "+e.track_id:"")
                 +(e.occupancy!=null?" \u2192 "+e.occupancy:"")+"</li>").join("")
       || "<li class='muted'>Nothing has happened yet.</li>";
-    if (!(await pullFrame())) {
-      if (h === "FAILED") showPlaceholder("Camera disconnected", "The feed has stopped.");
-      else if (h === "RECONNECTING")
-        showPlaceholder("Reconnecting\u2026", "Waiting for the camera.");
-      else if (h === "STOPPED") showPlaceholder("Session stopped", "No live feed.");
-      else showPlaceholder("Waiting for the camera\u2026", "No frame has arrived yet.");
-    }
+    if (visibleFeed === null) waitingPlaceholder();
   } catch (err) {
+    lastHealth = null;
+    reachable = false;
     pill($("health"), "SERVER UNREACHABLE", "bad");
-    showPlaceholder("Dashboard cannot reach the demo", "Is the SSH tunnel still up?");
+    waitingPlaceholder();
   }
+  if (!stopped) stateTimer = setTimeout(pullState, STATE_INTERVAL_MS);
 }
-tick(); setInterval(tick, 120);
+function teardown(){
+  stopped = true;
+  if (previewTimer !== null) { clearTimeout(previewTimer); previewTimer = null; }
+  if (stateTimer !== null) { clearTimeout(stateTimer); stateTimer = null; }
+}
+addEventListener("pagehide", teardown);
+pullState();
+pullPreview();
 </script>
 """
 
@@ -217,13 +286,22 @@ def build_handler(runtime: LiveDemoRuntime) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             # Nothing is embedded and nothing is loaded from anywhere else.
-            self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
+            # img-src is explicit because it is load-bearing: the preview is fetched by
+            # its own same-origin URL. blob: is deliberately not permitted, and the page
+            # creates no object URLs, so there is nothing for it to allow.
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self' 'unsafe-inline'; img-src 'self'",
+            )
             self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # BaseHTTPRequestHandler's naming contract
-            path = self.path.split("?", 1)[0]
+            # Route on the parsed path. The client appends a query string to every
+            # preview request, so a handler that compared the raw request target would
+            # 404 the only URL the dashboard actually asks for.
+            path = urlsplit(self.path).path
             if path in {"/", "/index.html"}:
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
                 return

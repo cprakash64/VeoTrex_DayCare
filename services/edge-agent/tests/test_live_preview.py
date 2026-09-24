@@ -655,3 +655,216 @@ def test_a_disconnected_source_reports_a_state_the_page_can_show_a_placeholder_f
     assert source.health is SourceHealth.FAILED
     assert runtime.state.source_health in {"FAILED", "STOPPED"}
     assert preview.buffer.latest() is None, "no image may remain to imply a live feed"
+
+
+# --------------------------------------------- dashboard preview path (V1-DEMO-01R1 correction)
+#
+# R1 shipped a working endpoint and a dashboard that could not display it. The page fetched the
+# frame and handed the ``<img>`` an object URL; the page's own Content-Security-Policy allows
+# only ``'self'``, so the browser refused every such load while the ``fetch`` behind it kept
+# returning 200. The page took the successful fetch as proof of a picture, revealed the element,
+# and left a broken-image icon and its alt text on screen for the rest of the session.
+#
+# The tests below pin both halves of that: the transport the page asks for, and the page's
+# inability to claim a frame it has not decoded.
+
+PAGE_FRAME_URL = re.compile(r'FRAME_URL\s*=\s*"([^"]+)"')
+PAGE_QUERY_KEY = re.compile(r'FRAME_URL\s*\+\s*"\?([a-z_]+)="')
+
+
+def _page(host: str, port: int) -> tuple[str, Any]:
+    with urllib.request.urlopen(f"http://{host}:{port}/", timeout=5) as response:
+        return response.read().decode(), response.headers
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/api/live/frame.jpg",
+        "/api/live/frame.jpg?sequence=123",
+        "/api/live/frame.jpg?t=123",
+        "/api/live/frame.jpg?sequence=1&t=2",
+    ],
+)
+def test_the_frame_endpoint_answers_whatever_query_string_the_page_appends(target: str) -> None:
+    """A handler that compared the raw request target would 404 every refresh but the first."""
+    runtime, _, _ = runtime_with_preview(300, interval_seconds=0.01)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        runtime.start()
+        _fetch_frame(host, port)
+        with urllib.request.urlopen(f"http://{host}:{port}{target}", timeout=5) as response:
+            body = response.read()
+            headers = response.headers
+        runtime.stop()
+    assert body[:2] == b"\xff\xd8"
+    assert headers["Content-Type"] == "image/jpeg"
+    assert int(headers["X-Preview-Sequence"]) >= 1
+
+
+def test_a_query_string_does_not_turn_no_frame_into_a_404() -> None:
+    """The empty case has to stay 503 too, or the page cannot tell "not yet" from "wrong URL"."""
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(f"http://{host}:{port}/api/live/frame.jpg?sequence=9", timeout=5)
+    assert raised.value.code == 503
+    assert json.loads(raised.value.read())["error"] == "no_frame"
+
+
+def test_the_exact_url_the_dashboard_builds_is_served() -> None:
+    """Reads the URL out of the shipped page rather than restating it, so the two cannot drift."""
+    runtime, _, _ = runtime_with_preview(300, interval_seconds=0.01)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        page, _ = _page(host, port)
+        base = PAGE_FRAME_URL.search(page)
+        key = PAGE_QUERY_KEY.search(page)
+        assert base is not None, "the page must name the preview URL in one place"
+        assert key is not None, "the page must append a per-request query parameter"
+        assert base.group(1).startswith("/"), "the preview must be loaded same-origin"
+        runtime.start()
+        _fetch_frame(host, port)
+        target = f"{base.group(1)}?{key.group(1)}=42"
+        with urllib.request.urlopen(f"http://{host}:{port}{target}", timeout=5) as response:
+            body = response.read()
+        runtime.stop()
+    assert body[:2] == b"\xff\xd8"
+
+
+def test_the_page_loads_the_preview_from_its_own_url_not_an_object_url() -> None:
+    """The object URL is the defect itself: the policy below can never permit one."""
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        page, _ = _page(host, port)
+    assert "createObjectURL" not in page
+    assert "revokeObjectURL" not in page
+    assert "blob" not in page.lower()
+
+
+def test_the_security_policy_permits_the_image_the_page_loads() -> None:
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        _, headers = _page(host, port)
+    policy = headers["Content-Security-Policy"]
+    directives = {
+        part.strip().split(" ", 1)[0]: part.strip() for part in policy.split(";") if part.strip()
+    }
+    assert "img-src" in directives, "img-src is load-bearing and must be stated, not inherited"
+    assert "'self'" in directives["img-src"]
+    assert "blob:" not in policy, "nothing here needs a blob source"
+    assert "default-src" in directives
+
+
+def test_the_page_reveals_an_image_only_after_the_browser_has_decoded_it() -> None:
+    """One place in the page may un-hide a frame, and it is inside the load handler.
+
+    This is the invariant R1 lacked. A fetch that returns 200 is not evidence that the browser
+    could render the bytes; only a fired load event is.
+    """
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        page, _ = _page(host, port)
+    assert page.count("hidden = false") == 1, "exactly one code path may show a frame"
+    assert "loader.onload" in page and "loader.onerror" in page
+    reveal = page.index("hidden = false")
+    handler = page.rindex("if (decoded)", 0, reveal)
+    assert handler > page.rindex("const settle", 0, reveal)
+
+
+def test_the_page_polls_the_preview_one_request_at_a_time() -> None:
+    """Self-scheduling, never an interval: a stalled endpoint cannot pile requests up behind it."""
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        page, _ = _page(host, port)
+    assert "setInterval" not in page, "an interval keeps firing whether or not the last finished"
+    assert "previewTimer !== null) return" in page
+    assert "pagehide" in page and "clearTimeout" in page
+
+
+def test_the_endpoint_recovers_from_the_first_frame_race_without_intervention() -> None:
+    """The dashboard is opened before the first frame exists: 503, then 200, no refresh."""
+    runtime, _, _ = runtime_with_preview(300, interval_seconds=0.01)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(f"http://{host}:{port}/api/live/frame.jpg", timeout=5)
+        assert raised.value.code == 503
+        runtime.start()
+        body, headers = _fetch_frame(host, port)
+        runtime.stop()
+    assert body[:2] == b"\xff\xd8"
+    assert int(headers["X-Preview-Sequence"]) >= 1
+
+
+def test_a_preview_that_goes_stale_and_returns_is_served_again() -> None:
+    """A gap in the feed must answer 503 while it lasts and 200 the moment a frame lands."""
+    runtime, preview, _ = runtime_with_preview(4, config=PreviewConfig(max_age_seconds=0.2))
+    canvas = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    scene(canvas, 1)
+    ok, encoded = cv2.imencode(".jpg", canvas)
+    assert ok
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        preview.buffer.publish(encoded.tobytes(), frame_index=1, width=WIDTH, height=HEIGHT)
+        with urllib.request.urlopen(f"http://{host}:{port}/api/live/frame.jpg?t=1", timeout=5) as r:
+            assert r.read()[:2] == b"\xff\xd8"
+
+        time.sleep(0.35)  # the frame is now older than max_age_seconds
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(f"http://{host}:{port}/api/live/frame.jpg?t=2", timeout=5)
+        assert raised.value.code == 503
+
+        preview.buffer.publish(encoded.tobytes(), frame_index=2, width=WIDTH, height=HEIGHT)
+        with urllib.request.urlopen(f"http://{host}:{port}/api/live/frame.jpg?t=3", timeout=5) as r:
+            recovered = r.read()
+    assert recovered[:2] == b"\xff\xd8", "recovery must need no action from the viewer"
+
+
+def test_a_failing_preview_viewer_cannot_hold_up_inference() -> None:
+    """Abandoned preview requests, as a retrying browser produces, must not cost frames."""
+    runtime, _, _ = runtime_with_preview(600, interval_seconds=0.005)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        runtime.start()
+        _fetch_frame(host, port)
+        before = runtime.metrics()["video_frames_processed_total"]
+        for index in range(30):
+            try:
+                response = urllib.request.urlopen(
+                    f"http://{host}:{port}/api/live/frame.jpg?sequence={index}", timeout=5
+                )
+                response.close()  # abandoned mid-body, as a cancelled image load would be
+            except urllib.error.HTTPError:
+                pass
+        time.sleep(0.3)
+        after = runtime.metrics()["video_frames_processed_total"]
+        assert runtime.running
+        runtime.stop()
+    assert after > before, "inference must have kept running throughout"
+
+
+def test_only_one_placeholder_message_can_win_at_a_time() -> None:
+    """Both loops can want the placeholder at once; they must not alternate.
+
+    Observed in a real browser during a deliberate outage: the counters loop wrote "cannot reach"
+    and the preview loop wrote "waiting for camera", once a second each, so a stopped demo looked
+    like a fault in the dashboard.
+    """
+    runtime, _, _ = runtime_with_preview(4)
+    with DemoServer(runtime, port=0) as server:
+        host, port = server.address
+        page, _ = _page(host, port)
+    unreachable = "Dashboard cannot reach the demo"
+    assert page.count(unreachable) == 1, "one writer for the unreachable message"
+    assert "if (!reachable)" in page, "reachability must take precedence"
+    # The failing state-poll branch delegates rather than writing its own text.
+    opened = page.index("catch (err) {") + len("catch (err) {")
+    branch = page[opened : page.index("\n  }", opened)]
+    assert "waitingPlaceholder();" in branch
+    assert unreachable not in branch

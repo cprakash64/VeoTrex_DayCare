@@ -122,6 +122,14 @@ view that is seconds behind.
 than a few percent. Measured on this Jetson: processing 15.7 fps without the preview and 15.1
 with it. `--preview-fps` lowers it further, `--no-preview` removes it entirely.
 
+**The video area shows a broken-image icon and its alt text.** Fixed in V1-DEMO-01R1; if it
+ever comes back, the page is claiming a frame the browser refused to render. Check the browser
+console first: the earlier cause was the dashboard's own Content-Security-Policy refusing the
+URL the page had built for the image, which the page could not detect because the fetch behind
+it succeeded. `curl -sI http://127.0.0.1:8891/api/live/frame.jpg` returning `200 image/jpeg`
+proves only the endpoint, not the page. The page now reveals a frame only after the browser
+reports it decoded, so the failure mode is a placeholder, never a broken icon.
+
 **The video area shows a placeholder.** It says which state it is in — waiting, reconnecting,
 disconnected, or stopped. A placeholder is correct behaviour: the dashboard refuses to display a
 stale frame, because a frozen image of an empty room is indistinguishable from a live one.
