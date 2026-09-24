@@ -1,7 +1,7 @@
 # Runbook: live camera tracking demo
 
 Local demo on the Jetson: a camera, person detection, multi-object tracking, and a loopback
-dashboard showing boxes, track ids and a live head count.
+dashboard showing **the live camera view** with tracking boxes, track ids and a head count.
 
 **What this demo is.** Anonymous person tracking. It detects and follows people and counts how
 many are currently visible.
@@ -52,6 +52,8 @@ Replace the device with the one step 1 reported. Useful options:
 | `--width 1280 --height 720` | request a mode; the camera's accepted mode is read back |
 | `--detector none` | run everything except detection — proves the camera and dashboard work |
 | `--source synthetic` | no camera at all; a moving synthetic scene |
+| `--no-preview` | metrics only, no camera image (lower cost) |
+| `--preview-fps 5` | slower preview if the machine is busy; inference is never throttled to match |
 | `--duration 300` | stop automatically after five minutes |
 | `--port 8891` | change the dashboard port |
 
@@ -69,10 +71,14 @@ ssh -N -L 8891:127.0.0.1:8891 <user>@<jetson-host>
 
 Then open <http://127.0.0.1:8891/> on the laptop. Leave that SSH session running for the demo.
 
-The page shows live boxes with track ids, the current head count, capture and processing rates,
-detector/tracker/pipeline latency, frames dropped, and source health. It shows **no video** —
-only geometry — so there is no imagery to cache, screenshot or leak. To see the room, look at
-the room.
+The page shows the live camera image with tracking boxes drawn on it, the current head count,
+capture/processing/preview rates, detector/tracker/pipeline latency, frames dropped, and source
+health.
+
+The picture is rendered on the Jetson onto the exact frame the tracker processed, so boxes
+cannot drift away from the person. Exactly one frame is held in memory at a time and **nothing
+is ever written to disk** — no recording, no stills, no history. If the feed stops, the page
+shows an explicit placeholder rather than leaving a frozen image looking live.
 
 > Binding to anything other than loopback requires an explicit flag and is refused by default.
 > Do not use it. The tunnel takes five seconds and keeps an unauthenticated dashboard off the
@@ -111,6 +117,15 @@ camera, so the pipeline deliberately drops stale frames to keep latency bounded 
 dropped" counter is that policy working, not a fault. A current view with gaps beats a complete
 view that is seconds behind.
 
+**The picture looks choppier than the boxes are accurate.** The preview is encoded at about
+8 fps while tracking runs faster; that is deliberate, so the picture never costs inference more
+than a few percent. Measured on this Jetson: processing 15.7 fps without the preview and 15.1
+with it. `--preview-fps` lowers it further, `--no-preview` removes it entirely.
+
+**The video area shows a placeholder.** It says which state it is in — waiting, reconnecting,
+disconnected, or stopped. A placeholder is correct behaviour: the dashboard refuses to display a
+stale frame, because a frozen image of an empty room is indistinguishable from a live one.
+
 **Someone asks about Ring.** Ring is blocked upstream by an Amazon-side IP-level rejection. It
 is unrelated to this demo, no Ring call is made here, and the live source is designed so Ring
 becomes an additional source later without changing any detection, tracking or dashboard code.
@@ -119,8 +134,9 @@ becomes an additional source later without changing any detection, tracking or d
 
 ## Notes
 
-- Nothing is recorded. No video, no frames, no face crops, no biometric data. A finished
-  session leaves nothing on disk.
+- Nothing is recorded. The live preview exists only as a single JPEG in memory, replaced
+  several times a second and dropped when the session ends. No video file, no stills, no face
+  crops, no biometric data. A finished session leaves nothing on disk.
 - The activity list says `PERSON_APPEARED_IN_VIEW` / `PERSON_NO_LONGER_VISIBLE`, not "entered"
   or "exited" — appearing in a camera view is not proof of walking through a door, and the
   wording stays honest about that.

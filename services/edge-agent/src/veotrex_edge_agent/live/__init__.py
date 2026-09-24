@@ -17,6 +17,12 @@ from veotrex_edge_agent.live.camera import (
     probe_camera,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.preview import (
+    PreviewBuffer,
+    PreviewConfig,
+    PreviewFrame,
+    PreviewRenderer,
+)
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime, LiveState, TrackBox
 from veotrex_edge_agent.live.scheduler import BackpressureScheduler, SchedulerMetrics
 from veotrex_edge_agent.live.source import (
@@ -42,6 +48,10 @@ __all__ = [
     "LiveState",
     "LiveVideoSource",
     "LocalCameraSource",
+    "PreviewBuffer",
+    "PreviewConfig",
+    "PreviewFrame",
+    "PreviewRenderer",
     "SchedulerMetrics",
     "SourceDescription",
     "SourceHealth",

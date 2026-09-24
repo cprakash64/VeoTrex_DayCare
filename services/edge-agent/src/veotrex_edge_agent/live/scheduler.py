@@ -51,13 +51,28 @@ class SchedulerMetrics:
     frames_captured_total: int = 0
     frames_delivered_total: int = 0
     frames_dropped_total: int = 0
-    capture_seconds: float = 0.0
+    # Set once, when capture begins. ``capture_seconds`` is derived from it rather than only
+    # assigned when the loop ends: an earlier version assigned elapsed time in the capture
+    # thread's ``finally``, so a running demo reported 0.0 capture FPS on the dashboard while
+    # frames_captured_total was visibly climbing. Live numbers have to be live.
+    capture_started_monotonic: float | None = None
+    capture_finished_seconds: float | None = None
+
+    @property
+    def capture_seconds(self) -> float:
+        """Elapsed capture time: measured so far while running, final once stopped."""
+        if self.capture_finished_seconds is not None:
+            return self.capture_finished_seconds
+        if self.capture_started_monotonic is None:
+            return 0.0
+        return max(time.monotonic() - self.capture_started_monotonic, 0.0)
 
     @property
     def capture_fps(self) -> float:
-        if self.capture_seconds <= 0:
+        elapsed = self.capture_seconds
+        if elapsed <= 0:
             return 0.0
-        return self.frames_captured_total / self.capture_seconds
+        return self.frames_captured_total / elapsed
 
     def snapshot(self) -> dict[str, float | int]:
         return {
@@ -65,6 +80,7 @@ class SchedulerMetrics:
             "frames_delivered_total": self.frames_delivered_total,
             "frames_dropped_total": self.frames_dropped_total,
             "camera_capture_fps": round(self.capture_fps, 3),
+            "capture_seconds": round(self.capture_seconds, 2),
         }
 
 
@@ -118,6 +134,7 @@ class BackpressureScheduler:
 
     def _capture_loop(self) -> None:
         started = time.monotonic()
+        self.metrics.capture_started_monotonic = started
         try:
             for frame in self._source.frames():
                 if self._stop.is_set():
@@ -138,7 +155,7 @@ class BackpressureScheduler:
             self._failure = "capture_error"
             self._logger.warning("live_capture_failed", category="capture_error")
         finally:
-            self.metrics.capture_seconds = time.monotonic() - started
+            self.metrics.capture_finished_seconds = time.monotonic() - started
             self._stop.set()
             # Wake a consumer blocked waiting for a frame that will never arrive.
             self._arrived.set()

@@ -16,6 +16,12 @@ from typing import Any
 
 from veotrex_edge_agent.live.camera import LocalCameraSource, discover_cameras
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.preview import (
+    DEFAULT_JPEG_QUALITY,
+    DEFAULT_PREVIEW_FPS,
+    PreviewConfig,
+    PreviewRenderer,
+)
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime
 from veotrex_edge_agent.live.server import (
     DEFAULT_HOST,
@@ -63,6 +69,20 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
     )
     command.add_argument(
         "--headless", action="store_true", help="run the pipeline without the dashboard"
+    )
+    command.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="dashboard shows metrics and boxes only, no camera image",
+    )
+    command.add_argument(
+        "--preview-fps",
+        type=float,
+        default=DEFAULT_PREVIEW_FPS,
+        help="preview encode rate. Inference is never throttled to match it",
+    )
+    command.add_argument(
+        "--preview-quality", type=int, default=DEFAULT_JPEG_QUALITY, help="preview JPEG quality"
     )
     command.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many processed frames"
@@ -136,7 +156,18 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             print(f"detector unavailable: {exc}", file=sys.stderr)
             return 2
 
-    runtime = LiveDemoRuntime(source, detector)
+    preview: PreviewRenderer | None = None
+    if not arguments.headless and not arguments.no_preview:
+        try:
+            preview = PreviewRenderer(
+                PreviewConfig(
+                    target_fps=arguments.preview_fps, jpeg_quality=arguments.preview_quality
+                )
+            )
+        except ValueError as exc:
+            print(f"invalid preview setting: {exc}", file=sys.stderr)
+            return 2
+    runtime = LiveDemoRuntime(source, detector, preview=preview)
     server: DemoServer | None = None
     code = 0
     try:
