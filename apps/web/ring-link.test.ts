@@ -9,9 +9,18 @@ describe("Ring link browser boundary", () => {
     expect(validRingLinkParameters("A".repeat(43), "1e9")).toBe(false);
   });
 
-  it("requires a same-origin POST", () => {
-    expect(isSameOriginPost("https://app.example/api/claim", "https://app.example")).toBe(true);
-    expect(isSameOriginPost("https://app.example/api/claim", "https://evil.example")).toBe(false);
-    expect(isSameOriginPost("https://app.example/api/claim", null)).toBe(false);
+  it("requires the browser origin to match the configured public app origin", () => {
+    expect(isSameOriginPost("https://app.example", "https://app.example")).toBe(true);
+    expect(isSameOriginPost("https://app.example/", "https://app.example")).toBe(true);
+    expect(isSameOriginPost("https://app.example/path", "https://app.example")).toBe(true);
+
+    expect(isSameOriginPost("https://app.example", "https://evil.example")).toBe(false);
+    expect(isSameOriginPost("http://app.example", "https://app.example")).toBe(false);
+
+    expect(isSameOriginPost(undefined, "https://app.example")).toBe(false);
+    expect(isSameOriginPost("", "https://app.example")).toBe(false);
+    expect(isSameOriginPost("not-a-url", "https://app.example")).toBe(false);
+    expect(isSameOriginPost("https://app.example", null)).toBe(false);
+    expect(isSameOriginPost("https://app.example", "not-a-url")).toBe(false);
   });
 });
