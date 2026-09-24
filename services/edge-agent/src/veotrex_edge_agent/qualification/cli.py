@@ -11,6 +11,9 @@ from uuid import UUID
 
 from pydantic import SecretStr
 
+from veotrex_edge_agent.live.cli import add_demo_arguments as add_live_demo_arguments
+from veotrex_edge_agent.live.cli import add_discover_arguments as add_live_discover_arguments
+from veotrex_edge_agent.live.cli import run_demo_cli, run_discover_cli
 from veotrex_edge_agent.qualification.backend import QualificationEnvironmentError
 from veotrex_edge_agent.qualification.environment import environment_json, inspect_environment
 from veotrex_edge_agent.qualification.gstreamer import GStreamerQualificationBackend
@@ -90,6 +93,15 @@ def parser() -> argparse.ArgumentParser:
     transport.add_argument("--fps", type=int, choices=(10, 15, 20, 25, 30), default=15)
     transport.add_argument("--duration", type=float)
     transport.add_argument("--report-dir", type=Path, default=Path("reports/qualification"))
+    # V1-DEMO-01: live camera ingestion. Local V4L2 devices only; no URL option exists.
+    add_live_discover_arguments(
+        commands.add_parser("live-cameras", help="list local V4L2 capture devices (safe metadata)")
+    )
+    add_live_demo_arguments(
+        commands.add_parser(
+            "live-demo", help="run the local live tracking demo with a loopback dashboard"
+        )
+    )
     # V1-02B1A: recorded-video person tracking. Local files only; no URL option exists.
     add_recorded_arguments(
         commands.add_parser(
@@ -233,6 +245,10 @@ def main() -> None:  # pragma: no cover - console wrapper verified by smoke comm
         raise SystemExit(run_webrtc_cli(arguments))
     if arguments.command == "track-recording":
         raise SystemExit(run_recorded_cli(arguments))
+    if arguments.command == "live-cameras":
+        raise SystemExit(run_discover_cli(arguments))
+    if arguments.command == "live-demo":
+        raise SystemExit(run_demo_cli(arguments))
     try:
         raise SystemExit(asyncio.run(_run_qualification(arguments)))
     except QualificationEnvironmentError as exc:
