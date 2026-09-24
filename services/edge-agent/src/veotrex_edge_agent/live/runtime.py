@@ -29,10 +29,16 @@ import structlog
 
 from veotrex_edge_agent.live.preview import PreviewRenderer
 from veotrex_edge_agent.live.scheduler import BackpressureScheduler
-from veotrex_edge_agent.live.source import LiveSourceError, SourceHealth, SourceKind
+from veotrex_edge_agent.live.source import (
+    LiveSourceError,
+    SourceHealth,
+    SourceKind,
+    health_label,
+)
 from veotrex_edge_agent.live.timeline import DemoEventKind, DemoTimeline
 from veotrex_edge_agent.recorded.model import TrackLifecycle
 from veotrex_edge_agent.recorded.pipeline import RecordedTrackingPipeline
+from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 from veotrex_edge_agent.tracking import TrackingConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -91,7 +97,10 @@ class LiveState:
             "source": {
                 "kind": self.source_kind,
                 "id": self.source_id,
+                # The machine-readable state and the words a human reads are different
+                # things. Both are sent, so the page never has to invent the wording.
                 "health": self.source_health,
+                "health_label": health_label(self.source_health),
                 "is_live": self.is_live,
             },
         }
@@ -109,6 +118,7 @@ class LiveDemoRuntime:
         capacity: int = 1,
         timeline: DemoTimeline | None = None,
         preview: PreviewRenderer | None = None,
+        ignore_regions: IgnoreRegionSet | None = None,
     ) -> None:
         # Optional on purpose: --headless and the automated tests run the whole pipeline with
         # no preview at all, so nothing about detection or tracking depends on it existing.
@@ -116,7 +126,9 @@ class LiveDemoRuntime:
         self._source = source
         self._detector = detector
         self._scheduler = BackpressureScheduler(source, capacity=capacity)
-        self._pipeline = RecordedTrackingPipeline(detector, tracking_config=tracking_config)
+        self._pipeline = RecordedTrackingPipeline(
+            detector, tracking_config=tracking_config, ignore_regions=ignore_regions
+        )
         self.timeline = timeline or DemoTimeline()
         self._state = LiveState(
             source_kind=str(source.kind),

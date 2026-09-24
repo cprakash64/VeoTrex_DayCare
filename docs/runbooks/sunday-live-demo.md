@@ -56,6 +56,51 @@ Replace the device with the one step 1 reported. Useful options:
 | `--preview-fps 5` | slower preview if the machine is busy; inference is never throttled to match |
 | `--duration 300` | stop automatically after five minutes |
 | `--port 8891` | change the dashboard port |
+| `--pixel-format MJPG` | the default. YUYV at 720p is capped at 9 fps by USB 2.0 bandwidth |
+| `--view left` \| `right` | **only** for dual-lens modules that send both lenses in one frame |
+| `--ignore-region ...` | drop detections from a known fixed artifact. See below |
+
+### Masking a known false positive
+
+A fixed camera sees fixed things, and the detector will sometimes call one of them a person.
+A poster with a figure on it is the usual culprit: it never moves and never leaves, so the head
+count is permanently one too high and the operator learns to distrust it.
+
+Mask it by naming the rectangle it occupies, in coordinates normalized to the frame, with the
+origin at the top left:
+
+```
+uv run --all-packages veotrex-edge live-demo --device /dev/video0 \
+  --ignore-region 0.62,0.18,0.78,0.52,poster-by-the-door
+```
+
+Repeatable, up to eight regions. The demo prints the regions it accepted at startup, and the
+dashboard shows an **Ignored detections** counter — watch it climb to confirm the region is
+doing something, and watch it stay put when a person walks past.
+
+**A detection is dropped when at least 80% of its area falls inside a region.** Containment, not
+the centre point: an adult standing in front of a poster is taller and wider than the poster, so
+most of their box is outside the region and they are still counted. Lower the bar with
+`--ignore-containment` only if you have checked what it costs — the lower it goes, the more
+likely a real person in that part of the room disappears.
+
+Regions are for **known fixed visual artifacts**: posters, mirrors, displays, signage. They are
+not a way to quieten a detector that is wrong in general, and they are not detector
+qualification. Anything else in the masked area is hidden too, so never draw one over a doorway
+or a play area. A single region may not cover more than half the frame, and the set may not
+cover more than three quarters of it; the demo refuses to start otherwise.
+
+Containment is measured against **one** region at a time, so two regions side by side do not
+add up: a detection straddling both, half in each, is kept. Draw one region around adjacent
+artifacts rather than two touching ones. (Seen on this camera: a box 51% covered across two
+neighbouring regions survived, correctly by the rule and probably not what the operator meant.)
+
+Finding the numbers: divide the pixel position by the frame width and height. A poster whose
+top-left corner is at (790, 130) in a 1280x720 frame starts at `0.62,0.18`.
+
+To find them without measuring the room, run the demo with no regions, watch `/api/state`, and
+look for a track whose box does not move: a person drifts tens of pixels in a few seconds, a
+poster drifts one or two.
 
 It prints the dashboard URL and the tunnel command, then runs until `Ctrl-C`.
 

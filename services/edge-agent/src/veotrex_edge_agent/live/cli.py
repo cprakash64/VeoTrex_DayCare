@@ -14,7 +14,13 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from veotrex_edge_agent.live.camera import LocalCameraSource, discover_cameras
+from veotrex_edge_agent.live.camera import (
+    DEFAULT_PIXEL_FORMAT,
+    SOURCE_VIEW_FULL,
+    SOURCE_VIEWS,
+    LocalCameraSource,
+    discover_cameras,
+)
 from veotrex_edge_agent.live.fake import FakeLiveSource
 from veotrex_edge_agent.live.preview import (
     DEFAULT_JPEG_QUALITY,
@@ -31,6 +37,11 @@ from veotrex_edge_agent.live.server import (
 )
 from veotrex_edge_agent.live.source import LiveSourceError
 from veotrex_edge_agent.recorded.detector import FakePersonDetector
+from veotrex_edge_agent.recorded.regions import (
+    DEFAULT_MIN_CONTAINMENT,
+    IgnoreRegionError,
+    build_ignore_regions,
+)
 from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
 
 SOURCE_CHOICES = ("camera", "synthetic")
@@ -54,6 +65,43 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
     command.add_argument("--width", type=int, default=1280)
     command.add_argument("--height", type=int, default=720)
     command.add_argument("--fps", type=float, default=30.0)
+    command.add_argument(
+        "--view",
+        choices=SOURCE_VIEWS,
+        default=SOURCE_VIEW_FULL,
+        help=(
+            "which part of the sensor frame is the picture. Only for dual-lens modules that "
+            "deliver both lenses side by side in one frame; ordinary cameras stay 'full'"
+        ),
+    )
+    command.add_argument(
+        "--pixel-format",
+        default=DEFAULT_PIXEL_FORMAT,
+        help=(
+            "FOURCC to request, e.g. MJPG or YUYV. MJPG usually unlocks a far higher frame "
+            "rate on USB 2.0; an empty value leaves the driver default"
+        ),
+    )
+    command.add_argument(
+        "--ignore-region",
+        action="append",
+        default=None,
+        metavar="x1,y1,x2,y2[,label]",
+        dest="ignore_regions",
+        help=(
+            "normalized 0-1 rectangle whose detections are dropped before tracking. For known "
+            "fixed artifacts only - a poster, a mirror, a display. Repeatable"
+        ),
+    )
+    command.add_argument(
+        "--ignore-containment",
+        type=float,
+        default=DEFAULT_MIN_CONTAINMENT,
+        help=(
+            "how much of a detection must lie inside an ignore region before it is dropped. "
+            "Lower values suppress more, and risk hiding a person standing in front of it"
+        ),
+    )
     command.add_argument("--detector", choices=DETECTOR_CHOICES, default="yolox")
     command.add_argument(
         "--environment",
@@ -126,7 +174,12 @@ def _source(arguments: argparse.Namespace) -> Any:
             interval_seconds=1.0 / max(arguments.fps, 1.0),
         )
     return LocalCameraSource(
-        arguments.device, width=arguments.width, height=arguments.height, fps=arguments.fps
+        arguments.device,
+        width=arguments.width,
+        height=arguments.height,
+        fps=arguments.fps,
+        view=arguments.view,
+        pixel_format=arguments.pixel_format or None,
     )
 
 
@@ -167,7 +220,23 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"invalid preview setting: {exc}", file=sys.stderr)
             return 2
-    runtime = LiveDemoRuntime(source, detector, preview=preview)
+    try:
+        regions = build_ignore_regions(
+            getattr(arguments, "ignore_regions", None),
+            min_containment=arguments.ignore_containment,
+        )
+    except IgnoreRegionError as exc:
+        print(f"invalid ignore region: {exc}", file=sys.stderr)
+        return 2
+    if regions:
+        # Printed, not silent. Masking part of a camera's view is a decision an operator has
+        # to be able to see they made, and to undo.
+        print(f"Ignoring detections in {len(regions)} configured region(s):")
+        for region in regions.regions:
+            note = f"  {region.as_dict()}"
+            print(note)
+        print("  These suppress known fixed artifacts only. They are not detector qualification.")
+    runtime = LiveDemoRuntime(source, detector, preview=preview, ignore_regions=regions)
     server: DemoServer | None = None
     code = 0
     try:

@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from veotrex_edge_agent.live.source import health_label
 from veotrex_edge_agent.qualification.metrics import BoundedSamples
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -272,7 +273,10 @@ class PreviewRenderer:
             )
 
         # Status strip: a head count and the feed's own state. No identity, no classification.
-        status = f"people: {occupancy}   {source_health}"
+        # The state is worded for a human by the same function the page uses - "RUNNING"
+        # burned into the picture beside a person's box invites exactly the misreading a
+        # client made of it.
+        status = f"people: {occupancy}   {health_label(source_health)}"
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 24), (16, 18, 22), -1)
         cv2.putText(
             canvas, status, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 226, 232), 1, cv2.LINE_AA

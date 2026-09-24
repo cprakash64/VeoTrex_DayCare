@@ -89,6 +89,11 @@ PAGE = """<!doctype html>
           justify-content:center; min-height:280px; }
  /* contain, never cover: the camera image must not be stretched or cropped. */
  .feed { width:100%; height:auto; display:block; object-fit:contain; }
+ /* Load-bearing, not tidiness. An author rule beats the user-agent's [hidden]{display:none},
+    so `display:block` above silently defeated the hidden attribute on both buffers: the stage
+    is a flex row, so two 100%-wide images were laid out side by side at half size each and the
+    room appeared duplicated. Only one preview may ever occupy the stage. */
+ .feed[hidden] { display:none; }
  #placeholder { position:absolute; inset:0; display:flex; flex-direction:column; gap:8px;
                 align-items:center; justify-content:center; text-align:center; padding:24px; }
  #placeholder.hidden { display:none; }
@@ -225,6 +230,7 @@ function rows(m){
     ["Frames captured", m.frames_captured_total ?? 0],
     ["Frames processed", m.video_frames_processed_total ?? 0],
     ["Frames dropped", m.frames_dropped_total ?? 0],
+    ["Ignored detections", m.detections_ignored_total ?? 0],
     ["Tracks created", m.tracks_created_total ?? 0],
     ["Reconnects", m.camera_reconnect_count ?? 0],
   ];
@@ -244,7 +250,10 @@ async function pullState(){
     const h = s.source.health;
     lastHealth = h;
     reachable = true;
-    pill($("health"), h, h === "RUNNING" ? "ok" : (h === "FAILED" ? "bad" : "warn"));
+    // The wording is the server's - one definition, shared with the overlay drawn onto the
+    // frame - so the two can never disagree about what the camera is doing.
+    pill($("health"), s.source.health_label || h,
+         h === "RUNNING" ? "ok" : (h === "FAILED" ? "bad" : "warn"));
     $("geometry").textContent = s.width
       ? (s.width+"\u00d7"+s.height+" \u00b7 frame "+s.frame_index) : "";
     $("metrics").innerHTML = rows(d.metrics)
