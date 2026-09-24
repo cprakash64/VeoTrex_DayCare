@@ -10,13 +10,22 @@ Nothing here performs or enables face recognition.
 """
 
 from veotrex_edge_agent.live.camera import (
+    SOURCE_VIEWS,
     CameraCandidate,
     LocalCameraSource,
+    crop_to_view,
     discover_cameras,
     list_device_nodes,
     probe_camera,
+    validate_source_view,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.preview import (
+    PreviewBuffer,
+    PreviewConfig,
+    PreviewFrame,
+    PreviewRenderer,
+)
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime, LiveState, TrackBox
 from veotrex_edge_agent.live.scheduler import BackpressureScheduler, SchedulerMetrics
 from veotrex_edge_agent.live.source import (
@@ -26,10 +35,12 @@ from veotrex_edge_agent.live.source import (
     SourceDescription,
     SourceHealth,
     SourceKind,
+    health_label,
 )
 from veotrex_edge_agent.live.timeline import DemoEvent, DemoEventKind, DemoTimeline
 
 __all__ = [
+    "SOURCE_VIEWS",
     "BackpressureScheduler",
     "CameraCandidate",
     "DemoEvent",
@@ -42,12 +53,19 @@ __all__ = [
     "LiveState",
     "LiveVideoSource",
     "LocalCameraSource",
+    "PreviewBuffer",
+    "PreviewConfig",
+    "PreviewFrame",
+    "PreviewRenderer",
     "SchedulerMetrics",
     "SourceDescription",
     "SourceHealth",
     "SourceKind",
     "TrackBox",
+    "crop_to_view",
     "discover_cameras",
+    "health_label",
     "list_device_nodes",
     "probe_camera",
+    "validate_source_view",
 ]

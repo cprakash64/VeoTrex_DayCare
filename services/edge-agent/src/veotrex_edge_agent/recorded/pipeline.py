@@ -41,6 +41,7 @@ from veotrex_edge_agent.recorded.model import (
     TrackObservation,
     TrackSummary,
 )
+from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 from veotrex_edge_agent.recorded.source import RecordedVideoSource, VideoMetadata
 from veotrex_edge_agent.tracking import PersonDetection, PersonTracker, TrackingConfig, TrackView
 
@@ -61,6 +62,10 @@ class PipelineMetrics:
     video_frames_dropped_total: int = 0
     person_detections_total: int = 0
     detections_rejected_total: int = 0
+    # Detections dropped by an operator-configured ignore region. Counted separately from
+    # rejections: a rejection is a malformed box, this is a well-formed box in a place the
+    # operator has said is furniture.
+    detections_ignored_total: int = 0
     tracks_created_total: int = 0
     tracks_completed_total: int = 0
     active_tracks: int = 0
@@ -100,6 +105,7 @@ class PipelineMetrics:
             "video_frames_dropped_total": self.video_frames_dropped_total,
             "person_detections_total": self.person_detections_total,
             "detections_rejected_total": self.detections_rejected_total,
+            "detections_ignored_total": self.detections_ignored_total,
             "tracks_created_total": self.tracks_created_total,
             "tracks_completed_total": self.tracks_completed_total,
             "active_tracks": self.active_tracks,
@@ -150,9 +156,13 @@ class RecordedTrackingPipeline:
         tracking_config: TrackingConfig | None = None,
         sample_every: int = 1,
         max_frames: int | None = None,
+        ignore_regions: IgnoreRegionSet | None = None,
     ) -> None:
         self._detector = detector
         self._tracking_config = tracking_config or TrackingConfig()
+        # Empty unless a camera has been configured, and an empty set is not consulted at all,
+        # so every existing caller keeps its exact behaviour.
+        self.ignore_regions = ignore_regions or IgnoreRegionSet()
         self._sample_every = max(1, sample_every)
         self._max_frames = max_frames
         self.metrics = PipelineMetrics()
@@ -271,8 +281,22 @@ class RecordedTrackingPipeline:
 
         validator = BoundingBoxValidator(frame.width, frame.height)
         accepted, rejected = validator.validate(detections)
-        self.metrics.person_detections_total += len(accepted)
         self.metrics.detections_rejected_total += rejected
+        if self.ignore_regions:
+            # Before the tracker, deliberately. A detection that reached PersonTracker would
+            # already have created or fed a track, so suppressing it later would leave a track
+            # id that appeared and then went quiet - which is exactly what a person leaving
+            # looks like. Dropping it here means the phantom never existed.
+            kept = []
+            for item in accepted:
+                if self.ignore_regions.matching(
+                    item.bbox_xyxy, width=frame.width, height=frame.height
+                ):
+                    self.metrics.detections_ignored_total += 1
+                else:
+                    kept.append(item)
+            accepted = kept
+        self.metrics.person_detections_total += len(accepted)
 
         tracker_started = time.perf_counter_ns()
         result = tracker.update(

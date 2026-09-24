@@ -27,11 +27,18 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from veotrex_edge_agent.live.preview import PreviewRenderer
 from veotrex_edge_agent.live.scheduler import BackpressureScheduler
-from veotrex_edge_agent.live.source import LiveSourceError, SourceHealth, SourceKind
+from veotrex_edge_agent.live.source import (
+    LiveSourceError,
+    SourceHealth,
+    SourceKind,
+    health_label,
+)
 from veotrex_edge_agent.live.timeline import DemoEventKind, DemoTimeline
 from veotrex_edge_agent.recorded.model import TrackLifecycle
 from veotrex_edge_agent.recorded.pipeline import RecordedTrackingPipeline
+from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 from veotrex_edge_agent.tracking import TrackingConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -90,7 +97,10 @@ class LiveState:
             "source": {
                 "kind": self.source_kind,
                 "id": self.source_id,
+                # The machine-readable state and the words a human reads are different
+                # things. Both are sent, so the page never has to invent the wording.
                 "health": self.source_health,
+                "health_label": health_label(self.source_health),
                 "is_live": self.is_live,
             },
         }
@@ -107,11 +117,18 @@ class LiveDemoRuntime:
         tracking_config: TrackingConfig | None = None,
         capacity: int = 1,
         timeline: DemoTimeline | None = None,
+        preview: PreviewRenderer | None = None,
+        ignore_regions: IgnoreRegionSet | None = None,
     ) -> None:
+        # Optional on purpose: --headless and the automated tests run the whole pipeline with
+        # no preview at all, so nothing about detection or tracking depends on it existing.
+        self.preview = preview
         self._source = source
         self._detector = detector
         self._scheduler = BackpressureScheduler(source, capacity=capacity)
-        self._pipeline = RecordedTrackingPipeline(detector, tracking_config=tracking_config)
+        self._pipeline = RecordedTrackingPipeline(
+            detector, tracking_config=tracking_config, ignore_regions=ignore_regions
+        )
         self.timeline = timeline or DemoTimeline()
         self._state = LiveState(
             source_kind=str(source.kind),
@@ -160,6 +177,8 @@ class LiveDemoRuntime:
         snapshot["occupancy"] = self.timeline.occupancy
         snapshot["peak_occupancy"] = self.timeline.peak_occupancy
         snapshot["source_health"] = str(self._source.health)
+        if self.preview is not None:
+            snapshot.update(self.preview.snapshot())
         return snapshot
 
     # ------------------------------------------------------------------------- processing
@@ -171,10 +190,21 @@ class LiveDemoRuntime:
 
         def hook(image: Any, boxes: Any, timestamp_ms: float) -> None:
             nonlocal live_boxes
+            bounded = list(boxes)[:MAX_RENDERED_TRACKS]
             live_boxes = {
-                int(track_id): TrackBox(int(track_id), tuple(box), 0.0)
-                for track_id, box in list(boxes)[:MAX_RENDERED_TRACKS]
+                int(track_id): TrackBox(int(track_id), tuple(box), 0.0) for track_id, box in bounded
             }
+            if self.preview is not None:
+                # Drawn here because this is the one place that holds the processed frame and
+                # its own confirmed boxes together; geometry and image cannot drift apart, and
+                # no second capture, detection or client-side redraw is involved.
+                self.preview.render(
+                    image,
+                    bounded,
+                    frame_index=getattr(current_frame, "frame_index", 0),
+                    occupancy=len(bounded),
+                    source_health=str(self._source.health),
+                )
 
         def frames() -> Any:
             nonlocal current_frame
@@ -229,6 +259,9 @@ class LiveDemoRuntime:
                     DemoEventKind.CAMERA_DISCONNECTED, session_ms=self._session_ms()
                 )
             self.timeline.record(DemoEventKind.TRACKING_STOPPED, session_ms=self._session_ms())
+            if self.preview is not None:
+                # A frozen last frame would keep looking live after the camera has gone.
+                self.preview.clear()
 
     def _publish(self, frame: Any, boxes: dict[int, TrackBox]) -> None:
         """Swap in a fresh state. Occupancy is the number of confirmed tracks right now."""

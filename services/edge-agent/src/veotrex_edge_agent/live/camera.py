@@ -42,8 +42,53 @@ DEVICE_ROOT = Path("/dev")
 DEFAULT_REQUESTED_WIDTH = 1280
 DEFAULT_REQUESTED_HEIGHT = 720
 DEFAULT_REQUESTED_FPS = 30.0
+# Ask for MJPG. This camera's default is YUYV, which at 1280x720 the driver caps at 9 fps
+# because uncompressed 720p does not fit through USB 2.0; the same geometry in MJPG advertises
+# 60. Capture rate is not inference rate - the detector is the limit either way - but newest
+# frame wins, so a faster capture means the frame the detector picks up is fresher. Falls back
+# to whatever the driver offers if the format is refused.
+DEFAULT_PIXEL_FORMAT = "MJPG"
 # Consecutive empty reads tolerated before the source treats the device as gone.
 MAX_CONSECUTIVE_READ_FAILURES = 30
+# Which part of the sensor's frame is the picture.
+#
+# Some USB modules are dual-lens and deliver both lenses in one frame, side by side, with no
+# way to ask for a single view - the frame is simply twice as wide as the picture. For those,
+# and only for those, an operator names the lens to use. This is opt-in: FULL is the default
+# and is what every ordinary camera does, because silently halving a frame is a far worse
+# failure than showing one the operator has to look at.
+#
+# The crop happens here, in the source, so the frame that leaves this module *is* the picture:
+# the detector, the validator, the tracker and the preview all see the same coordinate space
+# and boxes cannot land in the wrong half.
+SOURCE_VIEW_FULL = "full"
+SOURCE_VIEW_LEFT = "left"
+SOURCE_VIEW_RIGHT = "right"
+SOURCE_VIEWS = (SOURCE_VIEW_FULL, SOURCE_VIEW_LEFT, SOURCE_VIEW_RIGHT)
+
+
+def crop_to_view(image: Any, view: str) -> Any:
+    """The selected half of a side-by-side frame, or the frame itself for ``full``.
+
+    A view is taken on the array rather than copied: the slice is a read-only-by-convention
+    window onto the same buffer, so selecting a lens costs no allocation per frame.
+    """
+    if view == SOURCE_VIEW_FULL:
+        return image
+    width = int(image.shape[1])
+    half = width // 2
+    if half <= 0:  # pragma: no cover - validate_geometry rejects this long before here
+        return image
+    return image[:, :half] if view == SOURCE_VIEW_LEFT else image[:, half : half * 2]
+
+
+def validate_source_view(view: str) -> str:
+    normalized = str(view).strip().lower()
+    if normalized not in SOURCE_VIEWS:
+        raise LiveSourceError("invalid_source_view")
+    return normalized
+
+
 # A gap longer than this marks the next frame discontinuous, so the tracker is told that
 # motion across it cannot be assumed continuous.
 DISCONTINUITY_GAP_SECONDS = 1.0
@@ -151,9 +196,13 @@ class LocalCameraSource:
         height: int = DEFAULT_REQUESTED_HEIGHT,
         fps: float = DEFAULT_REQUESTED_FPS,
         reconnect_policy: ReconnectPolicy | None = None,
+        view: str = SOURCE_VIEW_FULL,
+        pixel_format: str | None = DEFAULT_PIXEL_FORMAT,
     ) -> None:
         self._index = _device_index(device)
         self._requested = (width, height, fps)
+        self._view = validate_source_view(view)
+        self._pixel_format = pixel_format
         self._capture: Any | None = None
         self._health = SourceHealth.STARTING
         self._stopping = False
@@ -202,6 +251,12 @@ class LocalCameraSource:
         # Requests, not guarantees: a UVC camera may substitute its nearest supported mode,
         # so the accepted geometry is read back rather than assumed.
         with contextlib.suppress(Exception):
+            if self._pixel_format:
+                # Before the geometry: a UVC driver picks the frame-rate table from the
+                # format, so setting it afterwards can leave the previous format's cap in
+                # place. A refused format leaves the driver default, which still works.
+                fourcc = cv2.VideoWriter_fourcc(*self._pixel_format)  # type: ignore[attr-defined]
+                capture.set(cv2.CAP_PROP_FOURCC, fourcc)
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             capture.set(cv2.CAP_PROP_FPS, fps)
@@ -217,7 +272,10 @@ class LocalCameraSource:
             with contextlib.suppress(Exception):
                 capture.release()
             raise
-        self._geometry = (accepted_width, accepted_height)
+        # The described geometry is the picture's, not the sensor frame's, so a dashboard
+        # reading 1280x720 is reading what the detector actually saw.
+        view_width = accepted_width if self._view == SOURCE_VIEW_FULL else accepted_width // 2
+        self._geometry = (view_width, accepted_height)
         self._nominal_fps = raw_fps if 0.0 < raw_fps < 1000.0 else None
         return capture
 
@@ -264,6 +322,10 @@ class LocalCameraSource:
             failures = 0
             if image.ndim != 3 or image.shape[2] != 3:
                 continue
+            # Before geometry validation and before the frame is handed to anyone: the
+            # selected view is the frame from here on, so detection, tracking and the preview
+            # share one coordinate space.
+            image = crop_to_view(image, self._view)
             height, width = int(image.shape[0]), int(image.shape[1])
             try:
                 validate_geometry(width, height)

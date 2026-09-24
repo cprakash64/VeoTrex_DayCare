@@ -69,6 +69,32 @@ class SourceHealth(StrEnum):
     FAILED = "FAILED"
 
 
+# What an operator or a visiting client reads on the dashboard, for each health value.
+#
+# The enum names are system state and stay as they are - logs, tests and the JSON contract all
+# depend on them. But "RUNNING" on a screen beside a person's bounding box does not read as
+# "the capture thread is running"; a client at the Sunday demo read it as the system claiming
+# the person was running. Nothing here detects behaviour of any kind, so the visible wording
+# has to be about the camera and the system, and nothing else.
+HEALTH_LABELS = {
+    SourceHealth.STARTING: "STARTING",
+    SourceHealth.RUNNING: "SYSTEM ACTIVE",
+    SourceHealth.RECONNECTING: "CAMERA RECONNECTING",
+    SourceHealth.STOPPED: "SESSION STOPPED",
+    SourceHealth.FAILED: "CAMERA OFFLINE",
+}
+
+
+def health_label(health: SourceHealth | str) -> str:
+    """The wording shown to a human. One definition, used by the page and the overlay alike."""
+    try:
+        return HEALTH_LABELS[SourceHealth(str(health))]
+    except ValueError:
+        # An unknown state is still shown, but never as a bare word that could describe a
+        # person: it is explicitly about the system.
+        return f"SYSTEM {str(health).upper()}"
+
+
 class LiveSourceError(Exception):
     """A bounded category. Never a device path, never a driver message, never pixels."""
 
