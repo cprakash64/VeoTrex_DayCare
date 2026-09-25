@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
   if (!faceEvaluationEnabled(process.env)) {
     return NextResponse.json({ status: "unavailable" }, { status: 404 });
   }
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   const declared = Number(request.headers.get("content-length") ?? "0");

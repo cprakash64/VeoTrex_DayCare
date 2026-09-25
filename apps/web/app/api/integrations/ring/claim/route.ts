@@ -7,7 +7,7 @@ type ClaimBody = { nonce?: unknown; time?: unknown };
 
 export async function POST(request: NextRequest) {
   const localRequestId = crypto.randomUUID();
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   if (request.headers.get("content-type")?.split(";", 1)[0] !== "application/json") {
