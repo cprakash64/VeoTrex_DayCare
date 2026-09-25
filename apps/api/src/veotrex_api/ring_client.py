@@ -58,7 +58,11 @@ _WHEP_COMPONENT_ID = re.compile(r"^[A-Za-z0-9._~-]{1,64}$")
 _WHEP_SESSION_PATH = re.compile(
     r"^/v1/devices/[A-Za-z0-9._~%-]{1,256}/media/streaming/whep/sessions/[A-Za-z0-9._~%-]{1,256}$"
 )
-_WHEP_LOCATION_QUERY = re.compile(r"^[A-Za-z0-9._~%=&-]{0,256}$")
+# Ring's real session Location carries an opaque query of 360 characters (observed 2026-09-25,
+# all within the allowlist below); 512 bounds it with margin. The character allowlist is
+# unchanged, and the query is never parsed or normalised - it is kept verbatim for the DELETE.
+_WHEP_LOCATION_QUERY_MAX = 512
+_WHEP_LOCATION_QUERY = re.compile(rf"^[A-Za-z0-9._~%=&-]{{0,{_WHEP_LOCATION_QUERY_MAX}}}$")
 _SDP_LINE = re.compile(r"^[a-z]=[^\r\n]*$")
 _MAX_LOCATION_CHARS = 1024
 
@@ -181,10 +185,10 @@ _SESSION_TAIL_ALLOWED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%-"
 )
 _MAX_DIAGNOSTIC_SEGMENTS = 64
-# Mirrors ``_WHEP_LOCATION_QUERY`` (``[A-Za-z0-9._~%=&-]{0,256}``) for DIAGNOSIS ONLY; the regex
+# Mirrors ``_WHEP_LOCATION_QUERY`` (``[A-Za-z0-9._~%=&-]{0,512}``) for DIAGNOSIS ONLY; the regex
 # remains the sole validator, and a test pins these two to exactly the same language.
 _QUERY_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%=&-")
-_QUERY_CURRENT_LIMIT = 256
+_QUERY_CURRENT_LIMIT = _WHEP_LOCATION_QUERY_MAX
 _MAX_DIAGNOSTIC_QUERY_LENGTH = 2048
 _MAX_DIAGNOSTIC_DISALLOWED = 256
 _QUERY_NAMED_PUNCTUATION = frozenset("+/:;,@?[]")

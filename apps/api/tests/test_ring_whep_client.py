@@ -503,37 +503,109 @@ def test_the_diagnostic_allowlist_is_exactly_the_unchanged_validator() -> None:
         _WHEP_LOCATION_QUERY,
     )
 
-    assert _WHEP_LOCATION_QUERY.pattern == r"^[A-Za-z0-9._~%=&-]{0,256}$"
+    # Same character class as ever; only the bound moved from 256 to 512.
+    assert _WHEP_LOCATION_QUERY.pattern == r"^[A-Za-z0-9._~%=&-]{0,512}$"
+    assert _QUERY_CURRENT_LIMIT == 512
 
     def mirror(value: str) -> bool:
         return len(value) <= _QUERY_CURRENT_LIMIT and all(c in _QUERY_ALLOWED for c in value)
 
     printable = [chr(code) for code in range(33, 127)]
     samples = [*printable, "", "a" * 255, "a" * 256, "a" * 257, "a=1&b=2", "x" * 256 + "+"]
+    samples += ["a" * 360, "a" * 511, "a" * 512, "a" * 513, "x" * 511 + "+", "x" * 512 + "+"]
     rng = random.Random(20260925)  # noqa: S311 - seeded test fuzz, not cryptography
     samples += [
-        "".join(rng.choice(printable) for _ in range(rng.randint(0, 300))) for _ in range(2000)
+        "".join(rng.choice(printable) for _ in range(rng.randint(0, 600))) for _ in range(2000)
+    ]
+    allowed = sorted(_QUERY_ALLOWED)
+    samples += [
+        "".join(rng.choice(allowed) for _ in range(rng.randint(400, 600))) for _ in range(500)
     ]
     for value in samples:
         assert bool(_WHEP_LOCATION_QUERY.fullmatch(value)) is mirror(value), repr(value)
     assert set(printable) - _QUERY_ALLOWED <= set(string.punctuation)
 
 
-def test_an_over_limit_but_otherwise_valid_query_is_reported_as_length(
+def _allowed_query(length: int) -> str:
+    """A synthetic query of exactly ``length`` characters, all in the current allowlist and
+    shaped like Ring's (key=value pairs with percent-escapes). Obviously not a real query."""
+    body = f"{QUERY_NAME}=" + "%2Dv-_.~" * 200 + f"&k2={QUERY_VALUE}"
+    query = (body * 4)[:length]
+    assert len(query) == length and query[-1] != "%"
+    return query
+
+
+@pytest.mark.parametrize("length", [256, 360, 512])
+def test_queries_up_to_the_new_limit_are_accepted_and_preserved_verbatim(
+    settings: Settings, length: int
+) -> None:
+    client, seen = client_with(settings, lambda _: httpx.Response(204))
+    query = _allowed_query(length)
+    for location in (
+        f"https://api.amazonvision.com{SECRET_PATH}?{query}",
+        f"{SECRET_PATH}?{query}",
+    ):
+        assert len(location) <= 1024, "fits the unchanged overall Location bound"
+        validated = client.validated_whep_location(location, device_id=SECRET_DEVICE)
+        # Opaque: never parsed, reordered or re-encoded.
+        assert validated == f"https://api.amazonvision.com:443{SECRET_PATH}?{query}"
+    assert seen == []
+
+
+def test_a_513_character_valid_query_is_still_rejected_as_over_length(
     settings: Settings,
 ) -> None:
-    query = f"{QUERY_NAME}=" + "v" * 300
+    query = _allowed_query(513)
     rejection = _query_rejection(settings, query)
     diagnostics = rejection.diagnostics
     assert diagnostics["query_over_current_limit"] is True
-    assert diagnostics["query_length"] == len(query)
+    assert diagnostics["query_length"] == 513
     assert diagnostics["disallowed_char_count"] == 0
     assert diagnostics["absolute"] is True and diagnostics["query_present"] is True
     assert all(diagnostics[name] is False for name in QUERY_BOOLEANS)
-    # A query at the limit is accepted, exactly as before.
-    client, _ = client_with(settings, lambda _: httpx.Response(204))
-    at_limit = "a=" + "v" * 254
-    assert client.validated_whep_location(f"{SECRET_PATH}?{at_limit}").endswith(at_limit)
+
+
+def test_short_disallowed_queries_report_not_over_limit(settings: Settings) -> None:
+    rejection = _query_rejection(settings, f"{QUERY_NAME}=a+b")
+    assert rejection.diagnostics["query_over_current_limit"] is False
+    assert rejection.diagnostics["contains_plus"] is True
+
+
+async def test_a_real_create_with_a_360_character_query_succeeds_and_deletes_it_exactly(
+    settings: Settings,
+) -> None:
+    """The production shape: 201, absolute Location, 360-character allowlisted query."""
+    token = SecretStr("synthetic-ring-access-SECRETTOKEN")
+    query = _allowed_query(360)
+    location = f"https://api.amazonvision.com{SECRET_PATH}?{query}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(
+            201,
+            content=ANSWER,
+            headers={"content-type": "application/sdp", "location": location},
+        )
+
+    client, seen = client_with(settings, handler)
+    with capture_logs() as logs:
+        session = await client.create_whep_session(
+            token, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536
+        )
+        assert session.session_url is not None
+        await client.delete_whep_session(token, session.session_url)
+    assert [entry for entry in logs if entry["event"] == "ring_whep_location_rejected"] == []
+    assert [entry for entry in logs if entry["event"] == "ring_provider_request_failed"] == []
+    assert [request.method for request in seen] == ["POST", "DELETE"]
+    delete = seen[1]
+    # Same origin, same path, the query byte-for-byte - the resource Ring issued.
+    assert delete.url.host == "api.amazonvision.com" and delete.url.scheme == "https"
+    assert delete.url.raw_path == f"{SECRET_PATH}?{query}".encode()
+    assert delete.headers["authorization"] == f"Bearer {token.get_secret_value()}"
+    rendered = repr(logs) + repr(session)
+    for secret in (query, QUERY_NAME, QUERY_VALUE, SECRET_DEVICE, SECRET_SESSION, "SECRETTOKEN"):
+        assert secret not in rendered, secret
 
 
 @pytest.mark.parametrize("character", sorted(NAMED_CLASSES))
