@@ -4,7 +4,7 @@ import { isSameOriginPost } from "../../../lib/ring-link";
 import { createStaff } from "../../../lib/veotrex-api";
 
 export async function POST(request: NextRequest) {
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   if (request.headers.get("content-type")?.split(";", 1)[0] !== "application/json") {

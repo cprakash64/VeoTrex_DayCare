@@ -11,7 +11,7 @@ import { uploadStaffImage } from "../../../../../lib/veotrex-api";
  */
 export async function POST(request: NextRequest, { params }: { params: Promise<{ staffId: string }> }) {
   const { staffId } = await params;
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   if (!UUID_PATTERN.test(staffId)) return NextResponse.json({ status: "failed" }, { status: 422 });
