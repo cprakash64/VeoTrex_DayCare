@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import httpx
@@ -689,3 +689,308 @@ async def test_a_real_create_logs_one_safe_query_event_without_any_query_text(
         "amazonvision",
     ):
         assert secret not in rendered, secret
+
+
+# ------------------------------------------------- WHEP teardown diagnostics (hotfix 4)
+FAILURE_EVENT_KEYS = {
+    "event",
+    "log_level",
+    "operation",
+    "category",
+    "status_code",
+    "provider_request_id",
+    "error_title",
+    "response_content_type_class",
+    "response_body_present",
+    "response_body_length",
+    "response_body_truncated",
+}
+TEARDOWN_TOKEN = SecretStr("synthetic-ring-access-SECRETTOKEN")
+OPAQUE_QUERY = (
+    "X-Sig-Algorithm=SYNTH-HMAC&X-Sig-Credential=SECRETCRED%2F20260925%2Fus%2Fwhep"
+    "&X-Sig-Date=20260925T000000Z&X-Sig-Expires=300&X-Sig-Token=SECRETQTOKEN~a.b-c_d"
+    "&X-Sig-Signature=" + "0123456789abcdef" * 12
+)
+TEARDOWN_URL = f"https://api.amazonvision.com:443{SECRET_PATH}?{OPAQUE_QUERY}"
+BODY_SECRETS = (
+    "SECRETDETAIL",
+    "SECRETMSG",
+    "SECRETMETA",
+    "eyJhbGciOiJSUzI1NiJ9.SECRETJWT",
+    "access_token=SECRETBODYTOKEN",
+    "refresh_token",
+    "<html>",
+)
+
+
+def _teardown_client(
+    settings: Settings, response: httpx.Response
+) -> tuple[RingClient, list[httpx.Request]]:
+    return client_with(settings, lambda _: response)
+
+
+async def _delete_failure(
+    settings: Settings, response: httpx.Response
+) -> tuple[
+    RingClientError, MutableMapping[str, Any], list[httpx.Request], list[MutableMapping[str, Any]]
+]:
+    client, seen = _teardown_client(settings, response)
+    with capture_logs() as logs, pytest.raises(RingClientError) as caught:
+        await client.delete_whep_session(TEARDOWN_TOKEN, TEARDOWN_URL)
+    [event] = [entry for entry in logs if entry["event"] == "ring_provider_request_failed"]
+    return caught.value, event, seen, logs
+
+
+def _assert_nothing_sensitive(rendered: str) -> None:
+    for secret in (
+        *BODY_SECRETS,
+        TEARDOWN_URL,
+        OPAQUE_QUERY,
+        "SECRETCRED",
+        "SECRETQTOKEN",
+        "X-Sig",
+        SECRET_DEVICE,
+        SECRET_SESSION,
+        TEARDOWN_TOKEN.get_secret_value(),
+        "SECRETTOKEN",
+        "Authorization",
+        "Bearer",
+        "v=0",
+        "a=rtpmap",
+        "set-cookie",
+        "SECRETCOOKIE",
+    ):
+        assert secret not in rendered, secret
+
+
+JSON_ERROR = (
+    b'{"errors":[{"title":"Forbidden","code":"AccessDenied","detail":"SECRETDETAIL '
+    b'access_token=SECRETBODYTOKEN","meta":{"k":"SECRETMETA"}}],"message":"SECRETMSG",'
+    b'"refresh_token":"eyJhbGciOiJSUzI1NiJ9.SECRETJWT"}'
+)
+
+
+async def test_a_delete_403_is_still_forbidden_and_reports_only_safe_fields(
+    settings: Settings,
+) -> None:
+    error, event, seen, logs = await _delete_failure(
+        settings,
+        httpx.Response(
+            403,
+            content=JSON_ERROR,
+            headers={
+                "content-type": "application/json",
+                "x-amzn-requestid": "req-teardown-1",
+                "set-cookie": "session=SECRETCOOKIE",
+                "www-authenticate": 'Bearer error="SECRETDETAIL"',
+            },
+        ),
+    )
+    # Behaviour unchanged: same category, not ambiguous, one request, no retry.
+    assert error.category == "forbidden" and error.operation == "whep_delete"
+    assert error.status_code == 403 and not isinstance(error, RingAmbiguousResult)
+    assert str(error) == "Ring operation failed: whep_delete/forbidden"
+    assert [request.method for request in seen] == ["DELETE"]
+    assert set(event) <= FAILURE_EVENT_KEYS
+    assert event == {
+        "event": "ring_provider_request_failed",
+        "log_level": "warning",
+        "operation": "whep_delete",
+        "category": "forbidden",
+        "status_code": 403,
+        "provider_request_id": "req-teardown-1",
+        "error_title": "Forbidden",
+        "response_content_type_class": "json",
+        "response_body_present": True,
+        "response_body_length": len(JSON_ERROR),
+        "response_body_truncated": False,
+    }
+    assert error.error_title == "Forbidden"
+    _assert_nothing_sensitive(repr(logs) + str(error) + repr(error))
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "title", "type_class"),
+    [
+        (
+            b'{"errors":[{"code":"AccessDenied","detail":"SECRETDETAIL"}]}',
+            "application/json",
+            "AccessDenied",
+            "json",
+        ),
+        (
+            b'{"message":"SECRETMSG","access_token=SECRETBODYTOKEN":1}',
+            "application/json",
+            None,
+            "json",
+        ),
+        (b'{"errors":[{"title":"Forbid', "application/json", None, "json"),
+        (b'{"errors": [SECRETDETAIL', "application/problem+json", None, "json"),
+        (
+            b"<html><body>SECRETDETAIL access_token=SECRETBODYTOKEN</body></html>",
+            "text/html; charset=utf-8",
+            None,
+            "html",
+        ),
+        (b"Forbidden: SECRETMSG eyJhbGciOiJSUzI1NiJ9.SECRETJWT", "text/plain", None, "text"),
+        (b"\x00\xffSECRETDETAIL", "application/octet-stream", None, "other"),
+        (b"SECRETMSG", None, None, "other"),
+        (b"", "application/json", None, "empty"),
+        (
+            b'{"errors":[{"title":"\\u0000Bad\\u007f title"}]}',
+            "application/json",
+            "Bad title",
+            "json",
+        ),
+    ],
+)
+async def test_provider_error_bodies_yield_only_the_shared_safe_title(
+    settings: Settings, body: bytes, content_type: str | None, title: str | None, type_class: str
+) -> None:
+    headers = {"content-type": content_type} if content_type else {}
+    error, event, _, logs = await _delete_failure(
+        settings, httpx.Response(403, content=body, headers=headers)
+    )
+    assert error.category == "forbidden"
+    assert event["error_title"] == title
+    assert event["response_content_type_class"] == type_class
+    assert event["response_body_present"] is bool(body)
+    assert event["response_body_length"] == len(body)
+    assert event["response_body_truncated"] is False
+    assert set(event) <= FAILURE_EVENT_KEYS
+    _assert_nothing_sensitive(repr(logs) + str(error) + repr(error))
+
+
+def test_the_whep_title_policy_is_the_generic_one() -> None:
+    from veotrex_api.ring_client import safe_error_summary, whep_response_diagnostics
+
+    for body in (JSON_ERROR, b'{"errors":[{"code":"X"}]}', b'{"a":1}', b"[1]", b"nope"):
+        generic, _ = safe_error_summary(httpx.Response(403, content=body))
+        whep = whep_response_diagnostics(httpx.Headers(), body, truncated=False)["error_title"]
+        assert whep == generic
+
+
+async def test_an_oversized_error_body_is_capped_and_never_parsed(settings: Settings) -> None:
+    body = b'{"errors":[{"title":"SECRETDETAIL"}],"pad":"' + b"x" * 80_000 + b'"}'
+    error, event, _, logs = await _delete_failure(
+        settings, httpx.Response(403, content=body, headers={"content-type": "application/json"})
+    )
+    assert error.category == "forbidden"
+    assert event["response_body_truncated"] is True
+    assert event["response_body_length"] <= 65_536
+    assert event["error_title"] is None, "a truncated document is never parsed"
+    _assert_nothing_sensitive(repr(logs))
+
+
+@pytest.mark.parametrize(
+    ("status", "category", "ambiguous"),
+    [
+        (401, "unauthorized", False),
+        (429, "rate_limited", False),
+        (400, "provider_rejected", False),
+        (500, "provider_unavailable", True),
+        (307, "redirect_refused", False),
+    ],
+)
+async def test_delete_categories_are_unchanged(
+    settings: Settings, status: int, category: str, ambiguous: bool
+) -> None:
+    error, event, seen, logs = await _delete_failure(
+        settings,
+        httpx.Response(
+            status,
+            content=JSON_ERROR,
+            headers={"content-type": "application/json", "location": "https://evil.example/x"},
+        ),
+    )
+    assert error.category == category and event["category"] == category
+    assert isinstance(error, RingAmbiguousResult) is ambiguous
+    # A redirect is refused, never followed: exactly one request, to Ring.
+    assert [(r.method, r.url.host) for r in seen] == [("DELETE", "api.amazonvision.com")]
+    _assert_nothing_sensitive(repr(logs))
+    assert "evil" not in repr(logs)
+
+
+async def test_post_failures_carry_the_same_safe_diagnostics_and_behave_as_before(
+    settings: Settings,
+) -> None:
+    client, seen = client_with(
+        settings,
+        lambda _: httpx.Response(
+            403, content=JSON_ERROR, headers={"content-type": "application/json"}
+        ),
+    )
+    with capture_logs() as logs, pytest.raises(RingClientError) as caught:
+        await client.create_whep_session(
+            TEARDOWN_TOKEN, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536
+        )
+    assert caught.value.category == "forbidden"
+    assert str(caught.value) == "Ring operation failed: whep_create/forbidden"
+    assert [request.method for request in seen] == ["POST"]
+    [event] = [entry for entry in logs if entry["event"] == "ring_provider_request_failed"]
+    assert event["operation"] == "whep_create" and event["error_title"] == "Forbidden"
+    assert set(event) <= FAILURE_EVENT_KEYS
+    _assert_nothing_sensitive(repr(logs) + repr(caught.value))
+
+
+async def test_post_2xx_failures_keep_their_original_event_shape(settings: Settings) -> None:
+    client, _ = client_with(
+        settings,
+        lambda _: httpx.Response(201, content=b"not sdp", headers={"location": SECRET_PATH}),
+    )
+    with capture_logs() as logs, pytest.raises(RingClientError):
+        await client.create_whep_session(
+            TEARDOWN_TOKEN, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536
+        )
+    failures = [e for e in logs if e["event"] == "ring_provider_request_failed"]
+    assert [e["category"] for e in failures] == ["malformed_answer"]
+    assert "response_body_length" not in failures[0], "only non-success responses are described"
+
+
+# -------------------------------------------- DELETE request preservation (tests only)
+async def test_delete_targets_the_validated_location_byte_for_byte_with_the_bearer(
+    settings: Settings,
+) -> None:
+    location = f"https://api.amazonvision.com{SECRET_PATH}?{OPAQUE_QUERY}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(
+            201, content=ANSWER, headers={"content-type": "application/sdp", "location": location}
+        )
+
+    client, seen = client_with(settings, handler)
+    session = await client.create_whep_session(
+        TEARDOWN_TOKEN, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536
+    )
+    # Validation preserves path and query exactly: no parsing, re-ordering or re-encoding.
+    assert session.session_url == TEARDOWN_URL
+    await client.delete_whep_session(TEARDOWN_TOKEN, session.session_url)
+    post, delete = seen
+    assert delete.method == "DELETE"
+    assert delete.url.scheme == "https" and delete.url.host == "api.amazonvision.com"
+    assert delete.url.port in (None, 443)
+    # httpx request construction sends exactly the validated path and query bytes.
+    assert delete.url.raw_path == f"{SECRET_PATH}?{OPAQUE_QUERY}".encode()
+    assert delete.url.query == OPAQUE_QUERY.encode()
+    assert b"%2F" in delete.url.raw_path, "percent-escapes are forwarded, not decoded"
+    # Teardown still authenticates exactly as Ring documents it.
+    assert delete.headers["authorization"] == f"Bearer {TEARDOWN_TOKEN.get_secret_value()}"
+    assert delete.headers["accept"] == "application/sdp"
+    assert "content-type" not in delete.headers and delete.content == b""
+    assert post.headers["authorization"] == delete.headers["authorization"]
+
+
+async def test_delete_never_follows_a_redirect_with_the_bearer(settings: Settings) -> None:
+    client, seen = client_with(
+        settings,
+        lambda request: httpx.Response(
+            302 if request.url.host == "api.amazonvision.com" else 204,
+            headers={"location": f"https://api.amazonvision.com{SECRET_PATH}-other"},
+        ),
+    )
+    with pytest.raises(RingClientError) as caught:
+        await client.delete_whep_session(TEARDOWN_TOKEN, TEARDOWN_URL)
+    assert caught.value.category == "redirect_refused"
+    assert len(seen) == 1, "a same-origin redirect is not followed either"

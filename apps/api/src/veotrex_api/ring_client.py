@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import hashlib
+import json
 import random
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -105,6 +106,44 @@ def validate_sdp_answer(body: bytes, content_type: str | None, max_bytes: int) -
         if not line.startswith("m=video ") and len(parts) > 1 and parts[1] != "0":
             raise ValueError("answer accepts non-video media")
     return text_value
+
+
+# Diagnostics for a non-success WHEP response (teardown hotfix). Everything below is derived,
+# bounded and secret-free: a content-type CLASS (never the header), body presence and a capped
+# length (never the body), and the shared ``_error_document_title`` policy for JSON errors.
+_MAX_DIAGNOSTIC_BODY_LENGTH = 65_536
+
+
+def _content_type_class(content_type: str | None, body: bytes) -> str:
+    if not body:
+        return "empty"
+    kind = (content_type or "").split(";", 1)[0].strip().lower()
+    if kind == "application/json" or kind.endswith("+json"):
+        return "json"
+    if kind == "text/html":
+        return "html"
+    if kind.startswith("text/"):
+        return "text"
+    return "other"
+
+
+def whep_response_diagnostics(
+    headers: httpx.Headers, body: bytes, *, truncated: bool
+) -> dict[str, str | int | bool | None]:
+    """Safe facts about a failed WHEP response body. Never the body, never a header value."""
+    title: str | None = None
+    if body and not truncated:
+        try:
+            title = _error_document_title(json.loads(body.decode("utf-8", errors="strict")))
+        except (ValueError, UnicodeError, RecursionError):
+            title = None
+    return {
+        "error_title": title,
+        "response_content_type_class": _content_type_class(headers.get("content-type"), body),
+        "response_body_present": bool(body),
+        "response_body_length": min(len(body), _MAX_DIAGNOSTIC_BODY_LENGTH),
+        "response_body_truncated": truncated,
+    }
 
 
 def _safe_request_id(headers: httpx.Headers) -> str | None:
@@ -289,6 +328,22 @@ def user_agent(app_version: str) -> str:
     return f"{USER_AGENT_PRODUCT}/{version[:32] or 'unknown'}"
 
 
+def _error_document_title(payload: object) -> str | None:
+    """``errors[0].title`` (or ``code``) of a parsed JSON:API error document, printable ASCII
+    and bounded; None for anything else. The single policy for what a provider error may say,
+    shared by ``safe_error_summary`` and the WHEP transport."""
+    if not isinstance(payload, dict):
+        return None
+    errors = payload.get("errors")
+    first = errors[0] if isinstance(errors, list) and errors else None
+    if isinstance(first, dict):
+        for key in ("title", "code"):
+            value = first.get(key)
+            if isinstance(value, str) and value.strip():
+                return "".join(ch for ch in value if 32 <= ord(ch) <= 126)[:_ERROR_TITLE_MAX]
+    return None
+
+
 def safe_error_summary(response: httpx.Response) -> tuple[str | None, str | None]:
     """The only two things ever kept from a failed provider response.
 
@@ -297,20 +352,11 @@ def safe_error_summary(response: httpx.Response) -> tuple[str | None, str | None
     yields None. ``request_id``: the first correlation header Ring's gateway supplies, bounded.
     Tokens, nonces, account ids and profile attributes never appear in either field.
     """
-    title: str | None = None
     try:
         payload = response.json()
     except ValueError:
         payload = None
-    if isinstance(payload, dict):
-        errors = payload.get("errors")
-        first = errors[0] if isinstance(errors, list) and errors else None
-        if isinstance(first, dict):
-            for key in ("title", "code"):
-                value = first.get(key)
-                if isinstance(value, str) and value.strip():
-                    title = "".join(ch for ch in value if 32 <= ord(ch) <= 126)[:_ERROR_TITLE_MAX]
-                    break
+    title = _error_document_title(payload)
     request_id: str | None = None
     for header in _REQUEST_ID_HEADERS:
         value = response.headers.get(header)
@@ -864,9 +910,11 @@ class RingClient:
         status_code: int | None,
         headers: httpx.Headers | None,
         error_type: type[RingClientError] = RingClientError,
+        response: dict[str, str | int | bool | None] | None = None,
     ) -> RingClientError:
-        """Operation, category, status and a gateway correlation id. Never a header value, an
-        SDP body, a Location or a token."""
+        """Operation, category, status and a gateway correlation id - plus, for a non-success
+        response, the bounded ``whep_response_diagnostics``. Never a header value, a body, an
+        SDP, a Location or a token."""
         request_id = _safe_request_id(headers) if headers is not None else None
         structlog.get_logger().warning(
             "ring_provider_request_failed",
@@ -874,8 +922,16 @@ class RingClient:
             category=category,
             status_code=status_code,
             provider_request_id=request_id,
+            **(response or {}),
         )
-        return error_type(operation, category, status_code, provider_request_id=request_id)
+        title = response.get("error_title") if response else None
+        return error_type(
+            operation,
+            category,
+            status_code,
+            error_title=title if isinstance(title, str) else None,
+            provider_request_id=request_id,
+        )
 
     async def _whep_send(
         self,
@@ -936,27 +992,54 @@ class RingClient:
         )
 
     def _whep_status_failure(
-        self, operation: str, status_code: int, headers: httpx.Headers
+        self,
+        operation: str,
+        status_code: int,
+        headers: httpx.Headers,
+        body: bytes = b"",
+        *,
+        truncated: bool = False,
     ) -> RingClientError:
+        # The categories are exactly as before; only the safe diagnostics are new.
+        response = whep_response_diagnostics(headers, body, truncated=truncated)
         if status_code == 401:
-            return self._whep_failure(operation, "unauthorized", status_code, headers)
+            return self._whep_failure(
+                operation, "unauthorized", status_code, headers, response=response
+            )
         if status_code == 403:
-            return self._whep_failure(operation, "forbidden", status_code, headers)
+            return self._whep_failure(
+                operation, "forbidden", status_code, headers, response=response
+            )
         if status_code == 404:
-            return self._whep_failure(operation, "not_found", status_code, headers)
+            return self._whep_failure(
+                operation, "not_found", status_code, headers, response=response
+            )
         if status_code == 429:
-            return self._whep_failure(operation, "rate_limited", status_code, headers)
+            return self._whep_failure(
+                operation, "rate_limited", status_code, headers, response=response
+            )
         if 300 <= status_code < 400:
             # Never follow a provider redirect with a bearer token attached.
-            return self._whep_failure(operation, "redirect_refused", status_code, headers)
+            return self._whep_failure(
+                operation, "redirect_refused", status_code, headers, response=response
+            )
         if 400 <= status_code < 500:
-            return self._whep_failure(operation, "provider_rejected", status_code, headers)
+            return self._whep_failure(
+                operation, "provider_rejected", status_code, headers, response=response
+            )
         if status_code >= 500:
             # A 5xx after the request reached Ring cannot prove no session exists.
             return self._whep_failure(
-                operation, "provider_unavailable", status_code, headers, RingAmbiguousResult
+                operation,
+                "provider_unavailable",
+                status_code,
+                headers,
+                RingAmbiguousResult,
+                response=response,
             )
-        return self._whep_failure(operation, "unexpected_status", status_code, headers)
+        return self._whep_failure(
+            operation, "unexpected_status", status_code, headers, response=response
+        )
 
     async def create_whep_session(
         self,
@@ -981,7 +1064,9 @@ class RingClient:
             ambiguous_on_transport_failure=True,
         )
         if not 200 <= status_code < 300:
-            raise self._whep_status_failure(operation, status_code, headers)
+            raise self._whep_status_failure(
+                operation, status_code, headers, payload, truncated=oversized
+            )
         raw_location = headers.get("location")
         session_url: str | None = None
         location_error: RingClientError | None = None
@@ -1023,7 +1108,7 @@ class RingClient:
         """Tear down one validated session resource. 2xx and 404 both mean it is gone."""
         operation = "whep_delete"
         url = self.validated_whep_location(session_url)
-        status_code, headers, _payload, _oversized = await self._whep_send(
+        status_code, headers, payload, oversized = await self._whep_send(
             operation,
             "DELETE",
             url,
@@ -1034,4 +1119,6 @@ class RingClient:
         )
         if 200 <= status_code < 300 or status_code == 404:
             return
-        raise self._whep_status_failure(operation, status_code, headers)
+        raise self._whep_status_failure(
+            operation, status_code, headers, payload, truncated=oversized
+        )
