@@ -28,6 +28,7 @@ from veotrex_edge_agent.live.preview import (
     PreviewConfig,
     PreviewRenderer,
 )
+from veotrex_edge_agent.live.ring import RingWhepSource
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime
 from veotrex_edge_agent.live.server import (
     DEFAULT_HOST,
@@ -44,7 +45,7 @@ from veotrex_edge_agent.recorded.regions import (
 )
 from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
 
-SOURCE_CHOICES = ("camera", "synthetic")
+SOURCE_CHOICES = ("camera", "synthetic", "ring")
 DETECTOR_CHOICES = ("yolox", "none")
 
 
@@ -57,6 +58,19 @@ def add_discover_arguments(command: argparse.ArgumentParser) -> argparse.Argumen
 
 def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
     command.add_argument("--source", choices=SOURCE_CHOICES, default="camera")
+    command.add_argument(
+        "--ring-camera",
+        default=None,
+        help="operator's label for the Ring camera to stream, with --source ring",
+    )
+    command.add_argument(
+        "--ring-media-qualification",
+        action="store_true",
+        help=(
+            "LOCAL ONLY: drive the Ring media path from a synthetic encoded stream instead of "
+            "a Ring session. Qualifies decode and frame delivery; contacts nothing"
+        ),
+    )
     command.add_argument(
         "--device",
         default="0",
@@ -173,6 +187,8 @@ def _source(arguments: argparse.Namespace) -> Any:
             fps=arguments.fps,
             interval_seconds=1.0 / max(arguments.fps, 1.0),
         )
+    if arguments.source == "ring":
+        return _ring_source(arguments)
     return LocalCameraSource(
         arguments.device,
         width=arguments.width,
@@ -181,6 +197,36 @@ def _source(arguments: argparse.Namespace) -> Any:
         view=arguments.view,
         pixel_format=arguments.pixel_format or None,
     )
+
+
+def _ring_source(arguments: argparse.Namespace) -> Any:
+    """Build a Ring live source, or refuse in a way that says exactly what is missing.
+
+    There is deliberately no path here that reaches Ring. Account linking is blocked upstream by
+    an Amazon-side IP-level rejection on ``/v1/users/me``; nothing in this stage works around
+    that, and a demo that silently produced a picture from somewhere else would be worse than
+    one that stops.
+    """
+    camera_id = arguments.ring_camera
+    if not camera_id:
+        raise LiveSourceError("ring_camera_id_required")
+    if arguments.ring_media_qualification:
+        # Explicitly named, never a fallback: the operator asked for the local media
+        # qualification, and what they get is synthetic imagery through the real decode path.
+        from veotrex_edge_agent.live.ring_fakes import FakeRingSessionProvider
+        from veotrex_edge_agent.live.ring_gst import GstFrameReader
+
+        print("Ring MEDIA QUALIFICATION: synthetic encoded stream, no Ring session, no network.")
+        return RingWhepSource(
+            camera_id,
+            FakeRingSessionProvider(),
+            GstFrameReader(
+                source="synthetic", width=arguments.width, height=arguments.height
+            ),
+        )
+    # The real path needs an authorized session provider from the existing credential
+    # boundary. Until the account link completes there is none to hand over.
+    raise LiveSourceError("ring_session_provider_unavailable")
 
 
 def _detector(arguments: argparse.Namespace) -> Any:
@@ -194,6 +240,16 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
         source = _source(arguments)
     except LiveSourceError as exc:
         print(f"camera rejected: {exc.category}", file=sys.stderr)
+        if exc.category == "ring_session_provider_unavailable":
+            print(
+                "No authorized Ring session provider is configured. Ring account linking is\n"
+                "blocked upstream (GET /v1/users/me returns 406, under review by Amazon as an\n"
+                "IP-level Ring Security issue); this build does not work around it.\n"
+                "To qualify the media path locally without Ring, add "
+                "--ring-media-qualification.\n"
+                "See docs/runbooks/ring-live-demo-qualification.md.",
+                file=sys.stderr,
+            )
         return 2
     try:
         detector = _detector(arguments)
