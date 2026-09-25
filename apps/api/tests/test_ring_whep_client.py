@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -12,10 +13,13 @@ from tests_edge_fixtures import ANSWER, OFFER, Secrets
 
 from veotrex_api.config import Settings
 from veotrex_api.ring_client import (
+    WHEP_LOCATION_DIAGNOSTIC_FIELDS,
     RingAmbiguousResult,
     RingClient,
     RingClientError,
     RingWhepSession,
+    WhepLocationRejected,
+    WhepLocationRejection,
     validate_sdp_answer,
 )
 
@@ -232,3 +236,228 @@ def test_answer_validation_accepts_video_and_rejected_other_media() -> None:
     assert validate_sdp_answer(
         b"v=0\r\nm=video 9 RTP 96\r\nm=audio 0 RTP/AVP 0\r\n", None, 65536
     ).startswith("v=0")
+
+
+# ------------------------------------------------ Location rejection diagnostics (hotfix)
+# Distinctive values so any leak of an identifier into a log or exception is detectable.
+SECRET_DEVICE = "dev-SECRETDEVICE-77"  # noqa: S105 - synthetic
+SECRET_SESSION = "sess-SECRETSESSION-4242"  # noqa: S105 - synthetic
+SECRET_PATH = f"/v1/devices/{SECRET_DEVICE}/media/streaming/whep/sessions/{SECRET_SESSION}"
+SAFE_EVENT_KEYS = {
+    "event",
+    "log_level",
+    "operation",
+    "status_code",
+    "provider_request_id",
+    "reason",
+} | set(WHEP_LOCATION_DIAGNOSTIC_FIELDS)
+
+
+def test_valid_absolute_and_relative_locations_still_pass(settings: Settings) -> None:
+    client, seen = client_with(settings, lambda _: httpx.Response(204))
+    expected = f"https://api.amazonvision.com:443{SECRET_PATH}"
+    for location in (
+        f"https://api.amazonvision.com{SECRET_PATH}",
+        f"https://api.amazonvision.com:443{SECRET_PATH}",
+        f"https://API.amazonvision.com{SECRET_PATH}",
+        SECRET_PATH,
+    ):
+        assert client.validated_whep_location(location, device_id=SECRET_DEVICE) == expected
+    assert client.validated_whep_location(SECRET_PATH + "?a=1&b=2") == expected + "?a=1&b=2"
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("location", "device", "reason", "expected"),
+    [
+        (12345, None, "invalid_type_or_length", {}),
+        ("", None, "invalid_type_or_length", {}),
+        ("/" + "x" * 1024, None, "invalid_type_or_length", {}),
+        (SECRET_PATH + " ", None, "non_printable", {}),
+        (SECRET_PATH + "\x7f", None, "non_printable", {}),
+        (SECRET_PATH + "#SECRETFRAG", None, "fragment_present", {}),
+        ("https://api.amazonvision.com:99999" + SECRET_PATH, None, "malformed_absolute_url", {}),
+        ("https://api.amazonvision.com:x" + SECRET_PATH, None, "malformed_absolute_url", {}),
+        ("http://api.amazonvision.com" + SECRET_PATH, None, "non_https", {"absolute": True}),
+        ("ftp://api.amazonvision.com" + SECRET_PATH, None, "non_https", {}),
+        ("https://u@api.amazonvision.com" + SECRET_PATH, None, "userinfo_present", {}),
+        (
+            "https://evil.example" + SECRET_PATH,
+            None,
+            "origin_mismatch",
+            {"origin_match": False, "absolute": True},
+        ),
+        ("https://api.amazonvision.com:8443" + SECRET_PATH, None, "origin_mismatch", {}),
+        ("https://api.amazonvision.com.evil.example" + SECRET_PATH, None, "origin_mismatch", {}),
+        (
+            "//evil.example" + SECRET_PATH,
+            None,
+            "path_shape_mismatch",
+            {"absolute": False, "path_segment_count": 10, "session_tail_length": 23},
+        ),
+        (
+            SECRET_PATH + "/../../x",
+            None,
+            "path_shape_mismatch",
+            {"contains_slash": True, "session_tail_length": len(SECRET_SESSION) + 8},
+        ),
+        (
+            f"/v1/devices/{SECRET_DEVICE}/media/streaming/whep/sessions/",
+            None,
+            "path_shape_mismatch",
+            {"trailing_slash": True, "session_tail_length": 0, "path_segment_count": 8},
+        ),
+        (SECRET_PATH + ":1", None, "path_shape_mismatch", {"contains_colon": True}),
+        (SECRET_PATH + "+1", None, "path_shape_mismatch", {"contains_plus": True}),
+        (SECRET_PATH + "=1", None, "path_shape_mismatch", {"contains_equals": True}),
+        (
+            SECRET_PATH + "!",
+            None,
+            "path_shape_mismatch",
+            {"contains_other_outside_current_allowlist": True, "contains_colon": False},
+        ),
+        (
+            "https://api.amazonvision.com/v1/somewhere/else?x=1",
+            None,
+            "path_shape_mismatch",
+            {"absolute": True, "session_tail_length": None, "query_present": True},
+        ),
+        (SECRET_PATH + "?x=<y>", None, "query_shape_mismatch", {"query_present": True}),
+        (
+            "/v1/devices/other-device/media/streaming/whep/sessions/" + SECRET_SESSION,
+            SECRET_DEVICE,
+            "device_scope_mismatch",
+            {"absolute": False},
+        ),
+    ],
+)
+def test_every_rejection_is_unchanged_and_carries_only_a_safe_reason(
+    settings: Settings, location: object, device: str | None, reason: str, expected: dict[str, Any]
+) -> None:
+    client, seen = client_with(settings, lambda _: httpx.Response(204))
+    with pytest.raises(RingClientError) as caught:
+        client.validated_whep_location(location, device_id=device)
+    error = caught.value
+    # Behaviour is exactly what it was: the same error type contract, category and message.
+    assert error.category == "invalid_location" and error.operation == "whep_location"
+    assert str(error) == "Ring operation failed: whep_location/invalid_location"
+    assert not isinstance(error, RingAmbiguousResult)
+    assert isinstance(error, WhepLocationRejected)
+    assert error.reason == WhepLocationRejection(reason)
+    assert set(error.diagnostics) <= WHEP_LOCATION_DIAGNOSTIC_FIELDS
+    for value in error.diagnostics.values():
+        assert value is None or isinstance(value, bool | int)
+        assert not isinstance(value, int) or isinstance(value, bool) or 0 <= value <= 1024
+    for key, value in expected.items():
+        assert error.diagnostics[key] == value, key
+    rendered = f"{error!s} {error!r} {error.diagnostics!r} {error.reason!r}"
+    for secret in (SECRET_DEVICE, SECRET_SESSION, "evil", "amazonvision", "8443", "SECRETFRAG"):
+        assert secret not in rendered
+    assert seen == [], "validation never makes a request"
+
+
+def test_path_diagnostics_are_only_emitted_for_path_shape_mismatches(settings: Settings) -> None:
+    client, _ = client_with(settings, lambda _: httpx.Response(204))
+    with pytest.raises(WhepLocationRejected) as caught:
+        client.validated_whep_location("https://evil.example" + SECRET_PATH)
+    assert caught.value.diagnostics == {"absolute": True, "origin_match": False}
+
+
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        ("https://evil.example" + SECRET_PATH, "origin_mismatch"),
+        ("https://api.amazonvision.com:8443" + SECRET_PATH, "origin_mismatch"),
+        ("http://api.amazonvision.com" + SECRET_PATH, "non_https"),
+        ("https://u:p@api.amazonvision.com" + SECRET_PATH, "userinfo_present"),
+        (SECRET_PATH + "#SECRETFRAG", "fragment_present"),
+        (SECRET_PATH + "/../../x", "path_shape_mismatch"),
+        (SECRET_PATH + ":443", "path_shape_mismatch"),
+        (SECRET_PATH + "?x=<y>", "query_shape_mismatch"),
+        (
+            "/v1/devices/other/media/streaming/whep/sessions/" + SECRET_SESSION,
+            "device_scope_mismatch",
+        ),
+        ("https://api.amazonvision.com:99999" + SECRET_PATH, "malformed_absolute_url"),
+    ],
+)
+async def test_a_refused_location_on_a_201_logs_one_safe_event_and_is_never_contacted(
+    settings: Settings, location: str, reason: str
+) -> None:
+    token = SecretStr("synthetic-ring-access-SECRETTOKEN")
+    client, seen = client_with(
+        settings,
+        lambda _: httpx.Response(
+            201,
+            content=ANSWER,
+            headers={
+                "content-type": "application/sdp",
+                "location": location,
+                "x-amzn-requestid": "req-diag-1",
+            },
+        ),
+    )
+    with capture_logs() as logs, pytest.raises(RingClientError) as caught:
+        await client.create_whep_session(token, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536)
+    # Behaviour unchanged: the same error, and only the POST was ever sent.
+    assert caught.value.category == "invalid_location"
+    assert [request.method for request in seen] == ["POST"]
+    diagnostics = [entry for entry in logs if entry["event"] == "ring_whep_location_rejected"]
+    assert len(diagnostics) == 1, "exactly one diagnostic event"
+    [event] = diagnostics
+    assert set(event) <= SAFE_EVENT_KEYS
+    assert event["operation"] == "whep_create" and event["status_code"] == 201
+    assert event["reason"] == reason and event["provider_request_id"] == "req-diag-1"
+    generic = [entry for entry in logs if entry["event"] == "ring_provider_request_failed"]
+    assert len(generic) == 1 and generic[0]["category"] == "invalid_location"
+    rendered = repr(logs) + str(caught.value) + repr(caught.value)
+    for secret in (
+        location,
+        SECRET_DEVICE,
+        SECRET_SESSION,
+        token.get_secret_value(),
+        "SECRETTOKEN",
+        "Authorization",
+        "Bearer",
+        "v=0",
+        "a=rtpmap",
+        "m=video",
+        "evil",
+        "amazonvision",
+        "SECRETFRAG",
+    ):
+        assert secret not in rendered, secret
+
+
+async def test_a_valid_location_emits_no_rejection_event(settings: Settings) -> None:
+    client, seen = client_with(
+        settings,
+        lambda _: httpx.Response(
+            201,
+            content=ANSWER,
+            headers={"content-type": "application/sdp", "location": SECRET_PATH},
+        ),
+    )
+    with capture_logs() as logs:
+        session = await client.create_whep_session(
+            TOKEN, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536
+        )
+    assert session.session_url == f"https://api.amazonvision.com:443{SECRET_PATH}"
+    assert [entry for entry in logs if entry["event"] == "ring_whep_location_rejected"] == []
+    assert [request.method for request in seen] == ["POST"]
+
+
+async def test_non_2xx_responses_and_delete_never_emit_the_location_diagnostic(
+    settings: Settings,
+) -> None:
+    client, _ = client_with(
+        settings, lambda _: httpx.Response(503, headers={"location": "https://evil.example/x"})
+    )
+    with capture_logs() as logs, pytest.raises(RingClientError):
+        await client.create_whep_session(TOKEN, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536)
+    client, seen = client_with(settings, lambda _: httpx.Response(204))
+    with capture_logs() as delete_logs, pytest.raises(RingClientError):
+        await client.delete_whep_session(TOKEN, "https://evil.example" + SECRET_PATH)
+    for entries in (logs, delete_logs):
+        assert [e for e in entries if e["event"] == "ring_whep_location_rejected"] == []
+    assert seen == [], "an untrusted teardown resource is never contacted"

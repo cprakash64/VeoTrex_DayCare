@@ -5,6 +5,7 @@ import random
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any
 from urllib.parse import quote, urlencode, urljoin, urlparse, urlsplit
 
@@ -131,6 +132,93 @@ class RingClientError(Exception):
 
 class RingAmbiguousResult(RingClientError):
     pass
+
+
+# Why a WHEP Location was refused (diagnostics only; the decision itself is unchanged). A finite
+# vocabulary, so a log line can say which rule fired without carrying any provider value.
+class WhepLocationRejection(StrEnum):
+    INVALID_TYPE_OR_LENGTH = "invalid_type_or_length"
+    NON_PRINTABLE = "non_printable"
+    FRAGMENT_PRESENT = "fragment_present"
+    MALFORMED_ABSOLUTE_URL = "malformed_absolute_url"
+    NON_HTTPS = "non_https"
+    USERINFO_PRESENT = "userinfo_present"
+    ORIGIN_MISMATCH = "origin_mismatch"
+    PATH_SHAPE_MISMATCH = "path_shape_mismatch"
+    QUERY_SHAPE_MISMATCH = "query_shape_mismatch"
+    DEVICE_SCOPE_MISMATCH = "device_scope_mismatch"
+
+
+# The only structural facts a rejection may report. Every value is a bool, a bounded int or
+# None: never a hostname, scheme, port, path, query, device id or session id.
+WHEP_LOCATION_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "absolute",
+        "origin_match",
+        "path_segment_count",
+        "trailing_slash",
+        "query_present",
+        "session_tail_length",
+        "contains_colon",
+        "contains_slash",
+        "contains_plus",
+        "contains_equals",
+        "contains_other_outside_current_allowlist",
+    }
+)
+_SESSION_COLLECTION_MARKER = "/media/streaming/whep/sessions/"
+_SESSION_TAIL_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%-"
+)
+_MAX_DIAGNOSTIC_SEGMENTS = 64
+
+
+def _path_shape(path: str, *, absolute: bool, query: str) -> dict[str, bool | int | None]:
+    """Structure of a refused path, without any of its text.
+
+    The session tail is whatever follows the last WHEP session-collection marker; only its
+    length and which character classes it contains are reported, never the characters.
+    """
+    segments = path.split("/")[1:] if path.startswith("/") else path.split("/")
+    marker = path.rfind(_SESSION_COLLECTION_MARKER)
+    tail = path[marker + len(_SESSION_COLLECTION_MARKER) :] if marker >= 0 else None
+    shape: dict[str, bool | int | None] = {
+        "absolute": absolute,
+        "path_segment_count": min(len(segments), _MAX_DIAGNOSTIC_SEGMENTS),
+        "trailing_slash": path.endswith("/"),
+        "query_present": bool(query),
+        "session_tail_length": None if tail is None else min(len(tail), _MAX_LOCATION_CHARS),
+        "contains_colon": False,
+        "contains_slash": False,
+        "contains_plus": False,
+        "contains_equals": False,
+        "contains_other_outside_current_allowlist": False,
+    }
+    if tail is not None:
+        shape["contains_colon"] = ":" in tail
+        shape["contains_slash"] = "/" in tail
+        shape["contains_plus"] = "+" in tail
+        shape["contains_equals"] = "=" in tail
+        shape["contains_other_outside_current_allowlist"] = any(
+            character not in _SESSION_TAIL_ALLOWED and character not in ":/+=" for character in tail
+        )
+    return shape
+
+
+class WhepLocationRejected(RingClientError):
+    """``invalid_location``, plus a safe reason and structural metadata for diagnosis.
+
+    A ``RingClientError`` with the same operation and category as before, so every caller's
+    behaviour is unchanged. The message never includes the reason or the metadata.
+    """
+
+    def __init__(self, reason: WhepLocationRejection, **diagnostics: bool | int | None) -> None:
+        super().__init__("whep_location", "invalid_location")
+        unknown = set(diagnostics) - WHEP_LOCATION_DIAGNOSTIC_FIELDS
+        if unknown:  # pragma: no cover - programming error, never provider-driven
+            raise ValueError("unapproved diagnostic field")
+        self.reason = reason
+        self.diagnostics: dict[str, bool | int | None] = dict(diagnostics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,32 +751,47 @@ class RingClient:
         A Location on another origin is refused rather than followed: the teardown request
         carries the Ring bearer token, which must never be sent anywhere else.
         """
-        operation = "whep_location"
+        # Every refusal below is the same ``invalid_location`` it always was; the reason code
+        # exists only to be logged. The checks and their order are unchanged.
+        reason = WhepLocationRejection
         if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_LOCATION_CHARS:
-            raise RingClientError(operation, "invalid_location")
-        if any(not 32 < ord(character) < 127 for character in raw) or "#" in raw:
-            raise RingClientError(operation, "invalid_location")
+            raise WhepLocationRejected(reason.INVALID_TYPE_OR_LENGTH)
+        if any(not 32 < ord(character) < 127 for character in raw):
+            raise WhepLocationRejected(reason.NON_PRINTABLE)
+        if "#" in raw:
+            raise WhepLocationRejected(reason.FRAGMENT_PRESENT)
         scheme, host, port = self._expected_api_origin()
         expected_port = port or 443
-        if raw.startswith("/"):
+        absolute = not raw.startswith("/")
+        if not absolute:
             path, _, query = raw.partition("?")
         else:
             parts = urlsplit(raw)
             try:
                 observed_port = parts.port or (443 if parts.scheme == "https" else None)
             except ValueError:
-                raise RingClientError(operation, "invalid_location") from None
-            if parts.scheme != "https" or "@" in parts.netloc:
-                raise RingClientError(operation, "invalid_location")
+                raise WhepLocationRejected(reason.MALFORMED_ABSOLUTE_URL, absolute=True) from None
+            if parts.scheme != "https":
+                raise WhepLocationRejected(reason.NON_HTTPS, absolute=True)
+            if "@" in parts.netloc:
+                raise WhepLocationRejected(reason.USERINFO_PRESENT, absolute=True)
             if (parts.hostname or "").lower() != host.lower() or observed_port != expected_port:
-                raise RingClientError(operation, "invalid_location")
+                raise WhepLocationRejected(
+                    reason.ORIGIN_MISMATCH, absolute=True, origin_match=False
+                )
             path, query = parts.path, parts.query
-        if not _WHEP_SESSION_PATH.fullmatch(path) or not _WHEP_LOCATION_QUERY.fullmatch(query):
-            raise RingClientError(operation, "invalid_location")
+        if not _WHEP_SESSION_PATH.fullmatch(path):
+            raise WhepLocationRejected(
+                reason.PATH_SHAPE_MISMATCH, **_path_shape(path, absolute=absolute, query=query)
+            )
+        if not _WHEP_LOCATION_QUERY.fullmatch(query):
+            raise WhepLocationRejected(
+                reason.QUERY_SHAPE_MISMATCH, absolute=absolute, query_present=True
+            )
         if device_id is not None:
             collection = f"/v1/devices/{quote(device_id, safe='._~-')}/media/streaming/whep/"
             if not path.startswith(collection):
-                raise RingClientError(operation, "invalid_location")
+                raise WhepLocationRejected(reason.DEVICE_SCOPE_MISMATCH, absolute=absolute)
         suffix = f"?{query}" if query else ""
         return f"{scheme}://{host}:{expected_port}{path}{suffix}"
 
@@ -759,6 +862,27 @@ class RingClient:
             ) from exc
         return response.status_code, response.headers, bytes(payload), oversized
 
+    @staticmethod
+    def _log_location_rejection(
+        operation: str,
+        status_code: int,
+        headers: httpx.Headers,
+        rejected: WhepLocationRejected,
+    ) -> None:
+        """One diagnostic event for a successful WHEP response whose Location was refused.
+
+        Carries only the reason code and the approved bools/bounded ints. The raw Location,
+        its host, scheme, port, path, query, the device id and the session id never appear.
+        """
+        structlog.get_logger().warning(
+            "ring_whep_location_rejected",
+            operation=operation,
+            status_code=status_code,
+            provider_request_id=_safe_request_id(headers),
+            reason=rejected.reason.value,
+            **rejected.diagnostics,
+        )
+
     def _whep_status_failure(
         self, operation: str, status_code: int, headers: httpx.Headers
     ) -> RingClientError:
@@ -812,7 +936,12 @@ class RingClient:
         if raw_location is not None:
             try:
                 session_url = self.validated_whep_location(raw_location, device_id=device_id)
-            except RingClientError:
+            except WhepLocationRejected as rejected:
+                self._log_location_rejection(operation, status_code, headers, rejected)
+                location_error = self._whep_failure(
+                    operation, "invalid_location", status_code, headers
+                )
+            except RingClientError:  # pragma: no cover - the validator raises only the above
                 location_error = self._whep_failure(
                     operation, "invalid_location", status_code, headers
                 )
