@@ -34,7 +34,7 @@ export async function GET(_request: NextRequest, { params }: Context) {
 
 export async function DELETE(request: NextRequest, { params }: Context) {
   const { staffId, imageId } = await params;
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   if (!UUID_PATTERN.test(staffId) || !UUID_PATTERN.test(imageId)) {

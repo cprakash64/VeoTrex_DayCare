@@ -7,7 +7,7 @@ import { deleteStaff, renameStaff } from "../../../../lib/veotrex-api";
 type Context = { params: Promise<{ staffId: string }> };
 
 function guard(request: NextRequest, staffId: string): NextResponse | null {
-  if (!isSameOriginPost(request.url, request.headers.get("origin"))) {
+  if (!isSameOriginPost(process.env.APP_BASE_URL, request.headers.get("origin"))) {
     return NextResponse.json({ status: "failed" }, { status: 403 });
   }
   if (!UUID_PATTERN.test(staffId)) return NextResponse.json({ status: "failed" }, { status: 422 });
