@@ -251,6 +251,7 @@ class RingWhepSource:
                 self._health = SourceHealth.RUNNING
                 self.metrics.stream_state = "STREAMING"
                 timeout = self._first_frame_timeout
+                stable_since: float | None = None
                 ended_cleanly = False  # set by a clean EOS, or by the loop's else-clause
                 while not self._stopping:
                     try:
@@ -285,12 +286,14 @@ class RingWhepSource:
                         # session, so it is dropped and counted rather than ending the stream.
                         self.metrics.frames_dropped_total += 1
                         continue
+                    if stable_since is None:
+                        stable_since = time.monotonic()
                     pending_discontinuity = False
                     previous_monotonic = decoded.arrival_monotonic_ns
                     index += 1
                     self._frames_published += 1
                     yield frame
-                    if self._stable():
+                    if self._stable(stable_since):
                         self._budget.reset()
                 else:
                     ended_cleanly = True
@@ -313,8 +316,12 @@ class RingWhepSource:
                 self.metrics.stream_state = str(SourceHealth.STOPPED)
         _ = previous_monotonic  # continuity is carried by pending_discontinuity
 
-    def _stable(self) -> bool:
-        return self._frames_published > 0 and self._budget.consecutive_failures > 0
+    def _stable(self, stable_since: float | None) -> bool:
+        return (
+            stable_since is not None
+            and self._budget.consecutive_failures > 0
+            and time.monotonic() - stable_since >= self._policy.stable_reset_seconds
+        )
 
     def _may_retry(self) -> bool:
         delay = self._budget.next_delay(time.monotonic())

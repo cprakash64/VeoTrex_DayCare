@@ -14,6 +14,7 @@ import ast
 import re
 import socket
 import threading
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -294,9 +295,18 @@ def test_a_reader_that_fails_to_start_is_handled_like_a_session_failure() -> Non
 
 
 def test_a_stalled_feed_is_noticed_even_though_nothing_errored() -> None:
-    source, _, _ = build(FakeRingFrameReader(frame_count=10, stall_after=3))
-    produced = list(source.frames())
-    assert len(produced) >= 3
+    frames_before_stall = 3
+    source, provider, _ = build(
+        FakeRingFrameReader(frame_count=10, stall_after=frames_before_stall)
+    )
+    stream = source.frames()
+    maximum_expected = frames_before_stall * (FAST.max_attempts + 1)
+    produced = list(islice(stream, maximum_expected + 1))
+    stream.close()
+
+    assert len(produced) >= frames_before_stall
+    assert len(produced) <= maximum_expected, "a flapping feed must exhaust its reconnect budget"
+    assert provider.acquired <= FAST.max_attempts + 1
     assert source.failure_category in {"MEDIA_STALLED", "FIRST_MEDIA_TIMEOUT"}
 
 
