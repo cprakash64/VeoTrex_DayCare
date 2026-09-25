@@ -164,6 +164,16 @@ WHEP_LOCATION_DIAGNOSTIC_FIELDS = frozenset(
         "contains_plus",
         "contains_equals",
         "contains_other_outside_current_allowlist",
+        # query_shape_mismatch only (second diagnostic hotfix)
+        "query_length",
+        "query_over_current_limit",
+        "disallowed_char_count",
+        "contains_semicolon",
+        "contains_comma",
+        "contains_at",
+        "contains_question_mark",
+        "contains_brackets",
+        "contains_other_punctuation",
     }
 )
 _SESSION_COLLECTION_MARKER = "/media/streaming/whep/sessions/"
@@ -171,6 +181,14 @@ _SESSION_TAIL_ALLOWED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%-"
 )
 _MAX_DIAGNOSTIC_SEGMENTS = 64
+# Mirrors ``_WHEP_LOCATION_QUERY`` (``[A-Za-z0-9._~%=&-]{0,256}``) for DIAGNOSIS ONLY; the regex
+# remains the sole validator, and a test pins these two to exactly the same language.
+_QUERY_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%=&-")
+_QUERY_CURRENT_LIMIT = 256
+_MAX_DIAGNOSTIC_QUERY_LENGTH = 2048
+_MAX_DIAGNOSTIC_DISALLOWED = 256
+_QUERY_NAMED_PUNCTUATION = frozenset("+/:;,@?[]")
+_ASCII_PUNCTUATION = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 
 def _path_shape(path: str, *, absolute: bool, query: str) -> dict[str, bool | int | None]:
@@ -203,6 +221,36 @@ def _path_shape(path: str, *, absolute: bool, query: str) -> dict[str, bool | in
             character not in _SESSION_TAIL_ALLOWED and character not in ":/+=" for character in tail
         )
     return shape
+
+
+def _query_shape(query: str, *, absolute: bool) -> dict[str, bool | int | None]:
+    """Why a query failed, as counts and character-class booleans only.
+
+    Never a parameter name, a value, a character or an ordinal: just its length, whether that
+    exceeds the current limit, how many characters fall outside the current allowlist, and
+    which punctuation classes those belong to.
+    """
+    disallowed = [character for character in query if character not in _QUERY_ALLOWED]
+    present = set(disallowed)
+    return {
+        "absolute": absolute,
+        "query_present": True,
+        "query_length": min(len(query), _MAX_DIAGNOSTIC_QUERY_LENGTH),
+        "query_over_current_limit": len(query) > _QUERY_CURRENT_LIMIT,
+        "disallowed_char_count": min(len(disallowed), _MAX_DIAGNOSTIC_DISALLOWED),
+        "contains_plus": "+" in present,
+        "contains_slash": "/" in present,
+        "contains_colon": ":" in present,
+        "contains_semicolon": ";" in present,
+        "contains_comma": "," in present,
+        "contains_at": "@" in present,
+        "contains_question_mark": "?" in present,
+        "contains_brackets": bool(present & {"[", "]"}),
+        "contains_other_punctuation": any(
+            character in _ASCII_PUNCTUATION and character not in _QUERY_NAMED_PUNCTUATION
+            for character in present
+        ),
+    }
 
 
 class WhepLocationRejected(RingClientError):
@@ -786,7 +834,7 @@ class RingClient:
             )
         if not _WHEP_LOCATION_QUERY.fullmatch(query):
             raise WhepLocationRejected(
-                reason.QUERY_SHAPE_MISMATCH, absolute=absolute, query_present=True
+                reason.QUERY_SHAPE_MISMATCH, **_query_shape(query, absolute=absolute)
             )
         if device_id is not None:
             collection = f"/v1/devices/{quote(device_id, safe='._~-')}/media/streaming/whep/"

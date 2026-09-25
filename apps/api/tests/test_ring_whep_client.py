@@ -347,7 +347,7 @@ def test_every_rejection_is_unchanged_and_carries_only_a_safe_reason(
     assert set(error.diagnostics) <= WHEP_LOCATION_DIAGNOSTIC_FIELDS
     for value in error.diagnostics.values():
         assert value is None or isinstance(value, bool | int)
-        assert not isinstance(value, int) or isinstance(value, bool) or 0 <= value <= 1024
+        assert not isinstance(value, int) or isinstance(value, bool) or 0 <= value <= 2048
     for key, value in expected.items():
         assert error.diagnostics[key] == value, key
     rendered = f"{error!s} {error!r} {error.diagnostics!r} {error.reason!r}"
@@ -461,3 +461,159 @@ async def test_non_2xx_responses_and_delete_never_emit_the_location_diagnostic(
     for entries in (logs, delete_logs):
         assert [e for e in entries if e["event"] == "ring_whep_location_rejected"] == []
     assert seen == [], "an untrusted teardown resource is never contacted"
+
+
+# ------------------------------------------- query_shape_mismatch diagnostics (hotfix 2)
+QUERY_NAME = "SECRETQNAME"
+QUERY_VALUE = "SECRETQVALUE"
+NAMED_CLASSES = {
+    "+": "contains_plus",
+    "/": "contains_slash",
+    ":": "contains_colon",
+    ";": "contains_semicolon",
+    ",": "contains_comma",
+    "@": "contains_at",
+    "?": "contains_question_mark",
+    "[": "contains_brackets",
+    "]": "contains_brackets",
+}
+QUERY_BOOLEANS = sorted(set(NAMED_CLASSES.values()) | {"contains_other_punctuation"})
+
+
+def _query_rejection(settings: Settings, query: str) -> WhepLocationRejected:
+    client, seen = client_with(settings, lambda _: httpx.Response(204))
+    with pytest.raises(WhepLocationRejected) as caught:
+        client.validated_whep_location(
+            f"https://api.amazonvision.com{SECRET_PATH}?{query}", device_id=SECRET_DEVICE
+        )
+    assert caught.value.reason is WhepLocationRejection.QUERY_SHAPE_MISMATCH
+    assert caught.value.category == "invalid_location"
+    assert seen == []
+    return caught.value
+
+
+def test_the_diagnostic_allowlist_is_exactly_the_unchanged_validator() -> None:
+    """The regex alone decides; the diagnostic mirror must describe the same language."""
+    import random
+    import string
+
+    from veotrex_api.ring_client import (
+        _QUERY_ALLOWED,
+        _QUERY_CURRENT_LIMIT,
+        _WHEP_LOCATION_QUERY,
+    )
+
+    assert _WHEP_LOCATION_QUERY.pattern == r"^[A-Za-z0-9._~%=&-]{0,256}$"
+
+    def mirror(value: str) -> bool:
+        return len(value) <= _QUERY_CURRENT_LIMIT and all(c in _QUERY_ALLOWED for c in value)
+
+    printable = [chr(code) for code in range(33, 127)]
+    samples = [*printable, "", "a" * 255, "a" * 256, "a" * 257, "a=1&b=2", "x" * 256 + "+"]
+    rng = random.Random(20260925)  # noqa: S311 - seeded test fuzz, not cryptography
+    samples += [
+        "".join(rng.choice(printable) for _ in range(rng.randint(0, 300))) for _ in range(2000)
+    ]
+    for value in samples:
+        assert bool(_WHEP_LOCATION_QUERY.fullmatch(value)) is mirror(value), repr(value)
+    assert set(printable) - _QUERY_ALLOWED <= set(string.punctuation)
+
+
+def test_an_over_limit_but_otherwise_valid_query_is_reported_as_length(
+    settings: Settings,
+) -> None:
+    query = f"{QUERY_NAME}=" + "v" * 300
+    rejection = _query_rejection(settings, query)
+    diagnostics = rejection.diagnostics
+    assert diagnostics["query_over_current_limit"] is True
+    assert diagnostics["query_length"] == len(query)
+    assert diagnostics["disallowed_char_count"] == 0
+    assert diagnostics["absolute"] is True and diagnostics["query_present"] is True
+    assert all(diagnostics[name] is False for name in QUERY_BOOLEANS)
+    # A query at the limit is accepted, exactly as before.
+    client, _ = client_with(settings, lambda _: httpx.Response(204))
+    at_limit = "a=" + "v" * 254
+    assert client.validated_whep_location(f"{SECRET_PATH}?{at_limit}").endswith(at_limit)
+
+
+@pytest.mark.parametrize("character", sorted(NAMED_CLASSES))
+def test_each_named_punctuation_class_sets_only_its_own_flag(
+    settings: Settings, character: str
+) -> None:
+    rejection = _query_rejection(settings, f"{QUERY_NAME}={QUERY_VALUE}{character}tail")
+    diagnostics = rejection.diagnostics
+    expected = NAMED_CLASSES[character]
+    for name in QUERY_BOOLEANS:
+        assert diagnostics[name] is (name == expected), name
+    assert diagnostics["disallowed_char_count"] == 1
+    assert diagnostics["query_over_current_limit"] is False
+
+
+def test_unknown_punctuation_only_sets_the_other_flag_and_is_never_rendered(
+    settings: Settings,
+) -> None:
+    unknown = "!$'()*<>^`{|}\\\""
+    rejection = _query_rejection(settings, f"{QUERY_NAME}={unknown}{QUERY_VALUE}")
+    diagnostics = rejection.diagnostics
+    assert diagnostics["contains_other_punctuation"] is True
+    assert all(diagnostics[name] is False for name in set(NAMED_CLASSES.values()))
+    assert diagnostics["disallowed_char_count"] == len(unknown)
+    assert set(diagnostics) <= WHEP_LOCATION_DIAGNOSTIC_FIELDS
+    assert all(value is None or isinstance(value, bool | int) for value in diagnostics.values())
+    rendered = f"{rejection!s} {rejection!r}"
+    for secret in (unknown, QUERY_NAME, QUERY_VALUE, SECRET_DEVICE, SECRET_SESSION):
+        assert secret not in rendered
+
+
+def test_the_disallowed_count_is_capped(settings: Settings) -> None:
+    rejection = _query_rejection(settings, ";" * 600)
+    assert rejection.diagnostics["disallowed_char_count"] == 256
+    assert rejection.diagnostics["query_length"] == 600
+    assert rejection.diagnostics["query_over_current_limit"] is True
+
+
+async def test_a_real_create_logs_one_safe_query_event_without_any_query_text(
+    settings: Settings,
+) -> None:
+    token = SecretStr("synthetic-ring-access-SECRETTOKEN")
+    location = (
+        f"https://api.amazonvision.com{SECRET_PATH}"
+        f"?{QUERY_NAME}={QUERY_VALUE};other=SECRETQVALUE2,x:y"
+    )
+    client, seen = client_with(
+        settings,
+        lambda _: httpx.Response(
+            201,
+            content=ANSWER,
+            headers={"content-type": "application/sdp", "location": location},
+        ),
+    )
+    with capture_logs() as logs, pytest.raises(RingClientError) as caught:
+        await client.create_whep_session(token, SECRET_DEVICE, None, OFFER, max_answer_bytes=65536)
+    assert caught.value.category == "invalid_location"
+    # Unchanged since before either hotfix: create reports its own operation.
+    assert str(caught.value) == "Ring operation failed: whep_create/invalid_location"
+    assert [request.method for request in seen] == ["POST"], "never contacted"
+    [event] = [entry for entry in logs if entry["event"] == "ring_whep_location_rejected"]
+    assert set(event) <= SAFE_EVENT_KEYS
+    assert event["reason"] == "query_shape_mismatch"
+    assert event["contains_semicolon"] is True and event["contains_comma"] is True
+    assert event["contains_colon"] is True and event["contains_other_punctuation"] is False
+    assert event["disallowed_char_count"] == 3
+    rendered = repr(logs) + str(caught.value) + repr(caught.value)
+    for secret in (
+        location,
+        QUERY_NAME,
+        QUERY_VALUE,
+        "SECRETQVALUE2",
+        "other=",
+        SECRET_DEVICE,
+        SECRET_SESSION,
+        "SECRETTOKEN",
+        "Authorization",
+        "Bearer",
+        "v=0",
+        "a=rtpmap",
+        "amazonvision",
+    ):
+        assert secret not in rendered, secret
