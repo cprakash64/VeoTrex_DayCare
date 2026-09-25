@@ -7,6 +7,7 @@ the code path that runs.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import threading
@@ -588,18 +589,19 @@ def test_people_who_are_never_identified_are_tracked_normally() -> None:
 
 
 # ------------------------------------------------------------ future Ring compatibility
-def test_the_ring_source_kind_exists_and_is_live_without_any_implementation() -> None:
-    """Ring plugs in by implementing LiveVideoSource. The slot is declared now so adding it
-    changes no consumer; nothing produces it in this stage."""
+def test_only_the_ring_source_module_produces_ring_frames() -> None:
+    """Ring plugs in by implementing LiveVideoSource (V1-DEMO-02/03C). Exactly one live module,
+    ``ring.py``'s RingWhepSource, stamps frames as Ring; no consumer branches on the kind."""
     assert SourceKind.LIVE_RING_WHEP.is_live
     package = Path(__file__).resolve().parents[1] / "src" / "veotrex_edge_agent" / "live"
-    produced = [
+    produced = sorted(
         module.name
         for module in package.glob("*.py")
-        if "SourceKind.LIVE_RING_WHEP" in module.read_text(encoding="utf-8")
+        if not module.name.startswith("._")
+        and "SourceKind.LIVE_RING_WHEP" in module.read_text(encoding="utf-8")
         and module.name != "source.py"
-    ]
-    assert produced == [], f"no live module may construct a Ring frame yet: {produced}"
+    )
+    assert produced == ["ring.py"], f"only RingWhepSource may construct a Ring frame: {produced}"
 
 
 def test_a_ring_shaped_source_satisfies_the_same_contract() -> None:
@@ -625,12 +627,74 @@ def test_a_ring_shaped_source_satisfies_the_same_contract() -> None:
     assert "CAMERA_CONNECTED" in kinds
 
 
-def test_no_module_in_the_live_package_calls_ring() -> None:
+def _code_strings(tree: ast.AST) -> list[str]:
+    """String literals that are code, not documentation."""
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def test_the_live_package_reaches_ring_only_through_the_veotrex_broker() -> None:
+    """V1-DEMO-03C replaced "the live package never calls Ring" with the stronger structural
+    form of what matters: no live module can talk to Ring or hold a Ring token. The only path
+    to a session is the VeoTrex broker, imported by exactly the provider and the CLI."""
     package = Path(__file__).resolve().parents[1] / "src" / "veotrex_edge_agent" / "live"
+    forbidden_modules = (
+        "whep_client",
+        "whep_provider",
+        "ring_client",
+        "qualification.backend",
+        "http.client",
+        "urllib.request",
+        "httpx",
+        "requests",
+    )
+    broker_importers = set()
     for module in sorted(package.glob("*.py")):
-        text = module.read_text(encoding="utf-8").lower()
-        for forbidden in ("whep_client", "ring_client", "oauth", "amazonvision", "access_token"):
-            assert forbidden not in text, f"{module.name} must not touch Ring"
+        if module.name.startswith("._"):
+            continue
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        imported = {
+            name
+            for node in ast.walk(tree)
+            for name in (
+                [node.module or ""]
+                if isinstance(node, ast.ImportFrom)
+                else [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else []
+            )
+        }
+        for name in imported:
+            assert not name.endswith(forbidden_modules), f"{module.name} imports {name}"
+            if name.endswith("broker_whep"):
+                broker_importers.add(module.name)
+        identifiers = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.Attribute)
+        } | {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)}
+        for identifier in identifiers:
+            lowered = identifier.lower()
+            assert "access_token" not in lowered and "refresh_token" not in lowered, (
+                f"{module.name} handles {identifier}"
+            )
+        for value in _code_strings(tree):
+            lowered = value.lower()
+            assert "amazonvision" not in lowered and "oauth" not in lowered, module.name
+    assert broker_importers == {"cli.py", "ring_broker.py"}
 
 
 # ------------------------------------------------------------------ prohibited footage

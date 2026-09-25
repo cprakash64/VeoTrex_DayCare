@@ -272,7 +272,8 @@ def test_teardown_goes_back_to_the_control_plane(server: WhepFixtureServer) -> N
     [
         (401, C.WHEP_HTTP_UNAUTHORIZED),
         (403, C.WHEP_HTTP_FORBIDDEN),
-        (404, C.CAMERA_OFFLINE),
+        # V1-DEMO-03C: the broker's 404 is 'this node may not stream this camera' - terminal.
+        (404, C.AUTHORIZATION_FAILED),
         (429, C.WHEP_HTTP_RATE_LIMITED),
         (502, C.WHEP_HTTP_SERVER_ERROR),
         (503, C.CAMERA_OFFLINE),

@@ -8,6 +8,7 @@ credentials used with it are obviously synthetic. It stores nothing and logs not
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -54,8 +55,16 @@ class WhepFixtureState:
     default: WhepScript = field(default_factory=WhepScript)
     observations: list[Observation] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Optional dynamic answer (V1-DEMO-03C): given the observed request, return its script or
+    # None to fall back to the queue. Lets a synthetic broker answer with a real peer's SDP.
+    responder: Callable[[Observation], WhepScript | None] | None = None
 
-    def next_script(self) -> WhepScript:
+    def next_script(self, observation: Observation | None = None) -> WhepScript:
+        responder = self.responder
+        if responder is not None and observation is not None:
+            dynamic = responder(observation)
+            if dynamic is not None:
+                return dynamic
         with self.lock:
             return self.scripts.pop(0) if self.scripts else self.default
 
@@ -71,13 +80,12 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(min(length, 1_048_576)) if length else b""
         path, _, query = self.path.partition("?")
+        observation = Observation(
+            method, path, {k.lower(): v for k, v in self.headers.items()}, body, query
+        )
         with self.state.lock:
-            self.state.observations.append(
-                Observation(
-                    method, path, {k.lower(): v for k, v in self.headers.items()}, body, query
-                )
-            )
-        script = self.state.next_script()
+            self.state.observations.append(observation)
+        script = self.state.next_script(observation)
         if script.delay_seconds:
             threading.Event().wait(script.delay_seconds)
         if (

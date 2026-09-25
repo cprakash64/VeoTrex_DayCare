@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
 from dataclasses import asdict
 from typing import Any
+from uuid import UUID
 
 from veotrex_edge_agent.live.camera import (
     DEFAULT_PIXEL_FORMAT,
@@ -46,7 +48,28 @@ from veotrex_edge_agent.recorded.regions import (
 from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
 
 SOURCE_CHOICES = ("camera", "synthetic", "ring")
+# The same variables EdgeSettings reads (V1-DEMO-03B), so the service and the demo agree.
+CONTROL_PLANE_URL_ENV = "VEOTREX_EDGE_CONTROL_PLANE_URL"
+CREDENTIAL_FILE_ENV = "VEOTREX_EDGE_CREDENTIAL_FILE"
 DETECTOR_CHOICES = ("yolox", "none")
+BROKER_CONFIGURATION_CATEGORIES = frozenset(
+    {
+        "ring_camera_id_must_be_a_veotrex_camera_uuid",
+        "control_plane_url_not_configured",
+        "control_plane_url_invalid",
+        "credential_file_not_configured",
+        "credential_file_path_not_absolute",
+        "credential_file_missing",
+        "credential_file_is_symlink",
+        "credential_file_not_regular",
+        "credential_file_permissions_too_open",
+        "credential_file_wrong_owner",
+        "credential_file_too_large",
+        "credential_file_empty",
+        "credential_file_unreadable",
+        "credential_malformed",
+    }
+)
 
 
 def add_discover_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -61,7 +84,26 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
     command.add_argument(
         "--ring-camera",
         default=None,
-        help="operator's label for the Ring camera to stream, with --source ring",
+        help=(
+            "with --source ring: the VeoTrex camera UUID assigned to this edge node (never a "
+            "Ring device id). With --ring-media-qualification any local label is accepted"
+        ),
+    )
+    command.add_argument(
+        "--control-plane-url",
+        default=None,
+        help=(
+            "HTTPS origin of the VeoTrex control plane (default: "
+            f"${CONTROL_PLANE_URL_ENV}). The broker negotiates Ring on the node's behalf"
+        ),
+    )
+    command.add_argument(
+        "--credential-file",
+        default=None,
+        help=(
+            "absolute path of this node's 0600 machine-credential file (default: "
+            f"${CREDENTIAL_FILE_ENV}). Only the path is accepted; the credential never is"
+        ),
     )
     command.add_argument(
         "--ring-media-qualification",
@@ -200,12 +242,13 @@ def _source(arguments: argparse.Namespace) -> Any:
 
 
 def _ring_source(arguments: argparse.Namespace) -> Any:
-    """Build a Ring live source, or refuse in a way that says exactly what is missing.
+    """Build the Ring live source, or refuse in a way that says exactly what is missing.
 
-    There is deliberately no path here that reaches Ring. Account linking is blocked upstream by
-    an Amazon-side IP-level rejection on ``/v1/users/me``; nothing in this stage works around
-    that, and a demo that silently produced a picture from somewhere else would be worse than
-    one that stops.
+    The real path is brokered (V1-DEMO-03B/03C): the node presents its own machine credential to
+    the VeoTrex control plane, which negotiates with Ring server-side. The inputs are a VeoTrex
+    camera UUID, the control-plane origin and the credential file's path - never a credential,
+    a Ring token, a Ring device id or a provider URL. Everything is validated, and the
+    credential file read once, before any media process starts.
     """
     camera_id = arguments.ring_camera
     if not camera_id:
@@ -220,13 +263,76 @@ def _ring_source(arguments: argparse.Namespace) -> Any:
         return RingWhepSource(
             camera_id,
             FakeRingSessionProvider(),
-            GstFrameReader(
-                source="synthetic", width=arguments.width, height=arguments.height
-            ),
+            GstFrameReader(source="synthetic", width=arguments.width, height=arguments.height),
         )
-    # The real path needs an authorized session provider from the existing credential
-    # boundary. Until the account link completes there is none to hand over.
-    raise LiveSourceError("ring_session_provider_unavailable")
+    return build_brokered_ring_source(
+        camera_id,
+        control_plane_url=arguments.control_plane_url or os.environ.get(CONTROL_PLANE_URL_ENV),
+        credential_file=arguments.credential_file or os.environ.get(CREDENTIAL_FILE_ENV),
+        environment=arguments.environment,
+    )
+
+
+def build_brokered_ring_source(
+    camera_id: str,
+    *,
+    control_plane_url: str | None,
+    credential_file: str | None,
+    environment: str,
+    reader: Any = None,
+    connection_factory: Any = None,
+    **source_options: Any,
+) -> RingWhepSource:
+    """Compose broker auth -> BrokerWhepClient/BrokeredWhepSessionProvider -> GstFrameReader
+    -> RingWhepSource. ``reader`` and ``connection_factory`` exist for local tests only;
+    ``source_options`` are RingWhepSource's own bounded timing and reconnect settings."""
+    from veotrex_edge_agent.camera_transport.broker_whep import (
+        BrokeredWhepExchange,
+        BrokeredWhepSessionProvider,
+        BrokerWhepClient,
+        ControlPlaneEndpoint,
+        EdgeCredentialError,
+        read_edge_credential,
+    )
+    from veotrex_edge_agent.live.ring_broker import BrokeredRingSessionProvider
+    from veotrex_edge_agent.live.ring_gst import GstFrameReader
+
+    try:
+        camera = UUID(camera_id)
+    except ValueError:
+        raise LiveSourceError("ring_camera_id_must_be_a_veotrex_camera_uuid") from None
+    if str(camera) != camera_id.lower():
+        raise LiveSourceError("ring_camera_id_must_be_a_veotrex_camera_uuid")
+    if not control_plane_url:
+        raise LiveSourceError("control_plane_url_not_configured")
+    if not credential_file:
+        raise LiveSourceError("credential_file_not_configured")
+    try:
+        endpoint = ControlPlaneEndpoint.parse(control_plane_url, environment=environment)
+    except ValueError:
+        raise LiveSourceError("control_plane_url_invalid") from None
+    try:
+        # Read once now so a missing or unprotected file fails before media opens. The value
+        # is discarded; each session re-reads the file, so a rotated credential is picked up.
+        read_edge_credential(credential_file)
+    except EdgeCredentialError as exc:
+        raise LiveSourceError(exc.reason) from None
+    client = (
+        BrokerWhepClient(endpoint)
+        if connection_factory is None
+        else BrokerWhepClient(endpoint, connection_factory=connection_factory)
+    )
+    provider = BrokeredRingSessionProvider(
+        camera,
+        BrokeredWhepSessionProvider(camera, endpoint, credential_file),
+        BrokeredWhepExchange(client),
+    )
+    return RingWhepSource(
+        str(camera),
+        provider,
+        reader or GstFrameReader(source="webrtc", decoder="nvidia"),
+        **source_options,
+    )
 
 
 def _detector(arguments: argparse.Namespace) -> Any:
@@ -240,14 +346,14 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
         source = _source(arguments)
     except LiveSourceError as exc:
         print(f"camera rejected: {exc.category}", file=sys.stderr)
-        if exc.category == "ring_session_provider_unavailable":
+        if exc.category in BROKER_CONFIGURATION_CATEGORIES:
             print(
-                "No authorized Ring session provider is configured. Ring account linking is\n"
-                "blocked upstream (GET /v1/users/me returns 406, under review by Amazon as an\n"
-                "IP-level Ring Security issue); this build does not work around it.\n"
-                "To qualify the media path locally without Ring, add "
-                "--ring-media-qualification.\n"
-                "See docs/runbooks/ring-live-demo-qualification.md.",
+                "The Ring source is brokered by the VeoTrex control plane and needs:\n"
+                "  --ring-camera <VeoTrex camera UUID assigned to this node>\n"
+                f"  --control-plane-url https://... (or ${CONTROL_PLANE_URL_ENV})\n"
+                f"  --credential-file /abs/path (or ${CREDENTIAL_FILE_ENV}), a 0600 file\n"
+                "The credential itself is never an argument. To qualify the media path locally\n"
+                "without any session, add --ring-media-qualification.",
                 file=sys.stderr,
             )
         return 2

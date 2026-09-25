@@ -23,6 +23,7 @@ same protocol, and every test below the transport uses the fake.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -60,6 +61,12 @@ class RingSessionMaterial:
     # Inventing one would mean scheduling a renewal on a deadline nobody has published.
     codec: str | None = None
     hardware_decoder: bool | None = None
+    # V1-DEMO-03C: offer SDP in, answer SDP out, exactly once per session. Supplied by the
+    # provider, which alone knows how the session is authorized (the VeoTrex broker); the
+    # reader calls it with the media worker's offer and never learns what is behind it. It is
+    # a capability, not a credential: no token is a field of this object, and it is excluded
+    # from equality and from every rendering below.
+    negotiate: Callable[[str], str] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.session_id or not self.resource_path:
@@ -252,7 +259,7 @@ class RingMediaMetrics:
         if not samples:
             return None
         ordered = sorted(samples)
-        index = min(len(ordered) - 1, int(round((percentile / 100.0) * (len(ordered) - 1))))
+        index = min(len(ordered) - 1, round((percentile / 100.0) * (len(ordered) - 1)))
         return round(ordered[index], 3)
 
     def as_dict(self) -> dict[str, Any]:

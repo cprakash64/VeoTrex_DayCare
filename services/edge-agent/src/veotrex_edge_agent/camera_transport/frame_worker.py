@@ -232,11 +232,11 @@ class FrameWorker:
         raise RuntimeError("DECODER_START_FAILED")
 
     def build(self) -> None:
-        import gi
+        import gi  # type: ignore[import-not-found]
 
         gi.require_version("Gst", "1.0")
         gi.require_version("GstApp", "1.0")
-        from gi.repository import Gst
+        from gi.repository import Gst  # type: ignore[import-not-found]
 
         Gst.init(None)
         self.gst = Gst

@@ -72,6 +72,9 @@ TERMINAL_CATEGORIES = frozenset(
         "WEBRTC_CODEC_UNSUPPORTED",
         "INVALID_ENDPOINT",
         "REDIRECT_REFUSED",
+        # A 2xx whose lease cannot be addressed: asking again could only strand more leases
+        # this node cannot DELETE. Terminal in the transport taxonomy too (errors.py).
+        "WHEP_INVALID_LOCATION",
         "invalid_session_material",
         "provider_not_configured",
         "ring_session_material_missing",

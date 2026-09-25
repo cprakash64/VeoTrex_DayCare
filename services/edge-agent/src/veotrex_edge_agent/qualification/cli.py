@@ -99,7 +99,11 @@ def parser() -> argparse.ArgumentParser:
     )
     add_live_demo_arguments(
         commands.add_parser(
-            "live-demo", help="run the local live tracking demo with a loopback dashboard"
+            "live-demo",
+            help="run the local live tracking demo with a loopback dashboard",
+            # No prefix matching: "--credential <value>" must be an error, never a silent
+            # alias for --credential-file that would treat a credential as a path.
+            allow_abbrev=False,
         )
     )
     # V1-02B1A: recorded-video person tracking. Local files only; no URL option exists.

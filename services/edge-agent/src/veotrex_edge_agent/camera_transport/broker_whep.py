@@ -275,6 +275,14 @@ class BrokerWhepClient(WhepClient):
             raise self._fail(_C.WHEP_INVALID_LOCATION)
         return f"https://{self.config.host}:{self.config.port}{path}"
 
+    def _map_status(self, status: int) -> TransportErrorCategory:
+        # The broker answers 404 for every "this node may not stream this camera" case
+        # (unassigned, reassigned, disabled, removed, no LIVE_VIDEO). Asking again cannot change
+        # that without an operator, so it is terminal rather than Ring's transient CAMERA_OFFLINE.
+        if status == 404:
+            return _C.AUTHORIZATION_FAILED
+        return super()._map_status(status)
+
 
 # --------------------------------------------------------------------- session provider
 class BrokeredWhepSessionProvider:
@@ -305,6 +313,11 @@ class BrokeredWhepSessionProvider:
         return ProviderKind.RING
 
     async def acquire(self, camera_id: UUID, generation: int, now: float) -> LiveSessionLease:
+        return self.lease(camera_id, generation, now)
+
+    def lease(self, camera_id: UUID, generation: int, now: float) -> LiveSessionLease:
+        """Synchronous form of ``acquire`` for the thread-driven live source. No I/O but the
+        credential file read."""
         if camera_id != self._camera_id:
             raise TransportError(_C.INTERNAL_TRANSPORT_ERROR)
         if not self._probe().available:

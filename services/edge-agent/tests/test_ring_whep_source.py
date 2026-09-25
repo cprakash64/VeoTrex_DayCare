@@ -43,7 +43,6 @@ from veotrex_edge_agent.live.ring_media import (
     DecodedFrame,
     RingFrameReader,
     RingLiveSessionProvider,
-    RingMediaError,
     RingMediaMetrics,
     RingSessionMaterial,
 )
@@ -231,8 +230,13 @@ def test_dropped_frames_are_reported_to_the_operator() -> None:
 # -------------------------------------------------------------------- failure and retry
 @pytest.mark.parametrize(
     "category",
-    ["WHEP_HTTP_UNAUTHORIZED", "WHEP_HTTP_FORBIDDEN", "PROVIDER_NOT_CONFIGURED",
-     "WEBRTC_RUNTIME_UNAVAILABLE", "CODEC_UNSUPPORTED"],
+    [
+        "WHEP_HTTP_UNAUTHORIZED",
+        "WHEP_HTTP_FORBIDDEN",
+        "PROVIDER_NOT_CONFIGURED",
+        "WEBRTC_RUNTIME_UNAVAILABLE",
+        "CODEC_UNSUPPORTED",
+    ],
 )
 def test_an_authorization_or_capability_failure_is_never_retried(category: str) -> None:
     """The defect this prevents: a revoked token turning into a retry loop against Ring."""
@@ -466,8 +470,16 @@ def test_the_synthetic_source_still_refuses_to_present_itself_as_live() -> None:
 # -------------------------------------------------------- credentials, privacy, network
 def test_session_material_carries_no_token() -> None:
     fields = set(RingSessionMaterial.__dataclass_fields__)
-    for forbidden in ("token", "bearer", "authorization", "secret", "credential", "sdp",
-                      "password", "refresh"):
+    for forbidden in (
+        "token",
+        "bearer",
+        "authorization",
+        "secret",
+        "credential",
+        "sdp",
+        "password",
+        "refresh",
+    ):
         assert not any(forbidden in name for name in fields), forbidden
 
 
@@ -554,7 +566,10 @@ def test_no_ring_endpoint_is_named_in_the_new_source_modules() -> None:
 
 
 def test_the_media_path_downloads_nothing_at_runtime() -> None:
-    targets = [*sorted(LIVE_ROOT.glob("ring*.py")), SOURCE_ROOT / "camera_transport" / "frame_worker.py"]
+    targets = [
+        *sorted(LIVE_ROOT.glob("ring*.py")),
+        SOURCE_ROOT / "camera_transport" / "frame_worker.py",
+    ]
     for path in targets:
         text = path.read_text(encoding="utf-8")
         for forbidden in ("urlretrieve", "pip install", "apt-get", "curl ", "wget "):
@@ -565,13 +580,17 @@ def test_the_decode_worker_is_never_given_the_session_material() -> None:
     """Structural, not conventional: the worker process cannot leak what it never receives."""
     source_text = (LIVE_ROOT / "ring_gst.py").read_text(encoding="utf-8")
     tree = ast.parse(source_text)
-    start = next(
+    # V1-DEMO-03C split start() into per-route helpers; every one of them is checked.
+    starts = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "start"
-    )
+        if isinstance(node, ast.FunctionDef)
+        and (node.name == "start" or node.name.startswith("_start_"))
+    ]
+    assert {node.name for node in starts} >= {"start", "_start_frame_worker", "_start_webrtc"}
     sent = [
         node
+        for start in starts
         for node in ast.walk(start)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -581,14 +600,22 @@ def test_the_decode_worker_is_never_given_the_session_material() -> None:
     for call in sent:
         rendered = ast.dump(call)
         assert "material" not in rendered, "session material must not reach the worker"
+        # Only the SDP answer the negotiation returned crosses; never the capability itself.
+        assert "negotiate" not in rendered
 
 
 def test_the_worker_start_message_is_validated() -> None:
     from veotrex_edge_agent.camera_transport.frame_worker import validate_start
 
     ok = validate_start(
-        {"type": "START", "protocol_version": 1, "source": "synthetic",
-         "decoder": "nvidia", "width": 640, "height": 480}
+        {
+            "type": "START",
+            "protocol_version": 1,
+            "source": "synthetic",
+            "decoder": "nvidia",
+            "width": 640,
+            "height": 480,
+        }
     )
     assert ok["source"] == "synthetic"
     for bad in (
@@ -604,8 +631,9 @@ def test_the_worker_start_message_is_validated() -> None:
 
 # ------------------------------------------------------------------------- the CLI shape
 def test_the_usb_command_line_is_unchanged() -> None:
-    from veotrex_edge_agent.live.cli import add_demo_arguments
     import argparse
+
+    from veotrex_edge_agent.live.cli import add_demo_arguments
 
     parser = add_demo_arguments(argparse.ArgumentParser())
     parsed = parser.parse_args(["--device", "/dev/video0"])
@@ -627,16 +655,30 @@ def test_ring_without_a_camera_id_is_refused() -> None:
         _source(parsed)
 
 
-def test_ring_without_an_authorized_provider_fails_safely() -> None:
-    """No silent fallback to another source, and no attempt to reach Ring."""
+def test_ring_without_an_authorized_provider_fails_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No silent fallback to another source, and no attempt to reach Ring.
+
+    V1-DEMO-03C replaced the unconditional refusal with the brokered path, which is built only
+    from a VeoTrex camera UUID plus complete broker configuration; anything less still refuses
+    before a media process or a network connection exists.
+    """
     import argparse
 
     from veotrex_edge_agent.live.cli import _source, add_demo_arguments
     from veotrex_edge_agent.live.source import LiveSourceError
 
+    monkeypatch.delenv("VEOTREX_EDGE_CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("VEOTREX_EDGE_CREDENTIAL_FILE", raising=False)
     parser = add_demo_arguments(argparse.ArgumentParser())
     parsed = parser.parse_args(["--source", "ring", "--ring-camera", "front"])
-    with pytest.raises(LiveSourceError, match="ring_session_provider_unavailable"):
+    with pytest.raises(LiveSourceError, match="ring_camera_id_must_be_a_veotrex_camera_uuid"):
+        _source(parsed)
+    parsed = parser.parse_args(
+        ["--source", "ring", "--ring-camera", "0c7e5a31-44f2-4d0b-9a8e-6f1b2c3d4e5f"]
+    )
+    with pytest.raises(LiveSourceError, match="control_plane_url_not_configured"):
         _source(parsed)
 
 
@@ -685,8 +727,9 @@ def test_the_real_decode_path_reports_a_monotonic_media_clock() -> None:
     from veotrex_edge_agent.live.ring_gst import GstFrameReader
 
     reader = GstFrameReader(source="synthetic", width=320, height=240, frames=8)
-    source = RingWhepSource("qual", FakeRingSessionProvider(), reader,
-                            first_frame_timeout_seconds=25.0)
+    source = RingWhepSource(
+        "qual", FakeRingSessionProvider(), reader, first_frame_timeout_seconds=25.0
+    )
     stamps = []
     try:
         for frame in source.frames():
@@ -705,8 +748,9 @@ def test_the_real_decode_path_tears_the_worker_down() -> None:
     from veotrex_edge_agent.live.ring_gst import GstFrameReader
 
     reader = GstFrameReader(source="synthetic", width=320, height=240, frames=40)
-    source = RingWhepSource("qual", FakeRingSessionProvider(), reader,
-                            first_frame_timeout_seconds=25.0)
+    source = RingWhepSource(
+        "qual", FakeRingSessionProvider(), reader, first_frame_timeout_seconds=25.0
+    )
     stream = source.frames()
     next(stream)
     assert reader.running
