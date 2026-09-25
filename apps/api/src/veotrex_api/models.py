@@ -486,6 +486,46 @@ class EdgeNode(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class EdgeNodeCredential(Base, IdMixin, TenantOwnedMixin):
+    """Machine credential of one EdgeNode (V1-DEMO-03B).
+
+    ``id`` is the public selector carried inside the token; ``secret_sha256`` is a
+    domain-separated SHA-256 of the 256-bit random secret, bound to that selector. The
+    plaintext is never stored. The runtime role has no privilege on this table: it
+    authenticates only through ``authenticate_edge_node_credential`` (migration 0008).
+    """
+
+    __tablename__ = "edge_node_credentials"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_edge_node_credentials_id_tenant"),
+        ForeignKeyConstraint(
+            ["edge_node_id", "tenant_id"],
+            ["edge_nodes.id", "edge_nodes.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_edge_node_credentials_node_tenant",
+        ),
+        CheckConstraint("status IN ('ACTIVE', 'REVOKED')", name="ck_edge_node_credentials_status"),
+        CheckConstraint(
+            "(status = 'ACTIVE' AND revoked_at IS NULL) "
+            "OR (status = 'REVOKED' AND revoked_at IS NOT NULL)",
+            name="ck_edge_node_credentials_revocation",
+        ),
+        CheckConstraint(
+            "octet_length(secret_sha256) = 32", name="ck_edge_node_credentials_digest_len"
+        ),
+        Index("ix_edge_node_credentials_node", "tenant_id", "edge_node_id", "status"),
+    )
+
+    edge_node_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    secret_sha256: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CameraAssignment(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     __tablename__ = "camera_assignments"
     __table_args__ = (

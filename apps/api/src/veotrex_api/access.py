@@ -22,6 +22,9 @@ from veotrex_api.identity import ExternalIdentity, IdentityVerificationError, Id
 from veotrex_api.models import Actor, ActorIdentity, RoleAssignment
 
 bearer = HTTPBearer(auto_error=False)
+# Prefix of an edge machine credential (``edge_auth.TOKEN_PREFIX``). Duplicated rather than
+# imported because edge_auth imports this module.
+EDGE_TOKEN_PREFIX = "vte1."  # noqa: S105 - format prefix, not a credential
 
 
 class AuthenticationFailureLogLimiter:
@@ -82,6 +85,14 @@ async def verify_request_identity(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
 ) -> ExternalIdentity:
     if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized()
+    # An edge machine credential is valid only under /v1/edge. It is refused here before it can
+    # reach the JWT library, its error paths or JWKS, rather than relying on it failing to parse.
+    if credentials.credentials.startswith(EDGE_TOKEN_PREFIX):
+        if authentication_failure_log_limiter.allow():
+            structlog.get_logger().warning(
+                "authentication_failed", reason="machine_credential_on_human_endpoint"
+            )
         raise _unauthorized()
     verifier: IdentityVerifier = request.app.state.identity_verifier
     try:

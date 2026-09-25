@@ -146,7 +146,7 @@ docker compose --env-file "$ENVFILE" run --rm --no-deps \
   --migration-role veotrex --url-ref file:/run/secrets/api_database_url
 ```
 
-The first prints `verified`; the second prints only `PASS` lines (21 checks). `probe` must
+The first prints `verified`; the second prints only `PASS` lines (23 checks). `probe` must
 be run from the `api` service with the API runtime DSN named explicitly, never from the
 `runtime-role` job: that job mounts the admin DSN. Since V1-01A-2-R1 the probe fails closed
 anyway - it first checks, read-only, that the connected role is exactly `--role` with every

@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     ring_inventory_max_component_reads: int = Field(default=2000, ge=1, le=10000)
     ring_inventory_backoff_max_seconds: float = Field(default=10.0, ge=0, le=60)
     ring_webhook_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    # Edge WHEP broker (V1-DEMO-03B). Conservative bounds: the offer limit sits under the
+    # reverse proxy's 128 KiB /v1 body cap, and every lease is also bounded in count and age.
+    # Leases live in process memory, so the API must run as ONE worker (ADR 0021).
+    ring_whep_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    edge_whep_max_offer_bytes: int = Field(default=65536, ge=1024, le=131072)
+    edge_whep_max_answer_bytes: int = Field(default=65536, ge=1024, le=262144)
+    edge_whep_max_active_leases: int = Field(default=16, ge=1, le=256)
+    edge_whep_max_leases_per_node: int = Field(default=4, ge=1, le=64)
+    edge_whep_lease_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    edge_whep_rate_limit_per_minute: int = Field(default=60, ge=1, le=600)
     # Externally reachable HTTPS origin of the control plane. Ring callback URLs are derived from
     # this configured value and never from an incoming Host/X-Forwarded-Host header. Empty until a
     # real deployment hostname exists; readiness then reports it as missing rather than guessing.
@@ -137,6 +147,12 @@ class Settings(BaseSettings):
             )
         if self.staff_face_backend == "opencv_eval" and not self.staff_face_model_dir.strip():
             raise ValueError("the opencv_eval face backend requires VEOTREX_STAFF_FACE_MODEL_DIR")
+        return self
+
+    @model_validator(mode="after")
+    def edge_lease_bounds_are_consistent(self) -> "Settings":
+        if self.edge_whep_max_leases_per_node > self.edge_whep_max_active_leases:
+            raise ValueError("the per-node WHEP lease bound cannot exceed the global bound")
         return self
 
     @property

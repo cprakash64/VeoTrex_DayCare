@@ -66,11 +66,13 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
     CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4).status == 200 else 1)"]
 
-# No --reload. Bounded worker count appropriate for staging; proxy_headers are accepted only
-# because the only client is the trusted in-network reverse proxy (see Caddyfile).
+# No --reload. Exactly ONE worker: the edge WHEP broker keeps its Ring session leases in process
+# memory (V1-DEMO-03B, ADR 0021), so a second worker would receive DELETEs for leases it never
+# issued. Do not raise this without first moving leases to a shared store. proxy_headers are
+# accepted only because the only client is the trusted in-network reverse proxy (see Caddyfile).
 CMD ["uvicorn", "veotrex_api.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "2", \
+     "--workers", "1", \
      "--proxy-headers", "--forwarded-allow-ips", "*", \
      "--no-server-header", \
      "--timeout-keep-alive", "20"]

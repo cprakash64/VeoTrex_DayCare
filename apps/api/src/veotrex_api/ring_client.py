@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import hashlib
 import random
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlsplit
 
 import httpx
 import structlog
@@ -30,8 +32,9 @@ _TRANSPORT_FAILURES = (httpx.TimeoutException, httpx.TransportError, SOCKSError)
 # The documented Partner API request contract (developer.amazon.com/docs/ring, re-read
 # 2026-09-22): every JSON API example - curl, JavaScript and Python, GET included - sends
 # ``Authorization: Bearer <token>`` and ``Content-Type: application/json``; the reference states
-# "Content Types - JSON APIs: application/json". These are the only media types this client
-# ever declares. Media (SDP, MP4, JPEG) endpoints are not used.
+# "Content Types - JSON APIs: application/json". These are the only media types the JSON API
+# methods declare; the WHEP methods below (V1-DEMO-03B) are the only ones that send SDP, and
+# MP4/JPEG media endpoints are not used.
 JSON_MEDIA_TYPE = "application/json"
 # A product token per RFC 9110 rather than the HTTP library's default. Bounded ASCII.
 USER_AGENT_PRODUCT = "VeoTrex-ControlPlane"
@@ -40,6 +43,71 @@ USER_AGENT_PRODUCT = "VeoTrex-ControlPlane"
 _ERROR_TITLE_MAX = 80
 _REQUEST_ID_MAX = 128
 _REQUEST_ID_HEADERS = ("x-request-id", "x-amzn-requestid", "x-amz-request-id")
+
+
+# Ring WHEP live video, server side (V1-DEMO-03B). The request contract is the one the edge
+# ``camera_transport/whep_client.py`` established from Ring's current official material:
+# ``POST {api}/v1/devices/{device_id}/media/streaming/whep/sessions[?component_id=...]`` with
+# ``Authorization: Bearer``, ``Content-Type: application/sdp`` and ``Accept: application/sdp``; any
+# 2xx carrying a valid SDP answer; the session resource in ``Location``; teardown by ``DELETE`` on
+# that resource, where 404 means already gone. Identifier and Location shapes match that client.
+SDP_MEDIA_TYPE = "application/sdp"
+_WHEP_DEVICE_ID = re.compile(r"^[A-Za-z0-9._~-]{1,256}$")
+_WHEP_COMPONENT_ID = re.compile(r"^[A-Za-z0-9._~-]{1,64}$")
+_WHEP_SESSION_PATH = re.compile(
+    r"^/v1/devices/[A-Za-z0-9._~%-]{1,256}/media/streaming/whep/sessions/[A-Za-z0-9._~%-]{1,256}$"
+)
+_WHEP_LOCATION_QUERY = re.compile(r"^[A-Za-z0-9._~%=&-]{0,256}$")
+_SDP_LINE = re.compile(r"^[a-z]=[^\r\n]*$")
+_MAX_LOCATION_CHARS = 1024
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RingWhepSession:
+    """A created Ring WHEP session. Both fields stay inside the control plane: the answer goes
+    to the edge only as a response body, and the session URL never leaves this process."""
+
+    answer_sdp: str
+    session_url: str | None
+
+    def __repr__(self) -> str:
+        resource = "present" if self.session_url else "absent"
+        return f"RingWhepSession(answer=REDACTED, session_resource={resource})"
+
+    __str__ = __repr__
+
+
+def validate_sdp_answer(body: bytes, content_type: str | None, max_bytes: int) -> str:
+    """Accept only a bounded, UTF-8, video-bearing SDP answer. Raises ValueError otherwise."""
+    if not body or len(body) > max_bytes:
+        raise ValueError("answer size")
+    if content_type is not None:
+        kind = content_type.split(";", 1)[0].strip().lower()
+        if kind and kind != SDP_MEDIA_TYPE:
+            raise ValueError("answer media type")
+    text_value = body.decode("utf-8", errors="strict")
+    lines = [line for line in text_value.replace("\r\n", "\n").split("\n") if line]
+    if not lines or not lines[0].startswith("v=0"):
+        raise ValueError("answer version")
+    if any(not _SDP_LINE.fullmatch(line) for line in lines):
+        raise ValueError("answer line")
+    media = [line for line in lines if line.startswith("m=")]
+    if not any(line.startswith("m=video ") for line in media):
+        raise ValueError("answer has no video")
+    # The edge offer is video-only; an accepted (non-zero port) non-video stream breaks that.
+    for line in media:
+        parts = line.split()
+        if not line.startswith("m=video ") and len(parts) > 1 and parts[1] != "0":
+            raise ValueError("answer accepts non-video media")
+    return text_value
+
+
+def _safe_request_id(headers: httpx.Headers) -> str | None:
+    for header in _REQUEST_ID_HEADERS:
+        value = headers.get(header)
+        if value:
+            return "".join(ch for ch in value if 33 <= ord(ch) <= 126)[:_REQUEST_ID_MAX] or None
+    return None
 
 
 class RingClientError(Exception):
@@ -574,3 +642,215 @@ class RingClient:
             or attributes.get("status") != expected
         ):
             raise RingClientError(operation, "malformed_response")
+
+    # ------------------------------------------------------------------ WHEP (V1-DEMO-03B)
+    def whep_session_collection_url(self, device_id: str, component_id: str | None) -> str:
+        """The Ring WHEP session collection for one device/component. Server-side identity only:
+        both values come from the tenant's stored inventory, never from an edge request."""
+        if not isinstance(device_id, str) or not _WHEP_DEVICE_ID.fullmatch(device_id):
+            raise RingClientError("whep_create", "unsupported_provider_identity")
+        base = self._settings.ring_api_base_url.rstrip("/")
+        url = f"{base}/v1/devices/{quote(device_id, safe='._~-')}/media/streaming/whep/sessions"
+        if component_id is not None:
+            if not isinstance(component_id, str) or not _WHEP_COMPONENT_ID.fullmatch(component_id):
+                raise RingClientError("whep_create", "unsupported_provider_identity")
+            url += f"?component_id={quote(component_id, safe='._~-')}"
+        return url
+
+    def validated_whep_location(self, raw: object, *, device_id: str | None = None) -> str:
+        """Accept only a session resource on the configured Ring API origin; return it absolute.
+
+        A Location on another origin is refused rather than followed: the teardown request
+        carries the Ring bearer token, which must never be sent anywhere else.
+        """
+        operation = "whep_location"
+        if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_LOCATION_CHARS:
+            raise RingClientError(operation, "invalid_location")
+        if any(not 32 < ord(character) < 127 for character in raw) or "#" in raw:
+            raise RingClientError(operation, "invalid_location")
+        scheme, host, port = self._expected_api_origin()
+        expected_port = port or 443
+        if raw.startswith("/"):
+            path, _, query = raw.partition("?")
+        else:
+            parts = urlsplit(raw)
+            try:
+                observed_port = parts.port or (443 if parts.scheme == "https" else None)
+            except ValueError:
+                raise RingClientError(operation, "invalid_location") from None
+            if parts.scheme != "https" or "@" in parts.netloc:
+                raise RingClientError(operation, "invalid_location")
+            if (parts.hostname or "").lower() != host.lower() or observed_port != expected_port:
+                raise RingClientError(operation, "invalid_location")
+            path, query = parts.path, parts.query
+        if not _WHEP_SESSION_PATH.fullmatch(path) or not _WHEP_LOCATION_QUERY.fullmatch(query):
+            raise RingClientError(operation, "invalid_location")
+        if device_id is not None:
+            collection = f"/v1/devices/{quote(device_id, safe='._~-')}/media/streaming/whep/"
+            if not path.startswith(collection):
+                raise RingClientError(operation, "invalid_location")
+        suffix = f"?{query}" if query else ""
+        return f"{scheme}://{host}:{expected_port}{path}{suffix}"
+
+    @staticmethod
+    def _whep_headers(access_token: SecretStr, *, with_body: bool) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {access_token.get_secret_value()}",
+            "Accept": SDP_MEDIA_TYPE,
+        }
+        if with_body:
+            headers["Content-Type"] = SDP_MEDIA_TYPE
+        return headers
+
+    @staticmethod
+    def _whep_failure(
+        operation: str,
+        category: str,
+        status_code: int | None,
+        headers: httpx.Headers | None,
+        error_type: type[RingClientError] = RingClientError,
+    ) -> RingClientError:
+        """Operation, category, status and a gateway correlation id. Never a header value, an
+        SDP body, a Location or a token."""
+        request_id = _safe_request_id(headers) if headers is not None else None
+        structlog.get_logger().warning(
+            "ring_provider_request_failed",
+            operation=operation,
+            category=category,
+            status_code=status_code,
+            provider_request_id=request_id,
+        )
+        return error_type(operation, category, status_code, provider_request_id=request_id)
+
+    async def _whep_send(
+        self,
+        operation: str,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        *,
+        max_body_bytes: int,
+        ambiguous_on_transport_failure: bool,
+    ) -> tuple[int, httpx.Headers, bytes, bool]:
+        """One request, no redirects, no retry. The body is read incrementally and abandoned
+        past ``max_body_bytes``; the returned flag says whether that happened."""
+        client = self._client_for(url)
+        timeout = httpx.Timeout(self._settings.ring_whep_timeout_seconds)
+        request = client.build_request(method, url, headers=headers, content=body, timeout=timeout)
+        try:
+            response = await client.send(request, stream=True, follow_redirects=False)
+            try:
+                payload = bytearray()
+                oversized = False
+                async for chunk in response.aiter_bytes():
+                    payload.extend(chunk)
+                    if len(payload) > max_body_bytes:
+                        oversized = True
+                        break
+            finally:
+                await response.aclose()
+        except _TRANSPORT_FAILURES as exc:
+            # A POST that died in flight may still have created a remote session. It is reported
+            # as ambiguous and is never replayed.
+            error_type = RingAmbiguousResult if ambiguous_on_transport_failure else RingClientError
+            raise self._whep_failure(
+                operation, "transport_failure", None, None, error_type
+            ) from exc
+        return response.status_code, response.headers, bytes(payload), oversized
+
+    def _whep_status_failure(
+        self, operation: str, status_code: int, headers: httpx.Headers
+    ) -> RingClientError:
+        if status_code == 401:
+            return self._whep_failure(operation, "unauthorized", status_code, headers)
+        if status_code == 403:
+            return self._whep_failure(operation, "forbidden", status_code, headers)
+        if status_code == 404:
+            return self._whep_failure(operation, "not_found", status_code, headers)
+        if status_code == 429:
+            return self._whep_failure(operation, "rate_limited", status_code, headers)
+        if 300 <= status_code < 400:
+            # Never follow a provider redirect with a bearer token attached.
+            return self._whep_failure(operation, "redirect_refused", status_code, headers)
+        if 400 <= status_code < 500:
+            return self._whep_failure(operation, "provider_rejected", status_code, headers)
+        if status_code >= 500:
+            # A 5xx after the request reached Ring cannot prove no session exists.
+            return self._whep_failure(
+                operation, "provider_unavailable", status_code, headers, RingAmbiguousResult
+            )
+        return self._whep_failure(operation, "unexpected_status", status_code, headers)
+
+    async def create_whep_session(
+        self,
+        access_token: SecretStr,
+        device_id: str,
+        component_id: str | None,
+        offer_sdp: bytes,
+        *,
+        max_answer_bytes: int,
+    ) -> RingWhepSession:
+        """POST the SDP offer to Ring once. Never retried here: the caller decides, and may only
+        retry after a definite ``unauthorized`` (no session can exist behind a 401)."""
+        operation = "whep_create"
+        url = self.whep_session_collection_url(device_id, component_id)
+        status_code, headers, payload, oversized = await self._whep_send(
+            operation,
+            "POST",
+            url,
+            self._whep_headers(access_token, with_body=True),
+            offer_sdp,
+            max_body_bytes=max_answer_bytes,
+            ambiguous_on_transport_failure=True,
+        )
+        if not 200 <= status_code < 300:
+            raise self._whep_status_failure(operation, status_code, headers)
+        raw_location = headers.get("location")
+        session_url: str | None = None
+        location_error: RingClientError | None = None
+        if raw_location is not None:
+            try:
+                session_url = self.validated_whep_location(raw_location, device_id=device_id)
+            except RingClientError:
+                location_error = self._whep_failure(
+                    operation, "invalid_location", status_code, headers
+                )
+        answer: str | None = None
+        answer_category: str | None = None
+        if oversized:
+            answer_category = "response_too_large"
+        else:
+            try:
+                answer = validate_sdp_answer(payload, headers.get("content-type"), max_answer_bytes)
+            except (ValueError, UnicodeError):
+                answer_category = "malformed_answer"
+        if location_error is None and answer is not None:
+            return RingWhepSession(answer, session_url)
+        # Ring answered 2xx, so a session may exist. Release it when its resource is trustworthy;
+        # an untrusted Location is never contacted with the bearer token.
+        if session_url is not None:
+            with contextlib.suppress(RingClientError):
+                await self.delete_whep_session(access_token, session_url)
+        if location_error is not None:
+            raise location_error
+        raise self._whep_failure(
+            operation, answer_category or "malformed_answer", status_code, headers
+        )
+
+    async def delete_whep_session(self, access_token: SecretStr, session_url: str) -> None:
+        """Tear down one validated session resource. 2xx and 404 both mean it is gone."""
+        operation = "whep_delete"
+        url = self.validated_whep_location(session_url)
+        status_code, headers, _payload, _oversized = await self._whep_send(
+            operation,
+            "DELETE",
+            url,
+            self._whep_headers(access_token, with_body=False),
+            None,
+            max_body_bytes=self._settings.ring_max_response_bytes,
+            ambiguous_on_transport_failure=False,
+        )
+        if 200 <= status_code < 300 or status_code == 404:
+            return
+        raise self._whep_status_failure(operation, status_code, headers)

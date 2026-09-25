@@ -34,6 +34,7 @@ veotrex-provision = "veotrex_api.provision_cli:main"
 veotrex-db-runtime-role = "veotrex_api.runtime_role:main"
 veotrex-ring-pending-expiry = "veotrex_api.ring_pending_expiry:main"
 veotrex-staff-recognition-package = "veotrex_api.staff_package:main"
+veotrex-edge-credential = "veotrex_api.edge_credentials:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/veotrex_api"]

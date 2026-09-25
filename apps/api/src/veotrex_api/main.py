@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +32,9 @@ from veotrex_api.db import (
     require_unprivileged,
     verify_runtime_role,
 )
+from veotrex_api.edge_api import is_edge_whep_offer, register_edge_routes
+from veotrex_api.edge_auth import EdgeAuthenticator
+from veotrex_api.edge_whep import EdgeWhepBroker, WhepLeaseRegistry
 from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
     VaultKeyProvider,
@@ -49,7 +54,12 @@ from veotrex_api.request_media import (
     canonical_code_payload,
     normalize_media_type,
 )
-from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientError
+from veotrex_api.ring_client import (
+    SDP_MEDIA_TYPE,
+    RingAmbiguousResult,
+    RingClient,
+    RingClientError,
+)
 from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
@@ -239,6 +249,19 @@ def create_app(
         resolved_vault,
         inventory_service,
     )
+    # Edge WHEP broker (V1-DEMO-03B). The lease registry is process-local and bounded; it is
+    # correct only because the API runs as a single worker process (ADR 0021).
+    edge_whep_broker = EdgeWhepBroker(
+        resolved_settings,
+        resolved_factory,
+        ring_service,
+        resolved_ring_client,
+        WhepLeaseRegistry(
+            max_active=resolved_settings.edge_whep_max_active_leases,
+            max_per_node=resolved_settings.edge_whep_max_leases_per_node,
+            ttl_seconds=resolved_settings.edge_whep_lease_ttl_seconds,
+        ),
+    )
     resolved_media = staff_media or StaffMediaStore(Path(resolved_settings.staff_media_dir))
     resolved_face_backend = face_backend or _face_backend_for(resolved_settings)
     staff_service = StaffEnrollmentService(
@@ -303,7 +326,13 @@ def create_app(
             environment=resolved_settings.environment,
             version=resolved_settings.app_version,
         )
+        expiry = asyncio.create_task(edge_whep_broker.run_expiry_loop())
         yield
+        expiry.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await expiry
+        # Outstanding Ring sessions are torn down while the Ring client is still open.
+        await edge_whep_broker.shutdown()
         await resolved_ring_client.aclose()
         await resolved_engine.dispose()
         logger.info("service_stopped", service=resolved_settings.service_name)
@@ -321,6 +350,17 @@ def create_app(
         window_seconds=60,
     )
     app.state.staff_service = staff_service
+    app.state.edge_authenticator = EdgeAuthenticator(
+        resolved_factory, AuthenticationFailureLogLimiter()
+    )
+    app.state.edge_whep_broker = edge_whep_broker
+    register_edge_routes(
+        app,
+        edge_whep_broker,
+        AuthenticationFailureLogLimiter(
+            limit=resolved_settings.edge_whep_rate_limit_per_minute, window_seconds=60
+        ),
+    )
     app.state.staff_recognition_service = recognition_service
     register_staff_routes(
         app,
@@ -351,12 +391,17 @@ def create_app(
             media_type = ""
             is_token_exchange = request.url.path == "/v1/integrations/ring/token-exchange"
             is_enrollment_image = is_enrollment_upload(request.method, request.url.path)
+            is_edge_offer = is_edge_whep_offer(request.method, request.url.path)
             if is_token_exchange:
                 body_limit = resolved_settings.ring_token_exchange_body_bytes
             elif request.url.path == "/v1/providers/ring/webhooks":
                 body_limit = resolved_settings.ring_webhook_body_bytes
             elif is_enrollment_image:
                 body_limit = resolved_settings.staff_enrollment_image_bytes
+            elif is_edge_offer:
+                # Refused before authentication or forwarding: an oversized offer never
+                # reaches the broker, let alone Ring.
+                body_limit = resolved_settings.edge_whep_max_offer_bytes
             if body_limit is not None:
                 media_type = normalize_media_type(request.headers.get("content-type"))
 
@@ -380,6 +425,8 @@ def create_app(
                     accepted = TOKEN_EXCHANGE_MEDIA_TYPES
                 elif is_enrollment_image:
                     accepted = ALLOWED_MEDIA_TYPES
+                elif is_edge_offer:
+                    accepted = frozenset({SDP_MEDIA_TYPE})
                 else:
                     accepted = frozenset({"application/json"})
                 if media_type not in accepted:

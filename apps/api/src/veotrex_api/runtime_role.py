@@ -159,14 +159,19 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "ring_pending_links": _function_only("pending-link state machine functions"),
     "ring_webhook_inbox": _function_only("webhook inbox functions"),
     "tenant_identity_bindings": _function_only("resolve_tenant_identity_binding"),
+    # Machine credentials (migration 0008): digests only, reached through the authentication
+    # function alone, so a compromised API cannot enumerate or rewrite them.
+    "edge_node_credentials": _function_only("authenticate_edge_node_credential"),
     "alembic_version": _no_access("migration bookkeeping"),
     "jurisdiction_policies": _no_access("policy catalog is file-backed in the API today"),
     "policy_versions": _no_access("policy catalog is file-backed in the API today"),
     "facilities": _no_access("no API endpoint yet"),
     "areas": _no_access("no API endpoint yet"),
     "zones": _no_access("no API endpoint yet"),
-    "edge_nodes": _no_access("no API endpoint yet"),
-    "camera_assignments": _no_access("no API endpoint yet"),
+    # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
+    # Nodes and assignments are still managed only by the admin identity.
+    "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),
+    "camera_assignments": _read("edge broker: the node's active camera assignment"),
 }
 
 # The intentionally exposed SECURITY DEFINER surface. Each was created with a fixed
@@ -189,6 +194,7 @@ RUNTIME_FUNCTION_GRANTS: tuple[str, ...] = (
     "vault_credential_open(uuid, text, text, uuid)",
     "vault_credential_replace(uuid, text, text, uuid, integer, integer, bytea, bytea)",
     "vault_credential_delete(uuid, text, text, uuid)",
+    "authenticate_edge_node_credential(uuid, bytea)",
 )
 # ``vault_credential_authorized`` is deliberately absent: it is the private predicate the four
 # vault functions call as their owner, and the runtime must not be able to probe it.
@@ -986,6 +992,16 @@ def probe(
         "vault open of an unknown credential discloses nothing",
         "SELECT count(*) FROM public.vault_credential_open("
         "gen_random_uuid(), 'RING', 'ring_pending_link', gen_random_uuid()) WHERE outcome = 'ok'",
+        0,
+    )
+    expect_refused(
+        "cannot read edge node credentials directly",
+        "SELECT count(*) FROM public.edge_node_credentials",
+    )
+    expect_count(
+        "edge credential authentication of an unknown selector discloses nothing",
+        "SELECT count(*) FROM public.authenticate_edge_node_credential("
+        "gen_random_uuid(), decode(repeat('00', 32), 'hex'))",
         0,
     )
     expect_refused("cannot create tables", f"CREATE TABLE public.{PROBE_ARTIFACT} (id int)")
