@@ -154,6 +154,13 @@ PAGE = """<!doctype html>
       <ul id="calibration"></ul>
     </div>
     <div class="card">
+      <div class="muted" style="margin-bottom:6px">Room transitions</div>
+      <div class="muted" id="transition-counts">&nbsp;</div>
+      <ul id="transitions"></ul>
+      <div class="muted">Counted only when a track crosses a configured doorway line. Appearing
+        in or leaving the view is not an entry or an exit. Anonymous; nobody is identified.</div>
+    </div>
+    <div class="card">
       <div class="muted" style="margin-bottom:6px">Activity</div>
       <ul id="timeline"></ul>
     </div>
@@ -291,6 +298,7 @@ async function pullState(){
     $("candidates").textContent = "Candidate person tracks: " + (s.candidate_tracks ?? 0)
       + " (shown, not counted)";
     calibration(d.calibration || {}, d.metrics);
+    transitions(d.room_transitions || {});
     pill($("kind"), s.source.is_live ? s.source.kind : s.source.kind + " (not live)",
          s.source.is_live ? "ok" : "warn");
     const h = s.source.health;
@@ -337,6 +345,26 @@ function calibration(c, m){
   items.push("Candidates flagged for review: " + (m.nuisance_review_candidates ?? 0)
     + " (review only \u2014 never masked automatically)");
   list.replaceChildren(...items.map(text => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    return li;
+  }));
+}
+// Room transitions (V1-05A). Portal labels are operator-supplied text: textContent only.
+function transitions(t){
+  const portals = t.portals || [];
+  const labels = {};
+  portals.forEach((p, i) => { labels[p.portal_id] = p.label || ("door " + (i + 1)); });
+  $("transition-counts").textContent = portals.length
+    ? ("Entries: " + (t.entries_total ?? 0) + " \u00b7 Exits: " + (t.exits_total ?? 0)
+       + " \u00b7 portals: " + portals.length)
+    : "No doorway configured \u2014 entries and exits are not measured.";
+  const items = (t.recent || []).map(e => {
+    const verb = e.kind === "PERSON_ENTERED_ROOM" ? "Entered via " : "Exited via ";
+    return verb + (labels[e.portal_id] || e.portal_id) + " \u00b7 track " + e.track_id;
+  });
+  const list = $("transitions");
+  list.replaceChildren(...(items.length ? items : ["No room transitions yet."]).map(text => {
     const li = document.createElement("li");
     li.textContent = text;
     return li;
@@ -394,6 +422,7 @@ def build_handler(runtime: LiveDemoRuntime) -> type[BaseHTTPRequestHandler]:
                     "running": runtime.running,
                     "calibration": runtime.calibration(),
                     "occupancy_diagnostics": runtime.occupancy_diagnostics(),
+                    "room_transitions": runtime.room_transitions(),
                 }
                 self._send(
                     200,

@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -944,6 +945,8 @@ TENANT_OWNED_TABLES = (
     "guardian_contacts",
     "child_guardian_links",
     "child_release_events",
+    # V1-05A
+    "camera_portals",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles
@@ -1678,3 +1681,102 @@ class ChildReleaseEvent(Base, IdMixin, TenantOwnedMixin):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class CameraPortal(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    """One operator-configured doorway line in one camera's picture (V1-05A).
+
+    Scoped to tenant, facility, classroom (``area_id``) and camera. Coordinates are normalised
+    to the frame (origin top-left, y down); ``inside_side`` is the room's side as seen on the
+    picture. Used by the edge to report anonymous room entry / exit when a track crosses the
+    line - never an identity, never a classification. Edited (revision + 1) or archived, never
+    deleted. The edge does not yet receive these rows; see ADR 0029.
+    """
+
+    __tablename__ = "camera_portals"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_camera_portals_id_tenant"),
+        ForeignKeyConstraint(
+            ["facility_id", "tenant_id"],
+            ["facilities.id", "facilities.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_camera_portals_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["area_id", "facility_id", "tenant_id"],
+            ["areas.id", "areas.facility_id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_camera_portals_area_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["camera_id", "tenant_id"],
+            ["cameras.id", "cameras.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_camera_portals_camera_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_camera_portals_creator_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["archived_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_camera_portals_archiver_tenant",
+        ),
+        CheckConstraint("status IN ('ACTIVE', 'ARCHIVED')", name="ck_camera_portals_status"),
+        CheckConstraint(
+            "inside_side IN ('LEFT', 'RIGHT', 'ABOVE', 'BELOW')",
+            name="ck_camera_portals_inside_side",
+        ),
+        # BETWEEN is false for NaN and for +/-Infinity in PostgreSQL, so these also refuse them.
+        CheckConstraint(
+            "x1 BETWEEN 0 AND 1 AND y1 BETWEEN 0 AND 1 AND x2 BETWEEN 0 AND 1 "
+            "AND y2 BETWEEN 0 AND 1",
+            name="ck_camera_portals_normalised",
+        ),
+        CheckConstraint(
+            "sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)) >= 0.01",
+            name="ck_camera_portals_length",
+        ),
+        CheckConstraint("deadband BETWEEN 0 AND 0.1", name="ck_camera_portals_deadband"),
+        CheckConstraint(
+            "label ~ '^[A-Za-z0-9 _.()/:#-]{1,40}$' AND label = btrim(label)",
+            name="ck_camera_portals_label",
+        ),
+        CheckConstraint("revision >= 1", name="ck_camera_portals_revision"),
+        CheckConstraint(
+            "(status = 'ARCHIVED') = (archived_at IS NOT NULL) "
+            "AND (archived_at IS NULL) = (archived_by_actor_id IS NULL)",
+            name="ck_camera_portals_archive",
+        ),
+        Index(
+            "uq_camera_portals_active_label",
+            "tenant_id",
+            "camera_id",
+            text("lower(label)"),
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+        Index("ix_camera_portals_camera", "tenant_id", "camera_id", "status"),
+        Index("ix_camera_portals_classroom", "tenant_id", "area_id", "status"),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    camera_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    label: Mapped[str] = mapped_column(String(40), nullable=False)
+    x1: Mapped[float] = mapped_column(Float, nullable=False)
+    y1: Mapped[float] = mapped_column(Float, nullable=False)
+    x2: Mapped[float] = mapped_column(Float, nullable=False)
+    y2: Mapped[float] = mapped_column(Float, nullable=False)
+    inside_side: Mapped[str] = mapped_column(String(8), nullable=False)
+    deadband: Mapped[float] = mapped_column(Float, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)

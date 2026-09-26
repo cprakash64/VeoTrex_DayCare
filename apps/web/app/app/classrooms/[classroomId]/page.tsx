@@ -85,7 +85,8 @@ export default async function ClassroomPage({ params }: Props) {
           <ul>
             {room.cameras.map((camera) => (
               <li key={camera.camera_id}>
-                {camera.name} · {camera.zone_name} · {camera.status.toLowerCase()}
+                {camera.name} · {camera.zone_name} · {camera.status.toLowerCase()} ·{" "}
+                <Link href={`/app/classrooms/${room.classroom_id}/cameras/${camera.camera_id}`}>Doorway lines</Link>
               </li>
             ))}
           </ul>

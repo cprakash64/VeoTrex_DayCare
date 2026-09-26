@@ -79,6 +79,9 @@ an administrative action and never creates a release.
 - Facility/building is represented by typed `Area`; whether Building deserves a separate entity is open.
 - Actor roles are placeholders pending the authorization model.
 - Tenant-specific activation of approved global policy versions requires a future effective-dated binding.
+- A `CameraPortal` (V1-05A, ADR 0029) is an operator doorway line on one classroom camera's picture,
+  used only to decide anonymous room entry / exit from track crossings. Room transition events are
+  edge-session facts and are not persisted yet.
 - Incident and media entities are non-goals. Guardian contacts and pickup authorization are
   operator records (V1-04E, ADR 0028), never camera or biometric identities. Staff persons
   and their biometric templates were added in V1-02A (ADR 0019). Children exist only as

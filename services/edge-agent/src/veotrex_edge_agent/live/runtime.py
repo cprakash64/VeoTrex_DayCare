@@ -25,6 +25,13 @@ one whose evidence the ``OccupancyLedger`` has validated changes the head count 
 is an ``OCCUPANCY_CANDIDATE``: drawn, counted separately, explained in the diagnostics, and never
 silently discarded. See ``occupancy``.
 
+**Room entry and exit need a doorway (V1-05A).** With operator-configured portals the runtime
+also feeds each confirmed, occupancy-validated observation to a ``PortalMonitor``, which emits
+``PERSON_ENTERED_ROOM`` / ``PERSON_EXITED_ROOM`` only when a track crosses a portal from one
+stable side to the other. Those are a separate vocabulary on purpose: appearing in view is still
+``PERSON_APPEARED_IN_VIEW``, a track ending is still not an exit, and a discontinuity clears all
+portal state without synthesising anything. See ``portal_crossing``.
+
 No recognition of any kind runs. Nothing in this module imports the face stack, and a test
 asserts the package cannot reach it. Everyone in view is an anonymous track, which is what
 makes the demo honest: an unidentified person is simply a person, never a "child" and never an
@@ -47,6 +54,8 @@ from veotrex_edge_agent.live.occupancy import (
     OccupancyEvidencePolicy,
     OccupancyLedger,
 )
+from veotrex_edge_agent.live.portal_crossing import CrossingPolicy, PortalMonitor
+from veotrex_edge_agent.live.portal_geometry import PortalSet
 from veotrex_edge_agent.live.preview import PreviewRenderer
 from veotrex_edge_agent.live.scheduler import (
     AdaptiveInferencePacer,
@@ -150,6 +159,8 @@ class LiveDemoRuntime:
         ignore_regions: IgnoreRegionSet | None = None,
         inference_rate: InferenceRateConfig | None = None,
         occupancy_policy: OccupancyEvidencePolicy | None = None,
+        portals: PortalSet | None = None,
+        crossing_policy: CrossingPolicy | None = None,
     ) -> None:
         # Optional on purpose: --headless and the automated tests run the whole pipeline with
         # no preview at all, so nothing about detection or tracking depends on it existing.
@@ -177,6 +188,12 @@ class LiveDemoRuntime:
         # only lets high-score detections create or confirm a track, so all of them were high.
         self._pre_confirmation_high = max(0, effective_tracking.confirmation_observations - 1)
         self.timeline = timeline or DemoTimeline()
+        # Empty unless portals are configured; an empty monitor is never consulted, so a camera
+        # without a doorway configured behaves exactly as before.
+        self.portals = PortalMonitor(
+            portals or PortalSet(), stream_id=source.source_id, policy=crossing_policy
+        )
+        self._discontinuities_seen = 0
         self._state = LiveState(
             source_kind=str(source.kind),
             source_id=source.source_id,
@@ -252,6 +269,19 @@ class LiveDemoRuntime:
         """Per-track evidence for operator review: normalised geometry and scores, no pixels."""
         return self.occupancy.diagnostics()
 
+    def room_transitions(self) -> dict[str, Any]:
+        """Configured portals, entry/exit counts and the recent anonymous transitions."""
+        return self.portals.snapshot()
+
+    def _sync_discontinuity(self) -> None:
+        """Drop every portal state when the tracker has cleared its own. A reconnect, an
+        over-long gap and a resolution change all end every track without an exit: nothing
+        before the break may be joined to anything after it."""
+        seen = self._pipeline.metrics.tracking_discontinuities_total
+        if seen != self._discontinuities_seen:
+            self._discontinuities_seen = seen
+            self.portals.reset()
+
     def calibration(self) -> dict[str, Any]:
         """The configured ignore regions and what they have suppressed. Nothing is hidden."""
         status = self.ignore_regions.status()
@@ -302,6 +332,7 @@ class LiveDemoRuntime:
                         if box.occupancy_status != OCCUPANCY_VALIDATED
                     ),
                     regions=self.ignore_regions,
+                    portals=self.portals.portals,
                 )
             self._publish(current_frame, live_boxes)
 
@@ -321,6 +352,8 @@ class LiveDemoRuntime:
             for record in self._pipeline.process(
                 frames(), run_id=self._source.source_id, frame_hook=hook
             ):
+                if self.portals:
+                    self._sync_discontinuity()
                 observation = record.observation
                 if observation is not None:
                     if observation.lifecycle is TrackLifecycle.TRACK_STARTED:
@@ -344,11 +377,31 @@ class LiveDemoRuntime:
                             session_ms=self._session_ms(),
                             track_id=observation.track_id,
                         )
+                    if self.portals:
+                        # Validated tracks only: a candidate may be a poster, and a crossing it
+                        # "makes" is recorded as suppressed rather than announced.
+                        for transition in self.portals.observe(
+                            observation.track_id,
+                            observation.bbox_xyxy,
+                            width=getattr(current_frame, "width", 0),
+                            height=getattr(current_frame, "height", 0),
+                            timestamp_ms=observation.timestamp_ms,
+                            eligible=self.occupancy.status(observation.track_id)
+                            == OCCUPANCY_VALIDATED,
+                        ):
+                            self._logger.info(
+                                "live_room_transition",
+                                kind=str(transition.kind),
+                                portal_id=transition.portal_id,
+                                track_id=transition.track_id,
+                            )
                     # Confidence comes from the observation rather than the draw hook, which
                     # only carries geometry. The hook for this frame runs after its records.
                     confidences[observation.track_id] = observation.detection_confidence
                 summary = record.summary
                 if summary is not None:
+                    # A track ending is never an exit, whichever side it was on.
+                    self.portals.forget(summary.track_id)
                     ended = self.occupancy.end(summary.track_id)
                     if ended is not None and ended.validated:
                         self.timeline.record(

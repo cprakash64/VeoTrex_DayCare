@@ -31,6 +31,7 @@ burned into the picture.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Collection, Sequence
@@ -44,6 +45,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
     from numpy.typing import NDArray
 
+    from veotrex_edge_agent.live.portal_geometry import PortalSet
     from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 
 # Defaults chosen for the demo: smooth enough to read as live, cheap enough to be invisible
@@ -69,6 +71,8 @@ BOX_COLOURS = (
 )
 CANDIDATE_COLOUR = (150, 150, 150)
 REGION_COLOUR = (0, 190, 255)
+# Portals are drawn in a colour no track or region uses.
+PORTAL_COLOUR = (255, 120, 220)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +199,7 @@ class PreviewRenderer:
         source_health: str,
         candidates: Collection[int] = frozenset(),
         regions: IgnoreRegionSet | None = None,
+        portals: PortalSet | None = None,
     ) -> PreviewFrame | None:
         """Encode this frame if one is due, otherwise skip it cheaply.
 
@@ -215,7 +220,7 @@ class PreviewRenderer:
         started = time.perf_counter_ns()
         try:
             canvas = self._annotate(
-                cv2, image, boxes, occupancy, source_health, candidates, regions
+                cv2, image, boxes, occupancy, source_health, candidates, regions, portals
             )
             ok, encoded = cv2.imencode(
                 ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), self.config.jpeg_quality]
@@ -247,6 +252,7 @@ class PreviewRenderer:
         source_health: str,
         candidates: Collection[int] = frozenset(),
         regions: IgnoreRegionSet | None = None,
+        portals: PortalSet | None = None,
     ) -> Any:
         """Boxes and track numbers on a copy of the frame.
 
@@ -276,6 +282,36 @@ class PreviewRenderer:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
                 REGION_COLOUR,
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Portals (V1-05A): the doorway line, a short arrow from its midpoint into the room, and a
+        # number. The operator's label stays on the dashboard, never in the picture.
+        for number, portal in enumerate(portals.portals if portals else (), start=1):
+            if not portal.enabled:
+                continue  # a disabled portal is not evaluated, so it is not drawn as if it were
+            colour = PORTAL_COLOUR
+            start = (int(portal.x1 * canvas_width), int(portal.y1 * canvas_height))
+            end = (int(portal.x2 * canvas_width), int(portal.y2 * canvas_height))
+            cv2.line(canvas, start, end, colour, 2, cv2.LINE_AA)
+            # The inside normal is in normalised units; scaled to pixels it still points into
+            # the room's half of the picture.
+            nx, ny = portal.inside_normal
+            vx, vy = nx * canvas_width, ny * canvas_height
+            magnitude = max(math.hypot(vx, vy), 1e-9)
+            reach = 0.06 * min(canvas_width, canvas_height)
+            mx, my = (start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0
+            tip = (int(mx + vx / magnitude * reach), int(my + vy / magnitude * reach))
+            cv2.arrowedLine(canvas, (int(mx), int(my)), tip, colour, 2, cv2.LINE_AA, 0, 0.35)
+            portal_text = f"door {number} in"
+            cv2.putText(
+                canvas,
+                portal_text,
+                (tip[0] + 4, tip[1] + 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                colour,
                 1,
                 cv2.LINE_AA,
             )

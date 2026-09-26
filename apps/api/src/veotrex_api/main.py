@@ -18,6 +18,8 @@ from veotrex_api.access import (
     require_permission,
 )
 from veotrex_api.authorization import Permission
+from veotrex_api.camera_portal_api import register_camera_portal_routes
+from veotrex_api.camera_portal_service import CameraPortalService
 from veotrex_api.child_roster_api import register_child_roster_routes
 from veotrex_api.child_roster_service import ChildRosterService
 from veotrex_api.classroom_api import register_classroom_routes
@@ -394,6 +396,10 @@ def create_app(
     # no camera, face backend or edge credential can reach them, and no route accepts an image.
     app.state.guardian_service = GuardianService(resolved_factory)
     register_guardian_routes(app, app.state.guardian_service)
+    # Camera doorway lines for anonymous room entry/exit (V1-05A). Configuration only; human
+    # routes; the edge does not fetch these yet.
+    app.state.camera_portal_service = CameraPortalService(resolved_factory)
+    register_camera_portal_routes(app, app.state.camera_portal_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,

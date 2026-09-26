@@ -542,3 +542,35 @@ export async function getReleaseOptions(classroomId: string): Promise<ReleaseOpt
 export async function releaseChild(classroomId: string, payload: ReleasePayload): Promise<Response> {
   return sendJson(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/release`, "POST", payload);
 }
+
+// ----------------------------------------------------------- camera portals (V1-05A)
+import type { CameraPortals, PortalPayload, PortalUpdatePayload } from "./portals";
+
+function portalsPath(classroomId: string, cameraId: string): string {
+  return `/v1/classrooms/${encodeURIComponent(classroomId)}/cameras/${encodeURIComponent(cameraId)}/portals`;
+}
+
+export async function getCameraPortals(classroomId: string, cameraId: string): Promise<CameraPortals | null> {
+  return jsonOrNull<CameraPortals>(portalsPath(classroomId, cameraId));
+}
+
+export async function createCameraPortal(
+  classroomId: string,
+  cameraId: string,
+  payload: PortalPayload,
+): Promise<Response> {
+  return sendJson(portalsPath(classroomId, cameraId), "POST", payload);
+}
+
+export async function updateCameraPortal(
+  classroomId: string,
+  cameraId: string,
+  portalId: string,
+  payload: PortalUpdatePayload,
+): Promise<Response> {
+  return sendJson(`${portalsPath(classroomId, cameraId)}/${encodeURIComponent(portalId)}`, "PATCH", payload);
+}
+
+export async function archiveCameraPortal(classroomId: string, cameraId: string, portalId: string): Promise<Response> {
+  return sendJson(`${portalsPath(classroomId, cameraId)}/${encodeURIComponent(portalId)}/archive`, "POST");
+}

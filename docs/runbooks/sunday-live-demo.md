@@ -61,6 +61,7 @@ Replace the device with the one step 1 reported. Useful options:
 | `--pixel-format MJPG` | the default. YUYV at 720p is capped at 9 fps by USB 2.0 bandwidth |
 | `--view left` \| `right` | **only** for dual-lens modules that send both lenses in one frame |
 | `--ignore-region ...` | drop detections from a known fixed artifact. See below |
+| `--portal ...` | a doorway line for anonymous room entry/exit counts. See below |
 
 ### Masking a known false positive
 
@@ -113,6 +114,35 @@ back as `--ignore-region`, look at the dashboard and confirm with your own eyes 
 on a fixed object. Also check that nobody could ever be wholly inside that rectangle: a narrow
 strip masks a small or distant person entirely. Labels may use letters, digits, spaces and
 `. _ - ( ) / : #`.
+
+### Room entry and exit need a doorway line (V1-05A)
+
+"Appeared in view" is not "entered the room", and "no longer visible" is not "left it". To count
+entries and exits, draw a line across the doorway and say which side is the room:
+
+```
+uv run --all-packages veotrex-edge live-demo --device /dev/video0 \
+  --portal door:0.55,0.2,0.55,0.95,RIGHT,Classroom door
+```
+
+Format `[id:]x1,y1,x2,y2,INSIDE[,label][,deadband=D]`, normalised like ignore regions (origin top
+left). `INSIDE` is the room's side **as seen on the picture**: `LEFT`/`RIGHT` for a line running
+up and down the picture, `ABOVE`/`BELOW` for one running across it; the demo refuses a side that
+runs along the line. Up to four portals; an invalid one stops the demo before the camera or the
+detector starts. The **Room transitions** card shows entries, exits
+and "Entered via <door>" / "Exited via <door>"; the preview draws the line with an arrow into the
+room.
+
+The rules: a person's position is the bottom-centre of their box. A crossing needs them clearly on
+one side (outside `--portal-deadband`, default 0.02), then three detections in a row clearly on the
+other side (`--portal-confirm-observations`), through the drawn segment. Standing in the doorway
+counts nothing. Someone already inside when the demo starts, or first seen inside, did not enter;
+someone who vanishes inside did not leave; a reconnect clears everything. Only validated tracks
+(below) are counted - a candidate's crossing is reported as suppressed. Nobody is identified, and
+nothing is sent anywhere: the events stay on this dashboard.
+
+The web app can store the same lines per classroom camera (Classrooms -> camera -> Doorway lines)
+and shows each as a ready-to-copy `--portal` flag. The edge does **not** fetch them yet.
 
 ### Occupancy counts evidence
 

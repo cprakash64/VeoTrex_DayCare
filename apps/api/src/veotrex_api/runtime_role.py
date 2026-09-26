@@ -229,6 +229,13 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "child_release_events": _append(
         "authorized child release records paired with their check-out; append-only by grant"
     ),
+    # V1-05A: operator doorway lines per camera; edited or archived, never deleted.
+    "camera_portals": _write(
+        "camera doorway lines for anonymous room entry/exit; archived, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),

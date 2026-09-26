@@ -24,6 +24,8 @@ from veotrex_edge_agent.live.camera import (
     discover_cameras,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.portal_crossing import DEFAULT_CONFIRM_OBSERVATIONS, CrossingPolicy
+from veotrex_edge_agent.live.portal_geometry import DEFAULT_DEADBAND, PortalError, build_portals
 from veotrex_edge_agent.live.preview import (
     DEFAULT_JPEG_QUALITY,
     DEFAULT_PREVIEW_FPS,
@@ -163,6 +165,31 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
             "how much of a detection must lie inside an ignore region before it is dropped. "
             "Lower values suppress more, and risk hiding a person standing in front of it"
         ),
+    )
+    command.add_argument(
+        "--portal",
+        action="append",
+        default=None,
+        metavar="[id:]x1,y1,x2,y2,INSIDE[,label]",
+        dest="portals",
+        help=(
+            "a doorway line in normalized 0-1 frame coordinates, with INSIDE (LEFT, RIGHT, "
+            "ABOVE or BELOW, as seen on the picture) the side that is the room. A person "
+            "crossing it from one side to the other is reported as an anonymous room entry "
+            "or exit. Optional; repeatable up to 4 times"
+        ),
+    )
+    command.add_argument(
+        "--portal-deadband",
+        type=float,
+        default=DEFAULT_DEADBAND,
+        help="distance from a portal line within which a position counts as neither side",
+    )
+    command.add_argument(
+        "--portal-confirm-observations",
+        type=int,
+        default=DEFAULT_CONFIRM_OBSERVATIONS,
+        help="consecutive observations on the new side needed to confirm a crossing",
     )
     command.add_argument("--detector", choices=DETECTOR_CHOICES, default="yolox")
     command.add_argument(
@@ -400,6 +427,20 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
     except IgnoreRegionError as exc:
         print(f"invalid ignore region: {exc}", file=sys.stderr)
         return 2
+    try:
+        # Validated with everything else, before a source opens or a GPU worker starts.
+        portals = build_portals(
+            getattr(arguments, "portals", None),
+            deadband=getattr(arguments, "portal_deadband", DEFAULT_DEADBAND),
+        )
+        crossing_policy = CrossingPolicy(
+            confirm_observations=getattr(
+                arguments, "portal_confirm_observations", DEFAULT_CONFIRM_OBSERVATIONS
+            )
+        )
+    except (PortalError, ValueError) as exc:
+        print(f"invalid portal: {exc}", file=sys.stderr)
+        return 2
 
     try:
         source = _source(arguments)
@@ -444,12 +485,22 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
                 "detection mostly OUTSIDE a region - a person standing in front of it - can be "
                 "suppressed."
             )
+    if portals:
+        print(f"Room transitions from {len(portals.enabled)} configured portal(s):")
+        for portal in portals.portals:
+            print(f"  {portal.as_dict()}")
+        print(
+            "  Entry/exit is reported only for a track crossing a portal line. Appearing in or "
+            "leaving the view is never an entry or an exit, and nobody is identified."
+        )
     runtime = LiveDemoRuntime(
         source,
         detector,
         preview=preview,
         ignore_regions=regions,
         inference_rate=inference_rate,
+        portals=portals,
+        crossing_policy=crossing_policy,
     )
     server: DemoServer | None = None
     code = 0
@@ -511,6 +562,7 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
                 # Geometry and confidence only. A suggested region in here is for review and is
                 # never applied unless the operator passes it back as --ignore-region.
                 "occupancy_diagnostics": runtime.occupancy_diagnostics(),
+                "room_transitions": runtime.room_transitions(),
             },
             indent=2,
             sort_keys=True,

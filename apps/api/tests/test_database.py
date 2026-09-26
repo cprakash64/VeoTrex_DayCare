@@ -55,6 +55,8 @@ TENANT_TABLES = [
     "guardian_contacts",
     "child_guardian_links",
     "child_release_events",
+    # V1-05A
+    "camera_portals",
 ]
 
 
@@ -101,8 +103,8 @@ async def test_migration_enables_rls_on_every_tenant_table(admin_settings: Setti
             policies = await connection.scalar(
                 text("SELECT count(*) FROM pg_policies WHERE policyname = 'tenant_isolation'")
             )
-        assert enabled == len(TENANT_TABLES) == 27
-        assert policies == 27
+        assert enabled == len(TENANT_TABLES) == 28
+        assert policies == 28
         async with engine.connect() as connection:
             tenants_rls = (
                 await connection.execute(
