@@ -8,9 +8,10 @@
  * picture and ABOVE/BELOW for one running across it; a side nearly parallel to the line is
  * ambiguous and refused - the same rules the API and the edge apply.
  *
- * Saving a portal here does not yet change what a camera reports: the edge does not receive
- * portals from the control plane in this stage. Each portal shows the exact local evaluation
- * flag instead. Nothing here concerns who anyone is.
+ * Saving a portal here does not yet change what a camera reports. V1-05B added the managed edge
+ * path (an edge node can pull its cameras' portals), but no deployed node consumes it, so the API
+ * still says edge_distribution NOT_CONNECTED. Each portal shows the exact local evaluation flag
+ * instead. Nothing here concerns who anyone is.
  */
 
 export type CameraPortal = Readonly<{

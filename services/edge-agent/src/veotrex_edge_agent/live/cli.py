@@ -24,8 +24,20 @@ from veotrex_edge_agent.live.camera import (
     discover_cameras,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.managed_config import DEFAULT_REFRESH_SECONDS
+from veotrex_edge_agent.live.managed_session import (
+    ManagedEdgeSession,
+    PortalPlan,
+    PortalPlanError,
+    resolve_portal_plan,
+)
 from veotrex_edge_agent.live.portal_crossing import DEFAULT_CONFIRM_OBSERVATIONS, CrossingPolicy
-from veotrex_edge_agent.live.portal_geometry import DEFAULT_DEADBAND, PortalError, build_portals
+from veotrex_edge_agent.live.portal_geometry import (
+    DEFAULT_DEADBAND,
+    PortalError,
+    PortalSet,
+    build_portals,
+)
 from veotrex_edge_agent.live.preview import (
     DEFAULT_JPEG_QUALITY,
     DEFAULT_PREVIEW_FPS,
@@ -33,6 +45,7 @@ from veotrex_edge_agent.live.preview import (
     PreviewRenderer,
 )
 from veotrex_edge_agent.live.ring import RingWhepSource
+from veotrex_edge_agent.live.room_event_outbox import DEFAULT_CAPACITY as DEFAULT_OUTBOX_CAPACITY
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime
 from veotrex_edge_agent.live.scheduler import (
     DEFAULT_INFERENCE_FPS,
@@ -59,6 +72,8 @@ SOURCE_CHOICES = ("camera", "synthetic", "ring")
 # The same variables EdgeSettings reads (V1-DEMO-03B), so the service and the demo agree.
 CONTROL_PLANE_URL_ENV = "VEOTREX_EDGE_CONTROL_PLANE_URL"
 CREDENTIAL_FILE_ENV = "VEOTREX_EDGE_CREDENTIAL_FILE"
+# Private (0700) directory for the managed-portal cache and the room-event outbox (V1-05B).
+STATE_DIR_ENV = "VEOTREX_EDGE_STATE_DIR"
 DETECTOR_CHOICES = ("yolox", "none")
 BROKER_CONFIGURATION_CATEGORIES = frozenset(
     {
@@ -178,6 +193,44 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
             "crossing it from one side to the other is reported as an anonymous room entry "
             "or exit. Optional; repeatable up to 4 times"
         ),
+    )
+    command.add_argument(
+        "--managed-portals",
+        action="store_true",
+        help=(
+            "take this camera's doorway lines from the VeoTrex control plane (refreshed "
+            "periodically, last-known-good kept) and upload its anonymous room events. Uses "
+            "--control-plane-url and --credential-file; cannot be combined with --portal. "
+            "The only portal source outside local/development/test/ci"
+        ),
+    )
+    command.add_argument(
+        "--managed-camera",
+        default=None,
+        help=(
+            "with --managed-portals: the VeoTrex camera UUID assigned to this edge node "
+            "(default: --ring-camera)"
+        ),
+    )
+    command.add_argument(
+        "--state-dir",
+        default=None,
+        help=(
+            "with --managed-portals: absolute path of a private (0700) directory for the "
+            f"config cache and the event outbox (default: ${STATE_DIR_ENV})"
+        ),
+    )
+    command.add_argument(
+        "--config-refresh-seconds",
+        type=float,
+        default=DEFAULT_REFRESH_SECONDS,
+        help="with --managed-portals: how often to re-read the configuration (30-600 s)",
+    )
+    command.add_argument(
+        "--outbox-capacity",
+        type=int,
+        default=DEFAULT_OUTBOX_CAPACITY,
+        help="with --managed-portals: most events held while the control plane is unreachable",
     )
     command.add_argument(
         "--portal-deadband",
@@ -441,7 +494,55 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
     except (PortalError, ValueError) as exc:
         print(f"invalid portal: {exc}", file=sys.stderr)
         return 2
+    try:
+        plan = portal_plan(arguments)
+    except PortalPlanError as exc:
+        print(f"portal source refused: {exc.category}", file=sys.stderr)
+        return 2
+    managed: ManagedEdgeSession | None = None
+    if plan.managed is not None:
+        try:
+            # Local I/O only (state directory, cache, outbox): still before any camera or GPU.
+            managed = ManagedEdgeSession.open(plan.managed)
+        except PortalPlanError as exc:
+            print(f"portal source refused: {exc.category}", file=sys.stderr)
+            return 2
+    try:
+        return _run_demo(
+            arguments, inference_rate, preview, regions, portals, crossing_policy, managed
+        )
+    finally:
+        if managed is not None:
+            managed.close()
 
+
+def portal_plan(arguments: argparse.Namespace) -> PortalPlan:
+    """Resolve where doorway lines come from (see ``managed_session``), before anything runs."""
+    managed_camera = getattr(arguments, "managed_camera", None)
+    if managed_camera is None and arguments.source == "ring":
+        managed_camera = arguments.ring_camera
+    return resolve_portal_plan(
+        environment=arguments.environment,
+        static_portals=bool(getattr(arguments, "portals", None)),
+        managed=bool(getattr(arguments, "managed_portals", False)),
+        camera_id=managed_camera,
+        control_plane_url=arguments.control_plane_url or os.environ.get(CONTROL_PLANE_URL_ENV),
+        credential_file=arguments.credential_file or os.environ.get(CREDENTIAL_FILE_ENV),
+        state_dir=getattr(arguments, "state_dir", None) or os.environ.get(STATE_DIR_ENV),
+        refresh_seconds=getattr(arguments, "config_refresh_seconds", DEFAULT_REFRESH_SECONDS),
+        outbox_capacity=getattr(arguments, "outbox_capacity", DEFAULT_OUTBOX_CAPACITY),
+    )
+
+
+def _run_demo(
+    arguments: argparse.Namespace,
+    inference_rate: InferenceRateConfig,
+    preview: PreviewRenderer | None,
+    regions: Any,
+    portals: PortalSet,
+    crossing_policy: CrossingPolicy,
+    managed: ManagedEdgeSession | None,
+) -> int:
     try:
         source = _source(arguments)
     except LiveSourceError as exc:
@@ -493,6 +594,19 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             "  Entry/exit is reported only for a track crossing a portal line. Appearing in or "
             "leaving the view is never an entry or an exit, and nobody is identified."
         )
+    if managed is not None:
+        cached, revision = managed.current()
+        print(
+            f"Room transitions from control-plane doorway lines for camera {managed.plan.camera_id}"
+            f" ({managed.plan.endpoint.origin}); refreshed every "
+            f"{managed.plan.refresh_seconds:g} s."
+        )
+        print(
+            f"  Last-known-good: {len(cached.portals)} line(s), revision {revision}"
+            if revision is not None
+            else "  No last-known-good configuration yet: no room events until the first fetch."
+        )
+        print("  Events are queued durably on this device and uploaded; nobody is identified.")
     runtime = LiveDemoRuntime(
         source,
         detector,
@@ -501,7 +615,13 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
         inference_rate=inference_rate,
         portals=portals,
         crossing_policy=crossing_policy,
+        transition_sink=None if managed is None else managed.submit,
+        managed_status=None if managed is None else managed.snapshot,
     )
+    if managed is not None:
+        # Stages the cached lines, then starts the refresher (first fetch immediately, on its
+        # own thread) and the uploader. Both are stopped by run_demo_cli's ``finally``.
+        managed.start(runtime.portals.stage)
     server: DemoServer | None = None
     code = 0
     try:

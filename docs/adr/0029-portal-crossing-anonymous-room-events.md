@@ -1,6 +1,8 @@
 # ADR 0029: Portal crossing and anonymous room entry / exit events
 
 - Status: Accepted (V1-05A). Semantics qualification; events not yet persisted. No alerting.
+- Amended by ADR 0030 (V1-05B): managed edge distribution and event persistence are implemented
+  but not deployed; `edge_distribution` stays `NOT_CONNECTED` until a deployed node consumes them.
 - Date: 2026-09-26
 
 ## Context

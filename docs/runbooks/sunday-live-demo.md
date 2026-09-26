@@ -142,7 +142,34 @@ someone who vanishes inside did not leave; a reconnect clears everything. Only v
 nothing is sent anywhere: the events stay on this dashboard.
 
 The web app can store the same lines per classroom camera (Classrooms -> camera -> Doorway lines)
-and shows each as a ready-to-copy `--portal` flag. The edge does **not** fetch them yet.
+and shows each as a ready-to-copy `--portal` flag. No deployed edge fetches them yet.
+
+#### Managed doorway lines and uploaded events (V1-05B, implemented, not deployed)
+
+Instead of `--portal`, a node can take its camera's lines from the control plane and upload its
+room events (ADR 0030):
+
+```
+uv run --all-packages veotrex-edge live-demo --source ring --ring-camera <camera uuid> \
+  --control-plane-url https://<control plane> --credential-file /abs/edge.credential \
+  --managed-portals --state-dir /abs/private/state
+```
+
+- Same machine credential as the Ring broker; nothing new to issue. `--managed-camera` defaults to
+  `--ring-camera`. `--state-dir` (or `$VEOTREX_EDGE_STATE_DIR`) must be a 0700 directory you own:
+  it holds the last-known-good lines (`config/`) and the event outbox (`outbox/`).
+- Lines are re-read every `--config-refresh-seconds` (default 60). A bad or unreachable control
+  plane keeps the current lines; with no cache yet there are simply no room events until the
+  first successful fetch. Video is never stopped by either.
+- `--portal` and `--managed-portals` together are refused. With `--environment staging` or
+  `production`, `--portal` is refused outright.
+- Events are queued on disk first and survive restarts and outages; `room_transitions.managed` in
+  the dashboard state shows config age/version and queue depth, dropped and dead-letter counts.
+- Operators see them at Classrooms -> *Room transitions*: "Person entered via Main Door". Nobody is
+  identified.
+
+This path is not deployed: do not enable it on `veotrex-edge.service` until migration 0015 and the
+API are live and the runtime-role probe passes.
 
 ### Occupancy counts evidence
 

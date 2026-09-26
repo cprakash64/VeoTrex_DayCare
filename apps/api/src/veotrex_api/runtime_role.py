@@ -238,6 +238,10 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
+    # V1-05B: anonymous room entry/exit reported by edge nodes; append-only by grant.
+    "room_transition_events": _append(
+        "anonymous room entry/exit events from edge nodes; append-only by grant"
+    ),
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),
     "camera_assignments": _read("edge broker: the node's active camera assignment"),
 }

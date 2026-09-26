@@ -43,8 +43,10 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import structlog
 
@@ -54,7 +56,7 @@ from veotrex_edge_agent.live.occupancy import (
     OccupancyEvidencePolicy,
     OccupancyLedger,
 )
-from veotrex_edge_agent.live.portal_crossing import CrossingPolicy, PortalMonitor
+from veotrex_edge_agent.live.portal_crossing import CrossingPolicy, PortalMonitor, RoomTransition
 from veotrex_edge_agent.live.portal_geometry import PortalSet
 from veotrex_edge_agent.live.preview import PreviewRenderer
 from veotrex_edge_agent.live.scheduler import (
@@ -161,6 +163,8 @@ class LiveDemoRuntime:
         occupancy_policy: OccupancyEvidencePolicy | None = None,
         portals: PortalSet | None = None,
         crossing_policy: CrossingPolicy | None = None,
+        transition_sink: Callable[[RoomTransition, str], object] | None = None,
+        managed_status: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         # Optional on purpose: --headless and the automated tests run the whole pipeline with
         # no preview at all, so nothing about detection or tracking depends on it existing.
@@ -194,6 +198,11 @@ class LiveDemoRuntime:
             portals or PortalSet(), stream_id=source.source_id, policy=crossing_policy
         )
         self._discontinuities_seen = 0
+        # V1-05B: where emitted transitions go (the managed session's durable outbox), with a
+        # random id for this session so a track number is only ever meaningful within it.
+        self._transition_sink = transition_sink
+        self._managed_status = managed_status
+        self.stream_instance_id = uuid4().hex
         self._state = LiveState(
             source_kind=str(source.kind),
             source_id=source.source_id,
@@ -271,7 +280,10 @@ class LiveDemoRuntime:
 
     def room_transitions(self) -> dict[str, Any]:
         """Configured portals, entry/exit counts and the recent anonymous transitions."""
-        return self.portals.snapshot()
+        snapshot = self.portals.snapshot()
+        if self._managed_status is not None:
+            snapshot["managed"] = self._managed_status()
+        return snapshot
 
     def _sync_discontinuity(self) -> None:
         """Drop every portal state when the tracker has cleared its own. A reconnect, an
@@ -316,6 +328,8 @@ class LiveDemoRuntime:
                 )
                 for track_id, box in bounded
             }
+            # A frame with no records still gets a staged configuration applied.
+            self.portals.apply_staged()
             if self.preview is not None:
                 # Drawn here because this is the one place that holds the processed frame and
                 # its own confirmed boxes together; geometry and image cannot drift apart, and
@@ -352,6 +366,7 @@ class LiveDemoRuntime:
             for record in self._pipeline.process(
                 frames(), run_id=self._source.source_id, frame_hook=hook
             ):
+                self.portals.apply_staged()
                 if self.portals:
                     self._sync_discontinuity()
                 observation = record.observation
@@ -395,6 +410,12 @@ class LiveDemoRuntime:
                                 portal_id=transition.portal_id,
                                 track_id=transition.track_id,
                             )
+                            if self._transition_sink is not None:
+                                try:
+                                    self._transition_sink(transition, self.stream_instance_id)
+                                except Exception:
+                                    # Persistence must never stop tracking.
+                                    self._logger.warning("live_room_transition_sink_failed")
                     # Confidence comes from the observation rather than the draw hook, which
                     # only carries geometry. The hook for this frame runs after its records.
                     confidences[observation.track_id] = observation.detection_confidence

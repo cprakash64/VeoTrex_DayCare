@@ -6,9 +6,10 @@ read, CONFIGURE_FACILITY_CAMERAS there to change anything), and an unknown, othe
 unreadable or not-in-this-classroom camera answered identically as ``not_found``.
 
 A portal is geometry an operator configures for one camera in one classroom. It says nothing
-about people. The edge does not yet receive portals from here - remote distribution is a later
-stage - so each portal is also rendered as the exact ``veotrex-edge live-demo --portal`` text
-an operator can use for local evaluation (ADR 0029).
+about people. V1-05B (ADR 0030) adds ``GET /v1/edge/runtime-config``, from which an edge node
+running in managed mode pulls the ACTIVE portals of its own assigned cameras. No deployed node
+consumes it yet, so distribution is still reported as ``NOT_CONNECTED`` and each portal is also
+rendered as the exact ``veotrex-edge live-demo --portal`` text for local evaluation (ADR 0029).
 """
 
 from __future__ import annotations
@@ -49,8 +50,9 @@ PORTAL_VALIDATION_CATEGORIES = frozenset(
 PORTAL_CONFLICT_CATEGORIES = frozenset(
     {"portal_limit_reached", "portal_label_exists", "portal_archived", "camera_inactive"}
 )
-# The edge does not read portals from the control plane yet. Said on every response so no
-# screen can imply that saving a portal changed what a camera reports.
+# Said on every response so no screen can imply that saving a portal changed what a camera
+# reports. V1-05B implemented the managed edge path (/v1/edge/runtime-config) but no edge node
+# is deployed consuming it, so this stays NOT_CONNECTED until one is (ADR 0030).
 EDGE_DISTRIBUTION = "NOT_CONNECTED"
 
 

@@ -8,6 +8,8 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -38,8 +40,14 @@ from veotrex_api.db import (
     require_unprivileged,
     verify_runtime_role,
 )
-from veotrex_api.edge_api import is_edge_whep_offer, register_edge_routes
+from veotrex_api.edge_api import (
+    is_edge_event_upload,
+    is_edge_whep_offer,
+    register_edge_routes,
+    register_edge_runtime_routes,
+)
 from veotrex_api.edge_auth import EdgeAuthenticator
+from veotrex_api.edge_runtime import EdgeRuntimeService
 from veotrex_api.edge_whep import EdgeWhepBroker, WhepLeaseRegistry
 from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
@@ -71,6 +79,10 @@ from veotrex_api.ring_client import (
 from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
+from veotrex_api.room_transition_api import (
+    RoomTransitionService,
+    register_room_transition_routes,
+)
 from veotrex_api.secrets import DefaultSecretResolver, SecretResolver
 from veotrex_api.staff_api import (
     is_enrollment_upload,
@@ -348,6 +360,26 @@ def create_app(
         logger.info("service_stopped", service=resolved_settings.service_name)
 
     app = FastAPI(title="VeoTrex API", version=resolved_settings.app_version, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_failed(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default echoes each rejected input back, which fails outright for a JSON
+        # NaN/Infinity (a 500 instead of a 422) and repeats request content into responses.
+        # Same shape, without the echo (V1-05B).
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "type": error.get("type"),
+                        "loc": list(error.get("loc", ())),
+                        "msg": error.get("msg"),
+                    }
+                    for error in exc.errors()
+                ]
+            },
+        )
+
     app.state.engine = resolved_engine
     app.state.settings = resolved_settings
     app.state.identity_verifier = identity_verifier or Auth0IdentityVerifier(resolved_settings)
@@ -369,6 +401,16 @@ def create_app(
         edge_whep_broker,
         AuthenticationFailureLogLimiter(
             limit=resolved_settings.edge_whep_rate_limit_per_minute, window_seconds=60
+        ),
+    )
+    # Edge runtime config + anonymous room-transition ingest (V1-05B): machine routes for the
+    # authenticated node's own cameras only.
+    app.state.edge_runtime_service = EdgeRuntimeService(resolved_factory)
+    register_edge_runtime_routes(
+        app,
+        app.state.edge_runtime_service,
+        AuthenticationFailureLogLimiter(
+            limit=resolved_settings.edge_runtime_rate_limit_per_minute, window_seconds=60
         ),
     )
     app.state.staff_recognition_service = recognition_service
@@ -396,10 +438,13 @@ def create_app(
     # no camera, face backend or edge credential can reach them, and no route accepts an image.
     app.state.guardian_service = GuardianService(resolved_factory)
     register_guardian_routes(app, app.state.guardian_service)
-    # Camera doorway lines for anonymous room entry/exit (V1-05A). Configuration only; human
-    # routes; the edge does not fetch these yet.
+    # Camera doorway lines for anonymous room entry/exit (V1-05A). Human routes; a managed edge
+    # node can pull them through /v1/edge/runtime-config (V1-05B, not yet deployed).
     app.state.camera_portal_service = CameraPortalService(resolved_factory)
     register_camera_portal_routes(app, app.state.camera_portal_service)
+    # Anonymous room-transition timeline for operators (V1-05B). Read-only human route.
+    app.state.room_transition_service = RoomTransitionService(resolved_factory)
+    register_room_transition_routes(app, app.state.room_transition_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,
@@ -422,6 +467,7 @@ def create_app(
             is_token_exchange = request.url.path == "/v1/integrations/ring/token-exchange"
             is_enrollment_image = is_enrollment_upload(request.method, request.url.path)
             is_edge_offer = is_edge_whep_offer(request.method, request.url.path)
+            is_edge_events = is_edge_event_upload(request.method, request.url.path)
             if is_token_exchange:
                 body_limit = resolved_settings.ring_token_exchange_body_bytes
             elif request.url.path == "/v1/providers/ring/webhooks":
@@ -432,6 +478,9 @@ def create_app(
                 # Refused before authentication or forwarding: an oversized offer never
                 # reaches the broker, let alone Ring.
                 body_limit = resolved_settings.edge_whep_max_offer_bytes
+            elif is_edge_events:
+                # Refused before authentication: an oversized batch never reaches the database.
+                body_limit = resolved_settings.edge_event_max_batch_bytes
             if body_limit is not None:
                 media_type = normalize_media_type(request.headers.get("content-type"))
 

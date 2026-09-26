@@ -3,7 +3,8 @@
 Reuses the V1-04A two-tenant stack. Every camera is a synthetic row attached to a classroom
 through a zone; nothing here has an image, a person or a track. Proves the table's own
 invariants, the API's validation (the same rules the edge applies), scoping, bounded counts,
-archive-not-delete, audit contents, and that the edge still receives nothing.
+archive-not-delete and audit contents. Distribution to the edge is tested in
+test_edge_runtime_api.py (V1-05B).
 """
 
 from __future__ import annotations

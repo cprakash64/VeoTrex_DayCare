@@ -79,6 +79,10 @@ export default async function ClassroomPage({ params }: Props) {
 
       <section aria-labelledby="camera-heading">
         <h2 id="camera-heading">Cameras</h2>
+        <p>
+          <Link href={`/app/classrooms/${room.classroom_id}/room-transitions`}>Room transitions</Link> · anonymous
+          entries and exits across doorway lines
+        </p>
         {room.cameras.length === 0 ? (
           <p>No camera is associated with this classroom yet.</p>
         ) : (

@@ -62,6 +62,7 @@ def test_all_expected_customer_tables_are_tenant_owned() -> None:
         "child_guardian_links",
         "child_release_events",
         "camera_portals",
+        "room_transition_events",
     }
 
 

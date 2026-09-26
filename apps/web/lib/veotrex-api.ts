@@ -574,3 +574,31 @@ export async function updateCameraPortal(
 export async function archiveCameraPortal(classroomId: string, cameraId: string, portalId: string): Promise<Response> {
   return sendJson(`${portalsPath(classroomId, cameraId)}/${encodeURIComponent(portalId)}/archive`, "POST");
 }
+
+// ----------------------------------------------------- room transitions (V1-05B)
+import {
+  parseTransitionPage,
+  transitionQuery,
+  type RoomTransitionResult,
+  type TransitionType,
+} from "./room-transitions";
+
+/** One bounded page of a classroom's anonymous room transitions, newest first. */
+export async function getRoomTransitions(
+  classroomId: string,
+  cursor: string | null,
+  type: TransitionType | null,
+): Promise<RoomTransitionResult> {
+  let response: Response;
+  try {
+    response = await authorizedFetch(
+      `/v1/classrooms/${encodeURIComponent(classroomId)}/room-transitions?${transitionQuery(cursor, type)}`,
+    );
+  } catch {
+    return { status: "error" };
+  }
+  if (response.status === 404) return { status: "not_found" };
+  if (!response.ok) return { status: "error" };
+  const page = parseTransitionPage(await response.json().catch(() => null));
+  return page === null ? { status: "error" } : { status: "ok", page };
+}

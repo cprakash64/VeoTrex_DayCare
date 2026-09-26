@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     edge_whep_max_leases_per_node: int = Field(default=4, ge=1, le=64)
     edge_whep_lease_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     edge_whep_rate_limit_per_minute: int = Field(default=60, ge=1, le=600)
+    # Edge runtime config and room-transition ingest (V1-05B). A node polls config about once a
+    # minute and uploads events in batches, so these limits are generous for one site and still
+    # bound a misbehaving node. Event batches sit well under the proxy's /v1 body cap.
+    edge_runtime_rate_limit_per_minute: int = Field(default=240, ge=1, le=6000)
+    edge_event_max_batch_bytes: int = Field(default=65536, ge=4096, le=131072)
     # Externally reachable HTTPS origin of the control plane. Ring callback URLs are derived from
     # this configured value and never from an incoming Host/X-Forwarded-Host header. Empty until a
     # real deployment hostname exists; readiness then reports it as missing rather than guessing.

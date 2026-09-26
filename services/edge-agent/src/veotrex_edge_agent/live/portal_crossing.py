@@ -48,6 +48,7 @@ or cross-camera identity anywhere in this module, and nothing here identifies an
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -296,6 +297,12 @@ class PortalMonitor:
         self._recent: deque[RoomTransition] = deque(maxlen=max_recent)
         self._sequence = 0
         self.resets_total = 0
+        # Managed configuration (V1-05B): a new portal set is staged by the refresh thread and
+        # applied by the pipeline thread between observations, whole, never portal by portal.
+        self.revision: str | None = None
+        self.config_applied_total = 0
+        self._staged: tuple[PortalSet, str | None] | None = None
+        self._staged_lock = threading.Lock()
         self.skipped_observations_total = 0
         self.evaluation_us = BoundedSamples(EVALUATION_SAMPLE_CAPACITY)
 
@@ -370,6 +377,26 @@ class PortalMonitor:
         self.evaluation_us.add((time.perf_counter_ns() - started) / 1e3)
         return emitted
 
+    def stage(self, portals: PortalSet, revision: str | None) -> None:
+        """Offer a replacement configuration; takes effect at the next ``apply_staged``."""
+        with self._staged_lock:
+            self._staged = (portals, revision)
+
+    def apply_staged(self) -> bool:
+        """Swap in a staged configuration, atomically. All crossing state is dropped - a line
+        that moved is a new line - and nothing is synthesised by the swap."""
+        with self._staged_lock:
+            staged, self._staged = self._staged, None
+        if staged is None:
+            return False
+        portals, revision = staged
+        if revision is not None and revision == self.revision and portals == self.portals:
+            return False
+        self.portals, self.revision = portals, revision
+        self._runtimes = [_PortalRuntime(portal) for portal in portals.enabled]
+        self.config_applied_total += 1
+        return True
+
     def forget(self, track_id: int) -> None:
         """A track ended. Its death is not an exit: the state is simply dropped."""
         for runtime in self._runtimes:
@@ -405,6 +432,8 @@ class PortalMonitor:
             "per_portal": per_portal,
             "recent": self.recent(recent_limit),
             "resets_total": self.resets_total,
+            "configuration_revision": self.revision,
+            "config_applied_total": self.config_applied_total,
             "skipped_observations_total": self.skipped_observations_total,
             "tracked_states": self.tracked(),
             "policy": {

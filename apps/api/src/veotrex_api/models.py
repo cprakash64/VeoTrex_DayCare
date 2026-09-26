@@ -947,6 +947,8 @@ TENANT_OWNED_TABLES = (
     "child_release_events",
     # V1-05A
     "camera_portals",
+    # V1-05B
+    "room_transition_events",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles
@@ -1780,3 +1782,110 @@ class CameraPortal(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     created_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     archived_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
+class RoomTransitionEvent(Base, TenantOwnedMixin):
+    """One anonymous room entry or exit reported by an edge node (V1-05B). Append-only.
+
+    ``id`` is the event id the edge generated and persisted in its outbox before the first send,
+    so a retried upload maps to the same row (the primary key is the idempotency guarantee).
+    Tenant, facility and classroom are taken server-side from the portal and the camera's
+    assignment, never from the request. ``ephemeral_track_id`` is a camera-session-local track
+    number, meaningful only together with ``stream_instance_id``: it is not a person, not an
+    identity, and it is never joined to any roster. There is no profile, face, embedding,
+    frame, crop or image column. The runtime role may SELECT and INSERT, never UPDATE or DELETE.
+    """
+
+    __tablename__ = "room_transition_events"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_room_transition_events_id_tenant"),
+        ForeignKeyConstraint(
+            ["facility_id", "tenant_id"],
+            ["facilities.id", "facilities.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_room_transition_events_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["area_id", "facility_id", "tenant_id"],
+            ["areas.id", "areas.facility_id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_room_transition_events_area_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["camera_id", "tenant_id"],
+            ["cameras.id", "cameras.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_room_transition_events_camera_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["edge_node_id", "tenant_id"],
+            ["edge_nodes.id", "edge_nodes.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_room_transition_events_node_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["portal_id", "tenant_id"],
+            ["camera_portals.id", "camera_portals.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_room_transition_events_portal_tenant",
+        ),
+        CheckConstraint(
+            "event_type IN ('ENTERED', 'EXITED')", name="ck_room_transition_events_type"
+        ),
+        CheckConstraint(
+            "crossing_x BETWEEN 0 AND 1 AND crossing_y BETWEEN 0 AND 1",
+            name="ck_room_transition_events_crossing",
+        ),
+        CheckConstraint(
+            "evidence_observations BETWEEN 1 AND 100",
+            name="ck_room_transition_events_evidence",
+        ),
+        CheckConstraint(
+            "ephemeral_track_id BETWEEN 1 AND 2147483647",
+            name="ck_room_transition_events_track",
+        ),
+        CheckConstraint(
+            "stream_instance_id ~ '^[a-z0-9][a-z0-9_-]{0,63}$'",
+            name="ck_room_transition_events_stream",
+        ),
+        CheckConstraint(
+            "occurred_at <= received_at + interval '120 seconds'",
+            name="ck_room_transition_events_not_future",
+        ),
+        CheckConstraint(
+            "occurred_at >= received_at - interval '7 days'",
+            name="ck_room_transition_events_not_stale",
+        ),
+        Index(
+            "ix_room_transition_events_classroom",
+            "tenant_id",
+            "area_id",
+            text("occurred_at DESC"),
+            text("id DESC"),
+        ),
+        Index(
+            "ix_room_transition_events_camera",
+            "tenant_id",
+            "camera_id",
+            text("occurred_at DESC"),
+        ),
+        # For the future retention job: prune by age within a tenant.
+        Index("ix_room_transition_events_received", "tenant_id", "received_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    camera_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    edge_node_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    portal_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ephemeral_track_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    stream_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    crossing_x: Mapped[float] = mapped_column(Float, nullable=False)
+    crossing_y: Mapped[float] = mapped_column(Float, nullable=False)
+    evidence_observations: Mapped[int] = mapped_column(Integer, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
