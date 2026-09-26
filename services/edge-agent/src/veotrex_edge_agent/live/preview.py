@@ -21,13 +21,19 @@ the dashboard falls back to an explicit placeholder instead of a convincing lie.
 
 The overlay draws the tracker's *current confirmed* boxes and a track number. It never draws a
 name, an identity, an age, a classification or a score, because none of those exist here.
+
+Since V1-03B a confirmed track whose evidence does not yet count toward occupancy is drawn
+thin and grey and labelled "Candidate N" rather than "Track N" - shown, not hidden, and not
+counted in the head count on the strip. Configured ignore regions are outlined and numbered, so
+an operator can always see which part of the view is being suppressed. Region labels are never
+burned into the picture.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +43,8 @@ from veotrex_edge_agent.qualification.metrics import BoundedSamples
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
     from numpy.typing import NDArray
+
+    from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 
 # Defaults chosen for the demo: smooth enough to read as live, cheap enough to be invisible
 # against the detector's cost.
@@ -59,6 +67,8 @@ BOX_COLOURS = (
     (140, 255, 140),
     (80, 80, 255),
 )
+CANDIDATE_COLOUR = (150, 150, 150)
+REGION_COLOUR = (0, 190, 255)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +193,8 @@ class PreviewRenderer:
         frame_index: int,
         occupancy: int,
         source_health: str,
+        candidates: Collection[int] = frozenset(),
+        regions: IgnoreRegionSet | None = None,
     ) -> PreviewFrame | None:
         """Encode this frame if one is due, otherwise skip it cheaply.
 
@@ -202,7 +214,9 @@ class PreviewRenderer:
 
         started = time.perf_counter_ns()
         try:
-            canvas = self._annotate(cv2, image, boxes, occupancy, source_health)
+            canvas = self._annotate(
+                cv2, image, boxes, occupancy, source_health, candidates, regions
+            )
             ok, encoded = cv2.imencode(
                 ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), self.config.jpeg_quality]
             )
@@ -231,6 +245,8 @@ class PreviewRenderer:
         boxes: Sequence[tuple[int, tuple[float, ...]]],
         occupancy: int,
         source_health: str,
+        candidates: Collection[int] = frozenset(),
+        regions: IgnoreRegionSet | None = None,
     ) -> Any:
         """Boxes and track numbers on a copy of the frame.
 
@@ -249,11 +265,36 @@ class PreviewRenderer:
         else:
             canvas = image.copy()
 
+        canvas_height, canvas_width = canvas.shape[:2]
+        for number, region in enumerate(regions.regions if regions else (), start=1):
+            rx1, ry1, rx2, ry2 = region.pixels(canvas_width, canvas_height)
+            cv2.rectangle(canvas, (int(rx1), int(ry1)), (int(rx2), int(ry2)), REGION_COLOUR, 1)
+            cv2.putText(
+                canvas,
+                f"ignore region {number}",
+                (int(rx1) + 4, min(int(ry2) - 6, canvas_height - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                REGION_COLOUR,
+                1,
+                cv2.LINE_AA,
+            )
+
         for track_id, box in boxes:
-            colour = BOX_COLOURS[int(track_id) % len(BOX_COLOURS)]
+            candidate = int(track_id) in candidates
+            colour = (
+                CANDIDATE_COLOUR if candidate else BOX_COLOURS[int(track_id) % len(BOX_COLOURS)]
+            )
             x1, y1, x2, y2 = (float(value) * scale for value in box)
-            cv2.rectangle(canvas, (int(x1), int(y1)), (int(x2), int(y2)), colour, 2)
-            label = f"Track {int(track_id)}"
+            cv2.rectangle(
+                canvas, (int(x1), int(y1)), (int(x2), int(y2)), colour, 1 if candidate else 2
+            )
+            # Two plain literals rather than one conditional string, so the test that audits
+            # every word this module can draw still sees both of them.
+            if candidate:
+                label = f"Candidate {int(track_id)}"
+            else:
+                label = f"Track {int(track_id)}"
             # A filled strip behind the label so it stays readable over a bright scene.
             (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             top = max(int(y1) - text_height - 6, 0)
@@ -279,7 +320,9 @@ class PreviewRenderer:
         # The state is worded for a human by the same function the page uses - "RUNNING"
         # burned into the picture beside a person's box invites exactly the misreading a
         # client made of it.
-        status = f"people: {occupancy}   {health_label(source_health)}"
+        pending = sum(1 for track_id, _ in boxes if int(track_id) in candidates)
+        pending_text = f" (+{pending} candidate)" if pending else ""
+        status = f"people: {occupancy}{pending_text}   {health_label(source_health)}"
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 24), (16, 18, 22), -1)
         cv2.putText(
             canvas, status, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 226, 232), 1, cv2.LINE_AA

@@ -438,6 +438,12 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             note = f"  {region.as_dict()}"
             print(note)
         print("  These suppress known fixed artifacts only. They are not detector qualification.")
+        if regions.low_containment:
+            print(
+                f"  WARNING: --ignore-containment {regions.min_containment} is below 0.5: a "
+                "detection mostly OUTSIDE a region - a person standing in front of it - can be "
+                "suppressed."
+            )
     runtime = LiveDemoRuntime(
         source,
         detector,
@@ -498,7 +504,16 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
 
     print(
         json.dumps(
-            {"metrics": runtime.metrics(), "failure": runtime.failure}, indent=2, sort_keys=True
+            {
+                "metrics": runtime.metrics(),
+                "failure": runtime.failure,
+                "calibration": runtime.calibration(),
+                # Geometry and confidence only. A suggested region in here is for review and is
+                # never applied unless the operator passes it back as --ignore-region.
+                "occupancy_diagnostics": runtime.occupancy_diagnostics(),
+            },
+            indent=2,
+            sort_keys=True,
         )
     )
     return code

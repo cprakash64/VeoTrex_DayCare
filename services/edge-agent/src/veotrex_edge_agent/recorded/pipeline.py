@@ -179,15 +179,6 @@ class RecordedTrackingPipeline:
     def video_metadata(self) -> VideoMetadata | None:
         return self._video_metadata
 
-    @property
-    def reported_track_count(self) -> int:
-        """Tracks reported as started and not yet ended.
-
-        Includes a track the tracker has briefly lost but not yet removed: it has not been
-        reported as ended, so as far as anything downstream knows the person is still there.
-        """
-        return sum(1 for live in self._live.values() if live.started_emitted)
-
     def _observe(
         self,
         view: TrackView,

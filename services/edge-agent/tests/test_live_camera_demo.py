@@ -448,7 +448,10 @@ def test_the_dashboard_serves_state_without_any_imagery() -> None:
     assert state["occupancy"] >= 1
     assert state["tracks"]
     for track in state["tracks"]:
-        assert set(track) == {"track_id", "bbox_xyxy", "confidence"}
+        # V1-03B adds whether the track counts toward occupancy: a fixed two-value state,
+        # never an identity or a classification of the person.
+        assert set(track) == {"track_id", "bbox_xyxy", "confidence", "occupancy_status"}
+        assert track["occupancy_status"] in {"OCCUPANCY_VALIDATED", "OCCUPANCY_CANDIDATE"}
         assert len(track["bbox_xyxy"]) == 4
     # Geometry and counts only: nothing pixel-shaped anywhere in the response.
     body = json.dumps(payload)

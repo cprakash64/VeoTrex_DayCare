@@ -19,6 +19,12 @@ capture-side timestamp, so a skipped camera frame neither compresses time nor co
 the tracker's lost-track tolerance is in seconds, not frames. Nothing is interpolated and no box
 is synthesised between detections.
 
+**Occupancy counts evidence, not candidates (V1-03B).** Every confirmed track is shown, but only
+one whose evidence the ``OccupancyLedger`` has validated changes the head count or produces
+``PERSON_APPEARED_IN_VIEW`` / ``PERSON_NO_LONGER_VISIBLE``. A track that has not yet earned that
+is an ``OCCUPANCY_CANDIDATE``: drawn, counted separately, explained in the diagnostics, and never
+silently discarded. See ``occupancy``.
+
 No recognition of any kind runs. Nothing in this module imports the face stack, and a test
 asserts the package cannot reach it. Everyone in view is an anonymous track, which is what
 makes the demo honest: an unidentified person is simply a person, never a "child" and never an
@@ -35,6 +41,12 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from veotrex_edge_agent.live.occupancy import (
+    OCCUPANCY_CANDIDATE,
+    OCCUPANCY_VALIDATED,
+    OccupancyEvidencePolicy,
+    OccupancyLedger,
+)
 from veotrex_edge_agent.live.preview import PreviewRenderer
 from veotrex_edge_agent.live.scheduler import (
     AdaptiveInferencePacer,
@@ -64,17 +76,19 @@ MAX_RENDERED_TRACKS = 32
 
 @dataclass(slots=True)
 class TrackBox:
-    """One confirmed track as the dashboard needs it: a box and an id, nothing else."""
+    """One confirmed track as the dashboard needs it: a box, an id and whether it counts."""
 
     track_id: int
     bbox_xyxy: tuple[float, float, float, float]
     confidence: float
+    occupancy_status: str = OCCUPANCY_CANDIDATE
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "track_id": self.track_id,
             "bbox_xyxy": [round(value, 1) for value in self.bbox_xyxy],
             "confidence": round(self.confidence, 3),
+            "occupancy_status": self.occupancy_status,
         }
 
 
@@ -91,7 +105,9 @@ class LiveState:
     timestamp_ms: float = 0.0
     width: int = 0
     height: int = 0
+    # Validated tracks only. Candidates are reported next to it, never inside it.
     occupancy: int = 0
+    candidate_tracks: int = 0
     tracks: list[TrackBox] = field(default_factory=list)
     source_kind: str = ""
     source_id: str = ""
@@ -105,6 +121,7 @@ class LiveState:
             "width": self.width,
             "height": self.height,
             "occupancy": self.occupancy,
+            "candidate_tracks": self.candidate_tracks,
             "tracks": [track.as_dict() for track in self.tracks],
             "source": {
                 "kind": self.source_kind,
@@ -132,6 +149,7 @@ class LiveDemoRuntime:
         preview: PreviewRenderer | None = None,
         ignore_regions: IgnoreRegionSet | None = None,
         inference_rate: InferenceRateConfig | None = None,
+        occupancy_policy: OccupancyEvidencePolicy | None = None,
     ) -> None:
         # Optional on purpose: --headless and the automated tests run the whole pipeline with
         # no preview at all, so nothing about detection or tracking depends on it existing.
@@ -150,6 +168,14 @@ class LiveDemoRuntime:
         self._pipeline = RecordedTrackingPipeline(
             detector, tracking_config=tracking_config, ignore_regions=ignore_regions
         )
+        self.ignore_regions = self._pipeline.ignore_regions
+        effective_tracking = tracking_config or TrackingConfig()
+        self.occupancy = OccupancyLedger(
+            occupancy_policy or OccupancyEvidencePolicy.from_tracking(effective_tracking)
+        )
+        # The observations a track made while TENTATIVE never reach the runtime. The tracker
+        # only lets high-score detections create or confirm a track, so all of them were high.
+        self._pre_confirmation_high = max(0, effective_tracking.confirmation_observations - 1)
         self.timeline = timeline or DemoTimeline()
         self._state = LiveState(
             source_kind=str(source.kind),
@@ -216,19 +242,31 @@ class LiveDemoRuntime:
         snapshot["occupancy"] = self.timeline.occupancy
         snapshot["peak_occupancy"] = self.timeline.peak_occupancy
         snapshot["source_health"] = str(self._source.health)
+        snapshot.update(self.occupancy.snapshot())
+        snapshot["ignore_regions_configured"] = len(self.ignore_regions)
         if self.preview is not None:
             snapshot.update(self.preview.snapshot())
         return snapshot
+
+    def occupancy_diagnostics(self) -> dict[str, Any]:
+        """Per-track evidence for operator review: normalised geometry and scores, no pixels."""
+        return self.occupancy.diagnostics()
+
+    def calibration(self) -> dict[str, Any]:
+        """The configured ignore regions and what they have suppressed. Nothing is hidden."""
+        status = self.ignore_regions.status()
+        status["detections_suppressed_total"] = self._pipeline.metrics.detections_ignored_total
+        return status
 
     # ------------------------------------------------------------------------- processing
     def _consume(self, max_frames: int | None = None) -> None:
         """Drive the pipeline over scheduled frames until capture stops.
 
         State is published once per processed frame, from that frame's own confirmed boxes, and
-        again whenever a track ends. Occupancy is the number of tracks that have been reported
-        as appeared and not yet as gone - the same lifecycle the timeline narrates - so one
-        missed detection inside the tracker's tolerance changes neither the count nor the
-        timeline. Boxes are drawn only where the detector actually found someone on this
+        again whenever a track ends. Occupancy is the number of *validated* tracks that have not
+        yet ended - the same lifecycle the timeline narrates - so one missed detection inside the
+        tracker's tolerance changes neither the count nor the timeline, and a candidate changes
+        neither at all. Boxes are drawn only where the detector actually found someone on this
         frame; nothing is predicted or interpolated onto the picture.
         """
         live_boxes: dict[int, TrackBox] = {}
@@ -238,13 +276,16 @@ class LiveDemoRuntime:
         def hook(image: Any, boxes: Any, timestamp_ms: float) -> None:
             nonlocal live_boxes
             bounded = list(boxes)[:MAX_RENDERED_TRACKS]
+            statuses = self.occupancy.statuses()
             live_boxes = {
                 int(track_id): TrackBox(
-                    int(track_id), tuple(box), confidences.get(int(track_id), 0.0)
+                    int(track_id),
+                    tuple(box),
+                    confidences.get(int(track_id), 0.0),
+                    statuses.get(int(track_id), OCCUPANCY_CANDIDATE),
                 )
                 for track_id, box in bounded
             }
-            occupancy = self._pipeline.reported_track_count
             if self.preview is not None:
                 # Drawn here because this is the one place that holds the processed frame and
                 # its own confirmed boxes together; geometry and image cannot drift apart, and
@@ -253,10 +294,16 @@ class LiveDemoRuntime:
                     image,
                     bounded,
                     frame_index=getattr(current_frame, "frame_index", 0),
-                    occupancy=occupancy,
+                    occupancy=self.occupancy.validated_count,
                     source_health=str(self._source.health),
+                    candidates=frozenset(
+                        track_id
+                        for track_id, box in live_boxes.items()
+                        if box.occupancy_status != OCCUPANCY_VALIDATED
+                    ),
+                    regions=self.ignore_regions,
                 )
-            self._publish(current_frame, live_boxes, occupancy)
+            self._publish(current_frame, live_boxes)
 
         def frames() -> Any:
             nonlocal current_frame
@@ -277,6 +324,21 @@ class LiveDemoRuntime:
                 observation = record.observation
                 if observation is not None:
                     if observation.lifecycle is TrackLifecycle.TRACK_STARTED:
+                        self.occupancy.start(
+                            observation.track_id,
+                            prior_high_observations=self._pre_confirmation_high,
+                        )
+                    became_validated = self.occupancy.observe(
+                        observation.track_id,
+                        score=observation.detection_confidence,
+                        bbox=observation.bbox_xyxy,
+                        width=getattr(current_frame, "width", 0),
+                        height=getattr(current_frame, "height", 0),
+                        timestamp_ms=observation.timestamp_ms,
+                    )
+                    if became_validated:
+                        # Appearance is announced when the track starts to count, not when the
+                        # tracker first confirms it: a candidate is not an arrival.
                         self.timeline.record(
                             DemoEventKind.PERSON_APPEARED_IN_VIEW,
                             session_ms=self._session_ms(),
@@ -287,15 +349,17 @@ class LiveDemoRuntime:
                     confidences[observation.track_id] = observation.detection_confidence
                 summary = record.summary
                 if summary is not None:
-                    self.timeline.record(
-                        DemoEventKind.PERSON_NO_LONGER_VISIBLE,
-                        session_ms=self._session_ms(),
-                        track_id=summary.track_id,
-                    )
+                    ended = self.occupancy.end(summary.track_id)
+                    if ended is not None and ended.validated:
+                        self.timeline.record(
+                            DemoEventKind.PERSON_NO_LONGER_VISIBLE,
+                            session_ms=self._session_ms(),
+                            track_id=summary.track_id,
+                        )
                     live_boxes.pop(summary.track_id, None)
                     # Also reached after the last frame, when the stream ends with tracks
                     # still live and no further hook will run.
-                    self._publish(current_frame, live_boxes, self._pipeline.reported_track_count)
+                    self._publish(current_frame, live_boxes)
         except LiveSourceError as exc:
             self._failure = exc.category
         except Exception:
@@ -314,8 +378,10 @@ class LiveDemoRuntime:
                 # A frozen last frame would keep looking live after the camera has gone.
                 self.preview.clear()
 
-    def _publish(self, frame: Any, boxes: dict[int, TrackBox], occupancy: int) -> None:
-        """Swap in a fresh state. ``occupancy`` counts appeared-and-not-yet-gone tracks."""
+    def _publish(self, frame: Any, boxes: dict[int, TrackBox]) -> None:
+        """Swap in a fresh state. Occupancy counts validated, not-yet-ended tracks only."""
+        occupancy = self.occupancy.validated_count
+        candidates = self.occupancy.candidate_count
         event = self.timeline.set_occupancy(occupancy, session_ms=self._session_ms())
         if event is not None:
             self._logger.info("live_occupancy_changed", occupancy=occupancy)
@@ -325,6 +391,7 @@ class LiveDemoRuntime:
             width=getattr(frame, "width", 0),
             height=getattr(frame, "height", 0),
             occupancy=occupancy,
+            candidate_tracks=candidates,
             tracks=sorted(boxes.values(), key=lambda item: item.track_id),
             source_kind=str(self._source.kind),
             source_id=self._source.source_id,

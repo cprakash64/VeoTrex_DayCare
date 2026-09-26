@@ -11,6 +11,12 @@ throughput and source health. Throughput is broken down by cause (V1-03A): captu
 and preview rates, and frames not processed split into scheduler skips (intentional sampling),
 backpressure drops (the detector behind its schedule) and transport drops (lost before capture).
 
+Occupancy is split the same way (V1-03B): the head count is validated tracks only, and
+confirmed tracks whose evidence does not yet count are shown beside it as candidate person
+tracks - never folded in, never hidden. Configured ignore regions, their containment rule and
+the number of detections they suppressed are listed, so no suppression is invisible. Every
+operator-supplied string reaches the page through ``textContent``, never as markup.
+
 V1-DEMO-01 served geometry only, on a black canvas. That was a deliberate privacy choice and
 the wrong one for a monitoring demonstration, so R1 puts the picture back under bounds: the
 frame is rendered server-side onto the exact frame the tracker processed, held as a single
@@ -125,8 +131,14 @@ PAGE = """<!doctype html>
       <div class="muted">People currently visible</div>
       <div class="count" id="occupancy">0</div>
       <div class="muted" id="peak">&nbsp;</div>
+      <div class="muted">counted in occupancy &mdash; validated tracks only</div>
+      <div class="muted" id="candidates">&nbsp;</div>
     </div>
     <div class="card"><table id="metrics"></table></div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Camera calibration</div>
+      <ul id="calibration"></ul>
+    </div>
     <div class="card">
       <div class="muted" style="margin-bottom:6px">Activity</div>
       <ul id="timeline"></ul>
@@ -260,6 +272,9 @@ async function pullState(){
     const s = d.state;
     $("occupancy").textContent = s.occupancy;
     $("peak").textContent = "peak this session: " + (d.metrics.peak_occupancy ?? 0);
+    $("candidates").textContent = "Candidate person tracks: " + (s.candidate_tracks ?? 0)
+      + " (shown, not counted)";
+    calibration(d.calibration || {}, d.metrics);
     pill($("kind"), s.source.is_live ? s.source.kind : s.source.kind + " (not live)",
          s.source.is_live ? "ok" : "warn");
     const h = s.source.health;
@@ -285,6 +300,31 @@ async function pullState(){
     waitingPlaceholder();
   }
   if (!stopped) stateTimer = setTimeout(pullState, STATE_INTERVAL_MS);
+}
+// Built with textContent only: region labels are operator-supplied text, and no
+// operator-supplied string is ever interpreted as markup.
+function calibration(c, m){
+  const list = $("calibration");
+  const items = [];
+  const regions = c.regions || [];
+  items.push("Ignore regions: " + regions.length + (regions.length ? "" : " (none configured)"));
+  regions.forEach((r, i) => items.push(
+    "  " + (i + 1) + ". " + (r.label || "(no label)") + " \u2014 " +
+    [r.x1, r.y1, r.x2, r.y2].map(v => Number(v).toFixed(3)).join(", ")));
+  if (regions.length) {
+    items.push("Rule: ignored when \u2265 " + Math.round((c.min_containment ?? 0) * 100)
+      + "% of a detection lies inside one region");
+    if (c.low_containment_warning)
+      items.push("WARNING: containment below 50% can hide a person standing in front");
+  }
+  items.push("Detections suppressed: " + (c.detections_suppressed_total ?? 0));
+  items.push("Candidates flagged for review: " + (m.nuisance_review_candidates ?? 0)
+    + " (review only \u2014 never masked automatically)");
+  list.replaceChildren(...items.map(text => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    return li;
+  }));
 }
 function teardown(){
   stopped = true;
@@ -336,6 +376,8 @@ def build_handler(runtime: LiveDemoRuntime) -> type[BaseHTTPRequestHandler]:
                     "timeline": runtime.timeline.recent(MAX_TIMELINE_EVENTS),
                     "failure": runtime.failure,
                     "running": runtime.running,
+                    "calibration": runtime.calibration(),
+                    "occupancy_diagnostics": runtime.occupancy_diagnostics(),
                 }
                 self._send(
                     200,

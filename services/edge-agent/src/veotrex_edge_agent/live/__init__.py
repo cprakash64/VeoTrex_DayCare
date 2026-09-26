@@ -21,6 +21,13 @@ from veotrex_edge_agent.live.camera import (
     validate_source_view,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.occupancy import (
+    OCCUPANCY_CANDIDATE,
+    OCCUPANCY_VALIDATED,
+    PERSISTENT_LOW_CONFIDENCE_CANDIDATE,
+    OccupancyEvidencePolicy,
+    OccupancyLedger,
+)
 from veotrex_edge_agent.live.preview import (
     PreviewBuffer,
     PreviewConfig,
@@ -46,6 +53,9 @@ from veotrex_edge_agent.live.source import (
 from veotrex_edge_agent.live.timeline import DemoEvent, DemoEventKind, DemoTimeline
 
 __all__ = [
+    "OCCUPANCY_CANDIDATE",
+    "OCCUPANCY_VALIDATED",
+    "PERSISTENT_LOW_CONFIDENCE_CANDIDATE",
     "SOURCE_VIEWS",
     "AdaptiveInferencePacer",
     "BackpressureScheduler",
@@ -61,6 +71,8 @@ __all__ = [
     "LiveState",
     "LiveVideoSource",
     "LocalCameraSource",
+    "OccupancyEvidencePolicy",
+    "OccupancyLedger",
     "PreviewBuffer",
     "PreviewConfig",
     "PreviewFrame",

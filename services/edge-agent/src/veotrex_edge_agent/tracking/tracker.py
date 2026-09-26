@@ -387,7 +387,12 @@ class PersonTracker:
         track.last_seen, track.score, track.misses = timestamp, detection.score, 0
         track.observations += 1
         track.low_recovery = low
-        track.state = TrackState.CONFIRMED
+        # A match re-confirms an established (CONFIRMED or LOST) track. A TENTATIVE track is
+        # promoted only by its caller, once it has ``confirmation_observations``; promoting it
+        # here confirmed every tentative track on its second observation whatever the config
+        # said (V1-03B).
+        if track.state is not TrackState.TENTATIVE:
+            track.state = TrackState.CONFIRMED
         track.history.append((timestamp, track.box))
 
     def _bound_tracks(self, stream: _Stream, removed: list[int]) -> None:

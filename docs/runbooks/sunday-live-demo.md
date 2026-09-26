@@ -77,8 +77,10 @@ uv run --all-packages veotrex-edge live-demo --device /dev/video0 \
 ```
 
 Repeatable, up to eight regions. The demo prints the regions it accepted at startup, and the
-dashboard shows an **Ignored detections** counter — watch it climb to confirm the region is
-doing something, and watch it stay put when a person walks past.
+dashboard's **Camera calibration** card lists every region, its label, the containment rule and
+**Detections suppressed**. The preview outlines and numbers each region. Watch the suppressed
+count climb to confirm the region is doing something, and watch it stay put when a person walks
+past.
 
 **A detection is dropped when at least 80% of its area falls inside a region.** Containment, not
 the centre point: an adult standing in front of a poster is taller and wider than the poster, so
@@ -100,9 +102,26 @@ neighbouring regions survived, correctly by the rule and probably not what the o
 Finding the numbers: divide the pixel position by the frame width and height. A poster whose
 top-left corner is at (790, 130) in a 1280x720 frame starts at `0.62,0.18`.
 
-To find them without measuring the room, run the demo with no regions, watch `/api/state`, and
-look for a track whose box does not move: a person drifts tens of pixels in a few seconds, a
-poster drifts one or two.
+To find them without measuring the room, run the demo with no regions and read the
+`occupancy_diagnostics` it prints on exit (also in `/api/state`). Every track has a normalized
+box envelope, confidence statistics and a centre spread. A long-lived candidate is labelled
+`PERSISTENT_LOW_CONFIDENCE_CANDIDATE` and comes with a `suggested_ignore_region`.
+
+**A suggestion is never applied automatically, and a still box is not proof of anything.** A
+person asleep, seated or working at a desk does not move either. Before you pass a suggestion
+back as `--ignore-region`, look at the dashboard and confirm with your own eyes that the box sits
+on a fixed object. Also check that nobody could ever be wholly inside that rectangle: a narrow
+strip masks a small or distant person entirely. Labels may use letters, digits, spaces and
+`. _ - ( ) / : #`.
+
+### Occupancy counts evidence
+
+The big number counts **validated** person tracks only. A confirmed track becomes validated once
+3 of its last 10 detections score at or above the tracker's high threshold (0.30). Until then it
+is a **candidate**: drawn thin and grey as "Candidate N", shown as "Candidate person tracks" under
+the count, and not counted. A candidate is not "not a person". It may be a distant, occluded or
+small person whose detections are weak, which is why it is shown rather than hidden. Once
+validated, a track stays counted until it has not been seen for 2 s. See ADR 0023.
 
 It prints the dashboard URL and the tunnel command, then runs until `Ctrl-C`.
 
