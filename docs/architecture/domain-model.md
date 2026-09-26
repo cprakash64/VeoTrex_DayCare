@@ -7,6 +7,7 @@ Tenant
 └─ Facility (jurisdiction, IANA timezone)
    ├─ Area (room/building/other typed area; kind CLASSROOM = a classroom, V1-04A)
    │  ├─ ClassroomRatioPolicy (operator-configured, effective-dated; ADR 0024)
+   │  ├─ ClassroomPresenceSnapshot (operator-reported counts, append-only, expiring; ADR 0025)
    │  └─ Zone
    │     └─ Camera
    ├─ CameraProviderConnection ── Camera
@@ -42,6 +43,11 @@ configured numbers (children per qualified staff member, minimum staff, optional
 an effective period in facility-local days. These are configured policies, not verified law.
 Ratio evaluation takes role counts only from approved presence sources; a camera's head count
 is never a child or staff count and is used only as a reconciliation diagnostic. See ADR 0024.
+
+The first connected presence source is MANUAL (ADR 0025): an operator reports children,
+qualified staff and visitors for a room as an append-only, short-lived snapshot (30 s - 15 min,
+default 2 min). Only the latest report can be authoritative; once revoked or expired the ratio
+is `INSUFFICIENT_DATA` and no earlier report is reused.
 
 ## Constraints not yet modeled
 

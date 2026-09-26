@@ -10,10 +10,11 @@ a competing location table. Every operation:
   so identifiers cannot be probed;
 * writes an audit event carrying numbers and labels only - never a person.
 
-Ratio status is computed by the pure :mod:`veotrex_api.classroom_ratio` engine. No approved
-presence source is connected in this stage, so status is honestly ``INSUFFICIENT_DATA`` with
-``presence_connected = False``: nothing here counts children from a camera, and nothing
-substitutes vision occupancy for a missing count.
+Ratio status is computed by the pure :mod:`veotrex_api.classroom_ratio` engine. Since V1-04B
+the one connected presence source is MANUAL: an operator-reported, append-only, short-lived
+aggregate snapshot (``classroom_presence_snapshots``). Storage and selection live here; the
+arithmetic stays in the engine. Nothing here counts children from a camera, and nothing
+substitutes vision occupancy for a missing or expired count.
 """
 
 from __future__ import annotations
@@ -33,21 +34,30 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from veotrex_api.access import AuthenticatedPrincipal
 from veotrex_api.authorization import Permission, has_permission
 from veotrex_api.classroom_ratio import (
+    Freshness,
+    ManualPresenceRecord,
+    PresenceAvailability,
+    PresenceResolution,
     RatioEvaluation,
     RatioPolicyError,
     RatioPolicyTerms,
     VisionReconciliation,
     evaluate_ratio,
     find_overlap,
+    freshness,
     reconcile_vision,
+    resolve_manual_presence,
     select_policy,
     validate_effective_period,
+    validate_manual_counts,
+    validate_manual_validity,
     validate_policy_numbers,
 )
 from veotrex_api.models import (
     Area,
     AuditEvent,
     Camera,
+    ClassroomPresenceSnapshot,
     ClassroomRatioPolicy,
     Facility,
     Zone,
@@ -76,8 +86,15 @@ VALIDATION_CATEGORIES = frozenset(
         "invalid_maximum_group_size",
         "effective_period_inverted",
         "invalid_effective_date",
+        "invalid_child_count",
+        "invalid_qualified_staff_count",
+        "invalid_visitor_count",
+        "invalid_validity_seconds",
     }
 )
+# How many past reports the presence endpoint returns. History is kept in full in the table;
+# this only bounds one response.
+PRESENCE_HISTORY_LIMIT = 20
 CONFLICT_CATEGORIES = frozenset(
     {
         "classroom_name_exists",
@@ -162,8 +179,10 @@ class RatioStatus:
     reconciliation: VisionReconciliation
     presence_connected: bool
     vision_connected: bool
+    presence: PresenceResolution | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        resolution = self.presence
         return {
             "classroom_id": str(self.classroom_id),
             "evaluation": self.evaluation.as_dict(),
@@ -171,7 +190,77 @@ class RatioStatus:
             "presence_connected": self.presence_connected,
             "vision_connected": self.vision_connected,
             "policy_basis": "CONFIGURED_CLASSROOM_POLICY",
+            "presence": presence_dict(resolution, self.evaluation.evaluated_at),
         }
+
+
+def presence_dict(resolution: PresenceResolution | None, now: datetime) -> dict[str, Any]:
+    """The authoritative presence behind a status. Counts appear only while FRESH: a stale or
+    revoked report is described, never shown as if it still held."""
+    if resolution is None or resolution.record is None:
+        availability = (
+            PresenceAvailability.PRESENCE_NOT_CONNECTED
+            if resolution is None
+            else resolution.availability
+        )
+        return {
+            "availability": str(availability),
+            "source": None,
+            "snapshot_id": None,
+            "observed_at": None,
+            "valid_until": None,
+            "freshness": str(Freshness.MISSING),
+            "child_count": None,
+            "qualified_staff_count": None,
+            "visitor_count": None,
+        }
+    record = resolution.record
+    fresh = resolution.availability is PresenceAvailability.PRESENCE_FRESH
+    return {
+        "availability": str(resolution.availability),
+        "source": "MANUAL",
+        "snapshot_id": str(record.snapshot_id),
+        "observed_at": utc(record.observed_at).isoformat(),
+        "valid_until": utc(record.valid_until).isoformat(),
+        "freshness": str(Freshness.FRESH if fresh else Freshness.STALE),
+        "child_count": record.child_count if fresh else None,
+        "qualified_staff_count": record.qualified_staff_count if fresh else None,
+        "visitor_count": record.visitor_count if fresh else None,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ManualPresenceInput:
+    child_count: int
+    qualified_staff_count: int
+    visitor_count: int
+    valid_for_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceReport:
+    """One stored report as history shows it: counts, times, state. No person, no name."""
+
+    snapshot_id: UUID
+    source: str
+    child_count: int
+    qualified_staff_count: int
+    visitor_count: int
+    observed_at: datetime
+    valid_until: datetime
+    created_at: datetime
+    revoked_at: datetime | None
+    freshness: str
+    authoritative: bool
+    submitted_by_caller: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ClassroomPresence:
+    classroom_id: UUID
+    availability: str
+    current: PresenceReport | None
+    history: tuple[PresenceReport, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +276,12 @@ class PolicyInput:
 
 
 # ------------------------------------------------------------------------------ validation
+def utc(value: datetime) -> datetime:
+    """Every timestamp leaves this module in UTC, whatever the database session's timezone:
+    a value read back from PostgreSQL must render exactly as the one just written."""
+    return value.astimezone(UTC)
+
+
 def clean_name(value: str, *, maximum: int = NAME_MAX, category: str) -> str:
     name = " ".join(str(value).split())
     if not name or len(name) > maximum or not _FREE_TEXT.match(name):
@@ -432,16 +527,16 @@ class ClassroomService:
             max_children_per_staff=row.max_children_per_staff,
             minimum_staff=row.minimum_staff,
             maximum_group_size=row.maximum_group_size,
-            effective_from=row.effective_from,
-            effective_until=row.effective_until,
+            effective_from=utc(row.effective_from),
+            effective_until=None if row.effective_until is None else utc(row.effective_until),
             effective_from_date=row.effective_from.astimezone(zone).date(),
             effective_through_date=through,
             status=row.status,
             revision=row.revision,
             source_reference=row.source_reference,
             in_effect=policy_terms(row).applies_at(now),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
+            created_at=utc(row.created_at),
+            updated_at=utc(row.updated_at),
         )
 
     async def _summary(
@@ -467,8 +562,8 @@ class ClassroomService:
             policies=tuple(self._policy_summary(row, zone, now) for row in rows),
             current_policy_id=None if selection.policy is None else selection.policy.policy_id,
             can_administer=self._can(principal, Permission.ADMINISTER_FACILITY, facility.id),
-            created_at=area.created_at,
-            updated_at=area.updated_at,
+            created_at=utc(area.created_at),
+            updated_at=utc(area.updated_at),
         )
 
     # ------------------------------------------------------------------------ facilities
@@ -809,13 +904,233 @@ class ClassroomService:
         }
 
     # ---------------------------------------------------------------------------- status
+    # ------------------------------------------------------------------ manual presence
+    @staticmethod
+    def _presence_record(row: ClassroomPresenceSnapshot) -> ManualPresenceRecord:
+        return ManualPresenceRecord(
+            snapshot_id=row.id,
+            classroom_id=row.area_id,
+            child_count=row.child_count,
+            qualified_staff_count=row.qualified_staff_count,
+            visitor_count=row.visitor_count,
+            observed_at=row.observed_at,
+            valid_until=row.valid_until,
+            created_at=row.created_at,
+            revoked_at=row.revoked_at,
+        )
+
+    @staticmethod
+    async def _presence_rows(
+        session: AsyncSession, tenant_id: UUID, classroom_id: UUID, limit: int
+    ) -> list[ClassroomPresenceSnapshot]:
+        """Newest first by the one authoritative ordering: observed_at, created_at, id - all
+        descending (``ManualPresenceRecord.ordering_key``). The index serves exactly this."""
+        return list(
+            (
+                await session.scalars(
+                    select(ClassroomPresenceSnapshot)
+                    .where(
+                        ClassroomPresenceSnapshot.tenant_id == tenant_id,
+                        ClassroomPresenceSnapshot.area_id == classroom_id,
+                    )
+                    .order_by(
+                        ClassroomPresenceSnapshot.observed_at.desc(),
+                        ClassroomPresenceSnapshot.created_at.desc(),
+                        ClassroomPresenceSnapshot.id.desc(),
+                    )
+                    .limit(limit)
+                )
+            ).all()
+        )
+
+    async def _resolve_presence(
+        self, session: AsyncSession, tenant_id: UUID, classroom_id: UUID, now: datetime
+    ) -> PresenceResolution:
+        latest = await self._presence_rows(session, tenant_id, classroom_id, 1)
+        return resolve_manual_presence(
+            [self._presence_record(row) for row in latest], classroom_id, now
+        )
+
+    def _report(
+        self,
+        row: ClassroomPresenceSnapshot,
+        principal: AuthenticatedPrincipal,
+        now: datetime,
+        authoritative_id: UUID | None,
+        *,
+        latest: bool,
+    ) -> PresenceReport:
+        record = self._presence_record(row)
+        if record.revoked:
+            state = "REVOKED"
+        elif not latest:
+            # Perhaps not expired, but no longer the report that counts: supersession is
+            # permanent, so an older row is never shown as if it were current.
+            state = "SUPERSEDED"
+        else:
+            state = str(freshness(record.to_snapshot().children, now))
+        return PresenceReport(
+            snapshot_id=row.id,
+            source=row.source,
+            child_count=row.child_count,
+            qualified_staff_count=row.qualified_staff_count,
+            visitor_count=row.visitor_count,
+            observed_at=utc(row.observed_at),
+            valid_until=utc(row.valid_until),
+            created_at=utc(row.created_at),
+            revoked_at=None if row.revoked_at is None else utc(row.revoked_at),
+            freshness=state,
+            authoritative=row.id == authoritative_id,
+            submitted_by_caller=row.submitted_by_actor_id == principal.actor_id,
+        )
+
+    async def _presence_summary(
+        self,
+        session: AsyncSession,
+        principal: AuthenticatedPrincipal,
+        area: Area,
+        now: datetime,
+    ) -> ClassroomPresence:
+        rows = await self._presence_rows(
+            session, principal.tenant_id, area.id, PRESENCE_HISTORY_LIMIT
+        )
+        resolution = resolve_manual_presence(
+            [self._presence_record(row) for row in rows[:1]], area.id, now
+        )
+        authoritative = (
+            resolution.record.snapshot_id
+            if resolution.availability is PresenceAvailability.PRESENCE_FRESH
+            and resolution.record is not None
+            else None
+        )
+        history = tuple(
+            self._report(row, principal, now, authoritative, latest=index == 0)
+            for index, row in enumerate(rows)
+        )
+        return ClassroomPresence(
+            classroom_id=area.id,
+            availability=str(resolution.availability),
+            current=history[0] if history else None,
+            history=history,
+        )
+
+    async def get_presence(
+        self, principal: AuthenticatedPrincipal, classroom_id: UUID, *, now: datetime | None = None
+    ) -> ClassroomPresence:
+        self._require_any(principal, Permission.READ_OPERATIONAL)
+        async with self._factory() as session, session.begin():
+            await self._set_tenant(session, principal.tenant_id)
+            area, _ = await self._classroom(session, principal, classroom_id)
+            return await self._presence_summary(session, principal, area, now or datetime.now(UTC))
+
+    async def submit_manual_presence(
+        self,
+        principal: AuthenticatedPrincipal,
+        classroom_id: UUID,
+        payload: ManualPresenceInput,
+        request_id: str,
+    ) -> ClassroomPresence:
+        """Append one operator report. ``observed_at`` is the server's clock at submission: a
+        client can neither backdate a count nor send one from the future."""
+        self._require_any(principal, Permission.ADMINISTER_FACILITY)
+        try:
+            validate_manual_counts(
+                payload.child_count, payload.qualified_staff_count, payload.visitor_count
+            )
+            validate_manual_validity(payload.valid_for_seconds)
+        except RatioPolicyError as exc:
+            raise ClassroomError(exc.category) from None
+        async with self._factory() as session, session.begin():
+            await self._set_tenant(session, principal.tenant_id)
+            area, facility = await self._classroom(
+                session, principal, classroom_id, administer=True
+            )
+            if area.status != "ACTIVE":
+                raise ClassroomError("classroom_inactive")
+            observed = datetime.now(UTC)
+            row = ClassroomPresenceSnapshot(
+                id=uuid4(),
+                tenant_id=principal.tenant_id,
+                facility_id=facility.id,
+                area_id=area.id,
+                child_count=payload.child_count,
+                qualified_staff_count=payload.qualified_staff_count,
+                visitor_count=payload.visitor_count,
+                source="MANUAL",
+                observed_at=observed,
+                valid_until=observed + timedelta(seconds=payload.valid_for_seconds),
+                submitted_by_actor_id=principal.actor_id,
+            )
+            session.add(row)
+            await session.flush()
+            self._audit(
+                session,
+                principal,
+                "classroom_presence_snapshot",
+                row.id,
+                "presence.manual_submitted",
+                request_id,
+                {
+                    "classroom_id": str(area.id),
+                    "source": "MANUAL",
+                    "child_count": payload.child_count,
+                    "qualified_staff_count": payload.qualified_staff_count,
+                    "visitor_count": payload.visitor_count,
+                    "valid_for_seconds": payload.valid_for_seconds,
+                },
+            )
+            await session.flush()
+            return await self._presence_summary(session, principal, area, datetime.now(UTC))
+
+    async def revoke_manual_presence(
+        self,
+        principal: AuthenticatedPrincipal,
+        classroom_id: UUID,
+        snapshot_id: UUID,
+        request_id: str,
+    ) -> ClassroomPresence:
+        """Withdraw one report. Idempotent: a second revoke changes nothing and is not audited
+        again, and the first revoker and time are kept."""
+        self._require_any(principal, Permission.ADMINISTER_FACILITY)
+        async with self._factory() as session, session.begin():
+            await self._set_tenant(session, principal.tenant_id)
+            area, _ = await self._classroom(session, principal, classroom_id, administer=True)
+            row = await session.scalar(
+                select(ClassroomPresenceSnapshot)
+                .where(
+                    ClassroomPresenceSnapshot.id == snapshot_id,
+                    ClassroomPresenceSnapshot.tenant_id == principal.tenant_id,
+                    ClassroomPresenceSnapshot.area_id == area.id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise ClassroomError("not_found")
+            if row.revoked_at is None:
+                row.revoked_at = datetime.now(UTC)
+                row.revoked_by_actor_id = principal.actor_id
+                await session.flush()
+                self._audit(
+                    session,
+                    principal,
+                    "classroom_presence_snapshot",
+                    row.id,
+                    "presence.manual_revoked",
+                    request_id,
+                    {"classroom_id": str(area.id), "source": "MANUAL"},
+                )
+                await session.flush()
+            return await self._presence_summary(session, principal, area, datetime.now(UTC))
+
+    # ---------------------------------------------------------------------------- status
     async def ratio_status(
         self, principal: AuthenticatedPrincipal, classroom_id: UUID, *, now: datetime | None = None
     ) -> RatioStatus:
-        """The configured policy evaluated with the presence sources connected today: none.
+        """policy in force -> latest authoritative manual report -> the pure engine.
 
-        The answer is therefore INSUFFICIENT_DATA (or NOT_CONFIGURED) and says why. It is never
-        derived from a camera: vision is not a presence source.
+        Missing, stale or revoked presence is INSUFFICIENT_DATA with the reason; no earlier
+        report and no camera count ever stands in for it. Vision is not connected here, so the
+        reconciliation diagnostic reports NOT_AVAILABLE.
         """
         self._require_any(principal, Permission.READ_OPERATIONAL)
         moment = now or datetime.now(UTC)
@@ -823,17 +1138,26 @@ class ClassroomService:
             await self._set_tenant(session, principal.tenant_id)
             area, _ = await self._classroom(session, principal, classroom_id)
             rows = await self._policies(session, principal.tenant_id, area.id)
+            resolution = await self._resolve_presence(session, principal.tenant_id, area.id, moment)
         selection = select_policy([policy_terms(row) for row in rows], moment)
+        fresh = (
+            resolution.snapshot
+            if resolution.availability is PresenceAvailability.PRESENCE_FRESH
+            else None
+        )
         return RatioStatus(
             classroom_id=area.id,
             evaluation=evaluate_ratio(
                 selection.policy,
-                None,
+                # A stale report goes in as-is so the engine itself reports it stale; a revoked
+                # one has no snapshot and reads as missing.
+                resolution.snapshot,
                 moment,
                 classroom_active=area.status == "ACTIVE",
                 policy_ambiguous=selection.ambiguous,
             ),
-            reconciliation=reconcile_vision(None, None, moment),
-            presence_connected=False,
+            reconciliation=reconcile_vision(fresh, None, moment),
+            presence_connected=resolution.connected,
             vision_connected=False,
+            presence=resolution,
         )

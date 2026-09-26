@@ -286,3 +286,30 @@ export async function deactivateRatioPolicy(classroomId: string, policyId: strin
     { method: "POST" },
   );
 }
+
+// ---------------------------------------------------------------- manual presence (V1-04B)
+import type { ClassroomPresence, ManualPresencePayload } from "./classrooms";
+
+export async function getClassroomPresence(classroomId: string): Promise<ClassroomPresence | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence`);
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomPresence;
+}
+
+export async function submitManualPresence(
+  classroomId: string,
+  payload: ManualPresencePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence/manual`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function revokeManualPresence(classroomId: string, snapshotId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/presence/${encodeURIComponent(snapshotId)}/revoke`,
+    { method: "POST" },
+  );
+}

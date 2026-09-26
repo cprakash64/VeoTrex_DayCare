@@ -2,16 +2,17 @@ import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
 import { auth0 } from "../../../../lib/auth0";
-import {
-  policyNumbers,
-  policyPeriod,
-  policyStatusLabel,
-  ratioStatusView,
-} from "../../../../lib/classrooms";
+import { policyNumbers, policyPeriod, policyStatusLabel } from "../../../../lib/classrooms";
 import { UUID_PATTERN } from "../../../../lib/ring-inventory";
 import { protectedRouteRedirect } from "../../../../lib/session-policy";
-import { getClassroom, getClassroomRatioStatus } from "../../../../lib/veotrex-api";
+import {
+  getClassroom,
+  getClassroomPresence,
+  getClassroomRatioStatus,
+} from "../../../../lib/veotrex-api";
 import { ClassroomControls } from "./classroom-controls";
+import { ManualPresenceCard } from "./manual-presence-card";
+import { RatioStatusCard } from "./ratio-status-card";
 import { PolicyForm } from "./policy-form";
 
 type Props = { params: Promise<{ classroomId: string }> };
@@ -21,12 +22,12 @@ export default async function ClassroomPage({ params }: Props) {
   if (destination) redirect(destination);
   const { classroomId } = await params;
   if (!UUID_PATTERN.test(classroomId)) notFound();
-  const [room, status] = await Promise.all([
+  const [room, status, presence] = await Promise.all([
     getClassroom(classroomId),
     getClassroomRatioStatus(classroomId),
+    getClassroomPresence(classroomId),
   ]);
   if (room === null) notFound();
-  const view = ratioStatusView(status);
   const canEdit = room.can_administer;
   const active = room.status === "ACTIVE";
 
@@ -44,21 +45,14 @@ export default async function ClassroomPage({ params }: Props) {
         {active ? "Active" : "Inactive"} · dates are in {room.facility_timezone}
       </p>
 
-      <section className="ratio-card" aria-labelledby="ratio-heading">
-        <p className="eyebrow">{view.basis}</p>
-        <h2 id="ratio-heading">
-          <span className={`badge ${view.tone === "attention" ? "attention" : view.tone === "ok" ? "ready" : "inactive"}`}>
-            {view.headline}
-          </span>
-        </h2>
-        {view.details.map((line) => (
-          <p key={line}>{line}</p>
-        ))}
-        <p className="staff-meta">
-          Counts come only from approved presence sources. People seen by a camera are never counted as
-          children or staff.
-        </p>
-      </section>
+      <RatioStatusCard status={status} />
+
+      <ManualPresenceCard
+        key={presence?.current?.snapshot_id ?? "none"}
+        classroomId={room.classroom_id}
+        presence={presence}
+        canReport={canEdit && active}
+      />
 
       <section aria-labelledby="camera-heading">
         <h2 id="camera-heading">Cameras</h2>

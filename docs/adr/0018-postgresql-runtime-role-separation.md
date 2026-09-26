@@ -102,6 +102,8 @@ roles' defaults and refuses to infer the migration role when connected as the ru
 Later stages reclassify through `TABLE_CLASSIFICATION` in `runtime_role.py`, which is the
 authoritative list. V1-04A (ADR 0024): `facilities` and `zones` became RUNTIME_READ; `areas` and
 the new `classroom_ratio_policies` became RUNTIME_WRITE (S,I,U). DELETE is still never granted.
+V1-04B (ADR 0025): `classroom_presence_snapshots` is RUNTIME_WRITE (S,I,U); a trigger limits
+UPDATE to one revocation, and there is no DELETE.
 
 ### The credential boundary (V1-00A-R1)
 

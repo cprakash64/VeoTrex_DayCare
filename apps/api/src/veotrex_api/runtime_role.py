@@ -176,6 +176,14 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
         "UPDATE",
     ),
     "zones": _read("classroom camera association (camera -> zone -> area)"),
+    # V1-04B: append-only operator head counts. UPDATE exists only for the single revocation a
+    # trigger permits (migration 0010); DELETE is never granted.
+    "classroom_presence_snapshots": _write(
+        "manual classroom presence reports; revocation is the only permitted update",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
     "classroom_ratio_policies": _write(
         "operator-configured classroom ratio policies; deactivated, never deleted",
         "SELECT",

@@ -182,7 +182,8 @@ describe("ratio status wording (V1-04A)", () => {
     );
     expect(over.headline).toBe("Configured ratio exceeded");
     expect(over.tone).toBe("attention");
-    expect(over.details).toContain("Additional qualified staff needed: 1");
+    expect(over.details).toContain("Staff deficit: 1");
+    expect(over.details).toContain("Required qualified staff: 2");
   });
 
   it("an unexplained person seen by the camera is never called a child", () => {
@@ -204,8 +205,8 @@ describe("ratio status wording (V1-04A)", () => {
       ),
     );
     const text = view.details.join(" ");
-    expect(text).toContain("Children recorded: 6");
-    expect(text).toContain("1 more person than the recorded presence accounts for");
+    expect(text).toContain("Children reported: 6");
+    expect(text).toContain("1 more person than the reported presence accounts for");
     expect(text).toContain("not counted as children or staff");
   });
 

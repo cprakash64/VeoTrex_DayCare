@@ -615,3 +615,143 @@ def reconcile_vision(
         visitors_included=visitors_included,
         reasons=() if visitors_included else ("VISITOR_COUNT_NOT_SUPPLIED",),
     )
+
+
+# ================================================================ manual presence (V1-04B)
+# The first authoritative presence source: an operator reports aggregate counts for a room.
+# Counts only - no names, no identities, no images. Bounds are for one classroom and are meant
+# to reject typos ("600" for "6"), not to encode any regulation: 150 children covers a combined
+# multipurpose room, 50 staff and 50 visitors cover an open day. Validity is short on purpose,
+# because a head count describes a moment: 30 s to 15 min, default 2 min.
+MANUAL_MAX_CHILDREN = 150
+MANUAL_MAX_QUALIFIED_STAFF = 50
+MANUAL_MAX_VISITORS = 50
+MANUAL_MIN_VALIDITY_SECONDS = 30
+MANUAL_MAX_VALIDITY_SECONDS = 15 * 60
+MANUAL_DEFAULT_VALIDITY_SECONDS = 120
+
+
+class PresenceAvailability(StrEnum):
+    """Why an authoritative presence snapshot is, or is not, available right now."""
+
+    PRESENCE_FRESH = "PRESENCE_FRESH"
+    PRESENCE_NOT_CONNECTED = "PRESENCE_NOT_CONNECTED"  # nothing has ever been reported
+    PRESENCE_STALE = "PRESENCE_STALE"  # the latest report has expired
+    PRESENCE_REVOKED = "PRESENCE_REVOKED"  # the latest report was withdrawn
+    PRESENCE_NOT_YET_VALID = "PRESENCE_NOT_YET_VALID"  # timestamped beyond the permitted skew
+
+
+def validate_manual_counts(children: int, qualified_staff: int, visitors: int) -> None:
+    for value, maximum, category in (
+        (children, MANUAL_MAX_CHILDREN, "invalid_child_count"),
+        (qualified_staff, MANUAL_MAX_QUALIFIED_STAFF, "invalid_qualified_staff_count"),
+        (visitors, MANUAL_MAX_VISITORS, "invalid_visitor_count"),
+    ):
+        if not _strict_int(value) or not 0 <= value <= maximum:
+            raise RatioPolicyError(category)
+
+
+def validate_manual_validity(seconds: int) -> None:
+    if not _strict_int(seconds) or not (
+        MANUAL_MIN_VALIDITY_SECONDS <= seconds <= MANUAL_MAX_VALIDITY_SECONDS
+    ):
+        raise RatioPolicyError("invalid_validity_seconds")
+
+
+@dataclass(frozen=True, slots=True)
+class ManualPresenceRecord:
+    """One stored operator report, as the domain sees it. Aggregate counts and provenance only."""
+
+    snapshot_id: UUID
+    classroom_id: UUID
+    child_count: int
+    qualified_staff_count: int
+    visitor_count: int
+    observed_at: datetime
+    valid_until: datetime
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        validate_manual_counts(self.child_count, self.qualified_staff_count, self.visitor_count)
+        for value in (self.observed_at, self.valid_until, self.created_at):
+            _require_aware(value, "presence_timestamp_must_be_utc_aware")
+        seconds = (self.valid_until - self.observed_at).total_seconds()
+        if seconds != int(seconds):
+            raise RatioPolicyError("invalid_validity_seconds")
+        validate_manual_validity(int(seconds))
+
+    @property
+    def valid_for_seconds(self) -> int:
+        return int((self.valid_until - self.observed_at).total_seconds())
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_at is not None
+
+    def ordering_key(self) -> tuple[datetime, datetime, str]:
+        """``observed_at DESC, created_at DESC, id DESC`` - the one authoritative ordering,
+        shared with the SQL that fetches the latest row. Ties are broken by id, so the same
+        rows always select the same snapshot."""
+        return (self.observed_at, self.created_at, str(self.snapshot_id))
+
+    def to_snapshot(self) -> PresenceSnapshot:
+        """Explicit role slots from an explicit MANUAL source. Nothing else is filled: there is
+        no UNKNOWN count here, and nothing from a camera."""
+
+        def count(role: PresenceRole, value: int) -> PresenceCount:
+            return PresenceCount(
+                self.classroom_id,
+                role,
+                value,
+                PresenceSource.MANUAL,
+                self.observed_at,
+                self.valid_for_seconds,
+            )
+
+        return PresenceSnapshot(
+            self.classroom_id,
+            children=count(PresenceRole.CHILD, self.child_count),
+            qualified_staff=count(PresenceRole.QUALIFIED_STAFF, self.qualified_staff_count),
+            visitors=count(PresenceRole.VISITOR, self.visitor_count),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceResolution:
+    """Which stored report, if any, is authoritative now, and why."""
+
+    availability: PresenceAvailability
+    record: ManualPresenceRecord | None
+    snapshot: PresenceSnapshot | None
+
+    @property
+    def connected(self) -> bool:
+        return self.availability is not PresenceAvailability.PRESENCE_NOT_CONNECTED
+
+
+def resolve_manual_presence(
+    records: Iterable[ManualPresenceRecord], classroom_id: UUID, now: datetime
+) -> PresenceResolution:
+    """The latest report for this classroom decides; nothing older is ever reconsidered.
+
+    Supersession is permanent. If the latest report is revoked or stale, the answer is that -
+    an earlier report is never resurrected, because an operator who withdraws or lets lapse
+    the current count must not find an older, silently re-authoritative one in its place.
+    Only a FRESH latest report yields a ``PresenceSnapshot`` for the ratio engine; a stale
+    report's snapshot is passed through so the engine itself reports it as stale.
+    """
+    _require_aware(now, "evaluation_time_must_be_utc_aware")
+    own = [record for record in records if record.classroom_id == classroom_id]
+    if not own:
+        return PresenceResolution(PresenceAvailability.PRESENCE_NOT_CONNECTED, None, None)
+    latest = max(own, key=ManualPresenceRecord.ordering_key)
+    if latest.revoked:
+        return PresenceResolution(PresenceAvailability.PRESENCE_REVOKED, latest, None)
+    snapshot = latest.to_snapshot()
+    state = freshness(snapshot.children, now)
+    if state is Freshness.FRESH:
+        return PresenceResolution(PresenceAvailability.PRESENCE_FRESH, latest, snapshot)
+    if latest.observed_at - now > MAX_FUTURE_SKEW:
+        return PresenceResolution(PresenceAvailability.PRESENCE_NOT_YET_VALID, latest, snapshot)
+    return PresenceResolution(PresenceAvailability.PRESENCE_STALE, latest, snapshot)

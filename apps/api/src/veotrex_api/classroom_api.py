@@ -20,14 +20,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from veotrex_api.access import PrincipalContext, require_permission
 from veotrex_api.authorization import Permission
+from veotrex_api.classroom_ratio import MANUAL_DEFAULT_VALIDITY_SECONDS
 from veotrex_api.classroom_service import (
     CONFLICT_CATEGORIES,
     VALIDATION_CATEGORIES,
     ClassroomError,
+    ClassroomPresence,
     ClassroomService,
     ClassroomSummary,
+    ManualPresenceInput,
     PolicyInput,
     PolicySummary,
+    PresenceReport,
 )
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
@@ -72,6 +76,73 @@ class PolicyRequest(BaseModel):
             effective_through_date=self.effective_through_date,
             source_reference=self.source_reference,
         )
+
+
+class ManualPresenceRequest(BaseModel):
+    """Aggregate counts only. There is deliberately no field for a name, an identifier of a
+    person, a timestamp (the server's clock is used) or a camera observation."""
+
+    model_config = ConfigDict(extra="forbid")
+    child_count: int = Field(strict=True)
+    qualified_staff_count: int = Field(strict=True)
+    visitor_count: int = Field(default=0, strict=True)
+    valid_for_seconds: int = Field(default=MANUAL_DEFAULT_VALIDITY_SECONDS, strict=True)
+
+    def to_input(self) -> ManualPresenceInput:
+        return ManualPresenceInput(
+            child_count=self.child_count,
+            qualified_staff_count=self.qualified_staff_count,
+            visitor_count=self.visitor_count,
+            valid_for_seconds=self.valid_for_seconds,
+        )
+
+
+class PresenceReportResponse(BaseModel):
+    snapshot_id: str
+    source: str
+    child_count: int
+    qualified_staff_count: int
+    visitor_count: int
+    observed_at: str
+    valid_until: str
+    created_at: str
+    revoked_at: str | None
+    freshness: str
+    authoritative: bool
+    submitted_by_caller: bool
+
+
+class PresenceResponse(BaseModel):
+    classroom_id: str
+    availability: str
+    current: PresenceReportResponse | None
+    history: list[PresenceReportResponse]
+
+
+def _report(value: PresenceReport) -> PresenceReportResponse:
+    return PresenceReportResponse(
+        snapshot_id=str(value.snapshot_id),
+        source=value.source,
+        child_count=value.child_count,
+        qualified_staff_count=value.qualified_staff_count,
+        visitor_count=value.visitor_count,
+        observed_at=value.observed_at.isoformat(),
+        valid_until=value.valid_until.isoformat(),
+        created_at=value.created_at.isoformat(),
+        revoked_at=None if value.revoked_at is None else value.revoked_at.isoformat(),
+        freshness=value.freshness,
+        authoritative=value.authoritative,
+        submitted_by_caller=value.submitted_by_caller,
+    )
+
+
+def _presence(value: ClassroomPresence) -> PresenceResponse:
+    return PresenceResponse(
+        classroom_id=str(value.classroom_id),
+        availability=value.availability,
+        current=None if value.current is None else _report(value.current),
+        history=[_report(item) for item in value.history],
+    )
 
 
 class FacilityResponse(BaseModel):
@@ -365,6 +436,55 @@ def register_classroom_routes(app: FastAPI, service: ClassroomService) -> None:
             return _classroom(
                 await service.deactivate_policy(
                     context.principal, classroom_id, policy_id, _request_id(request)
+                )
+            )
+        except ClassroomError as exc:
+            raise _http(exc) from None
+
+    @app.get("/v1/classrooms/{classroom_id}/presence", response_model=PresenceResponse)
+    async def get_presence(
+        classroom_id: UUID,
+        context: Annotated[PrincipalContext, Depends(require_read_operational)],
+    ) -> PresenceResponse:
+        try:
+            return _presence(await service.get_presence(context.principal, classroom_id))
+        except ClassroomError as exc:
+            raise _http(exc) from None
+
+    @app.post(
+        "/v1/classrooms/{classroom_id}/presence/manual",
+        response_model=PresenceResponse,
+        status_code=201,
+    )
+    async def submit_manual_presence(
+        classroom_id: UUID,
+        payload: ManualPresenceRequest,
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_administer_facility)],
+    ) -> PresenceResponse:
+        try:
+            return _presence(
+                await service.submit_manual_presence(
+                    context.principal, classroom_id, payload.to_input(), _request_id(request)
+                )
+            )
+        except ClassroomError as exc:
+            raise _http(exc) from None
+
+    @app.post(
+        "/v1/classrooms/{classroom_id}/presence/{snapshot_id}/revoke",
+        response_model=PresenceResponse,
+    )
+    async def revoke_manual_presence(
+        classroom_id: UUID,
+        snapshot_id: UUID,
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_administer_facility)],
+    ) -> PresenceResponse:
+        try:
+            return _presence(
+                await service.revoke_manual_presence(
+                    context.principal, classroom_id, snapshot_id, _request_id(request)
                 )
             )
         except ClassroomError as exc:

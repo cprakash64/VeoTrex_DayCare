@@ -128,6 +128,9 @@ reported as one *unexplained* person, not a child.
 
 ### What is connected today
 
+(Superseded for the control plane by ADR 0025, which connects MANUAL operator-reported presence.
+The live edge dashboard remains unconnected.)
+
 Nothing supplies presence yet:
 
 - `GET /v1/classrooms/{id}/ratio-status` returns `INSUFFICIENT_DATA` (or `NOT_CONFIGURED`) with

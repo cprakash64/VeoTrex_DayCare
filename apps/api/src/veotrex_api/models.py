@@ -73,6 +73,9 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     __tablename__ = "areas"
     __table_args__ = (
         UniqueConstraint("id", "tenant_id", name="uq_areas_id_tenant"),
+        # Target of the presence snapshot FK (V1-04B): a snapshot's classroom and facility must
+        # agree, enforced by the database rather than trusted from the API.
+        UniqueConstraint("id", "facility_id", "tenant_id", name="uq_areas_id_facility_tenant"),
         UniqueConstraint("tenant_id", "facility_id", "name", name="uq_areas_facility_name"),
         ForeignKeyConstraint(
             ["facility_id", "tenant_id"],
@@ -809,6 +812,90 @@ class ClassroomRatioPolicy(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     created_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
 
 
+class ClassroomPresenceSnapshot(Base, IdMixin, TenantOwnedMixin):
+    """One operator-reported aggregate head count for a classroom (V1-04B). Append-only.
+
+    Counts and provenance only: no names, no child or staff identifiers, no images, no faces,
+    no tracks, no boxes. A new report is a new row; a report is never edited. The only change a
+    row may ever undergo is a single revocation (``revoked_at`` + ``revoked_by_actor_id``), and
+    a database trigger (migration 0010) refuses every other UPDATE. The runtime role cannot
+    DELETE.
+    """
+
+    __tablename__ = "classroom_presence_snapshots"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_classroom_presence_snapshots_id_tenant"),
+        ForeignKeyConstraint(
+            ["area_id", "facility_id", "tenant_id"],
+            ["areas.id", "areas.facility_id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_classroom_presence_snapshots_area_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["submitted_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_classroom_presence_snapshots_submitter_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["revoked_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_classroom_presence_snapshots_revoker_tenant",
+        ),
+        CheckConstraint("source = 'MANUAL'", name="ck_classroom_presence_snapshots_source"),
+        CheckConstraint(
+            "child_count BETWEEN 0 AND 150", name="ck_classroom_presence_snapshots_children"
+        ),
+        CheckConstraint(
+            "qualified_staff_count BETWEEN 0 AND 50", name="ck_classroom_presence_snapshots_staff"
+        ),
+        CheckConstraint(
+            "visitor_count BETWEEN 0 AND 50", name="ck_classroom_presence_snapshots_visitors"
+        ),
+        CheckConstraint(
+            "valid_until >= observed_at + interval '30 seconds' "
+            "AND valid_until <= observed_at + interval '15 minutes'",
+            name="ck_classroom_presence_snapshots_validity",
+        ),
+        CheckConstraint(
+            "observed_at <= created_at + interval '120 seconds'",
+            name="ck_classroom_presence_snapshots_not_future",
+        ),
+        CheckConstraint(
+            "(revoked_at IS NULL) = (revoked_by_actor_id IS NULL)",
+            name="ck_classroom_presence_snapshots_revocation_pair",
+        ),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= created_at",
+            name="ck_classroom_presence_snapshots_revoked_after_created",
+        ),
+        Index(
+            "ix_classroom_presence_snapshots_latest",
+            "tenant_id",
+            "area_id",
+            text("observed_at DESC"),
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    child_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    qualified_staff_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    visitor_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="MANUAL")
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    submitted_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
 TENANT_OWNED_TABLES = (
     "facilities",
     "areas",
@@ -827,6 +914,8 @@ TENANT_OWNED_TABLES = (
     "audit_events",
     # V1-04A
     "classroom_ratio_policies",
+    # V1-04B
+    "classroom_presence_snapshots",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles

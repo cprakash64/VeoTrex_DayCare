@@ -88,6 +88,18 @@ export type VisionReconciliation = Readonly<{
   reasons: ReadonlyArray<string>;
 }>;
 
+export type PresenceStatus = Readonly<{
+  availability: string;
+  source: string | null;
+  snapshot_id: string | null;
+  observed_at: string | null;
+  valid_until: string | null;
+  freshness: string;
+  child_count: number | null;
+  qualified_staff_count: number | null;
+  visitor_count: number | null;
+}>;
+
 export type RatioStatus = Readonly<{
   classroom_id: string;
   evaluation: RatioEvaluation;
@@ -95,6 +107,57 @@ export type RatioStatus = Readonly<{
   presence_connected: boolean;
   vision_connected: boolean;
   policy_basis: string;
+  presence?: PresenceStatus;
+}>;
+
+export type PresenceReport = Readonly<{
+  snapshot_id: string;
+  source: string;
+  child_count: number;
+  qualified_staff_count: number;
+  visitor_count: number;
+  observed_at: string;
+  valid_until: string;
+  created_at: string;
+  revoked_at: string | null;
+  freshness: string;
+  authoritative: boolean;
+  submitted_by_caller: boolean;
+}>;
+
+export type ClassroomPresence = Readonly<{
+  classroom_id: string;
+  availability: string;
+  current: PresenceReport | null;
+  history: ReadonlyArray<PresenceReport>;
+}>;
+
+// ------------------------------------------------------------- manual presence (V1-04B)
+// Mirrors the API's bounds. Counts only: there is no field for a name or an identifier, and
+// the report's time is the server's clock at submission.
+export const MANUAL_LIMITS = { children: 150, qualified_staff: 50, visitors: 50 } as const;
+export const VALIDITY_CHOICES: ReadonlyArray<{ seconds: number; label: string }> = [
+  { seconds: 30, label: "30 seconds" },
+  { seconds: 60, label: "1 minute" },
+  { seconds: 120, label: "2 minutes" },
+  { seconds: 300, label: "5 minutes" },
+  { seconds: 600, label: "10 minutes" },
+  { seconds: 900, label: "15 minutes" },
+];
+export const DEFAULT_VALIDITY_SECONDS = 120;
+
+export type ManualPresenceForm = Readonly<{
+  child_count: string;
+  qualified_staff_count: string;
+  visitor_count: string;
+  valid_for_seconds: string;
+}>;
+
+export type ManualPresencePayload = Readonly<{
+  child_count: number;
+  qualified_staff_count: number;
+  visitor_count: number;
+  valid_for_seconds: number;
 }>;
 
 // --------------------------------------------------------------------------- validation
@@ -222,6 +285,52 @@ export function parsePolicyPayload(body: unknown): PolicyPayload | null {
   return result.ok ? result.value : null;
 }
 
+export function validateManualPresence(input: ManualPresenceForm): Validation<ManualPresencePayload> {
+  const errors: Record<string, string> = {};
+  const children = integer(input.child_count, 0, MANUAL_LIMITS.children);
+  if (children === null) errors.child_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.children}.`;
+  const staff = integer(input.qualified_staff_count, 0, MANUAL_LIMITS.qualified_staff);
+  if (staff === null) errors.qualified_staff_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.qualified_staff}.`;
+  const visitors = input.visitor_count.trim() ? integer(input.visitor_count, 0, MANUAL_LIMITS.visitors) : 0;
+  if (visitors === null) errors.visitor_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.visitors}.`;
+  const validity = Number(input.valid_for_seconds);
+  if (!VALIDITY_CHOICES.some((choice) => choice.seconds === validity)) {
+    errors.valid_for_seconds = "Choose how long this count stays valid.";
+  }
+  if (Object.keys(errors).length > 0) return { ok: false, errors };
+  return {
+    ok: true,
+    value: {
+      child_count: children as number,
+      qualified_staff_count: staff as number,
+      visitor_count: visitors as number,
+      valid_for_seconds: validity,
+    },
+  };
+}
+
+/** Strict re-validation in the BFF: exactly these keys, integer values only. */
+export function parseManualPresence(body: unknown): ManualPresencePayload | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  const keys = ["child_count", "qualified_staff_count", "visitor_count", "valid_for_seconds"];
+  if (Object.keys(record).some((key) => !keys.includes(key))) return null;
+  if (keys.some((key) => typeof record[key] !== "number" || !Number.isInteger(record[key]))) return null;
+  const result = validateManualPresence({
+    child_count: String(record.child_count),
+    qualified_staff_count: String(record.qualified_staff_count),
+    visitor_count: String(record.visitor_count),
+    valid_for_seconds: String(record.valid_for_seconds),
+  });
+  return result.ok ? result.value : null;
+}
+
+export function presenceStateLabel(report: PresenceReport, nowMs: number): string {
+  if (report.revoked_at) return "Revoked";
+  if (report.freshness === "FRESH" && Date.parse(report.valid_until) > nowMs) return "Fresh";
+  return "Stale";
+}
+
 export type ClassroomPayload = Readonly<{ name: string; age_band_label: string | null }>;
 
 export function validateClassroomForm(
@@ -248,6 +357,10 @@ const API_MESSAGES: Readonly<Record<string, string>> = {
   policy_period_overlaps: "Another active policy for this classroom covers some of these dates.",
   policy_limit_reached: "This classroom has reached its policy limit.",
   policy_inactive: "A deactivated policy cannot be edited; create a new one.",
+  invalid_child_count: "Children present must be a whole number within the allowed range.",
+  invalid_qualified_staff_count: "Qualified staff present must be a whole number within the allowed range.",
+  invalid_visitor_count: "Visitors present must be a whole number within the allowed range.",
+  invalid_validity_seconds: "Choose how long this count stays valid.",
   effective_period_inverted: "The last day cannot be before the first day.",
 };
 
@@ -267,13 +380,34 @@ export type RatioStatusView = Readonly<{
 
 const BASIS = "Configured classroom policy";
 
-export function ratioStatusView(status: RatioStatus | null): RatioStatusView {
+function clock(iso: string): string {
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleTimeString();
+}
+
+/**
+ * The server's evaluation, worded. ``nowMs`` lets the page re-check freshness on the browser's
+ * clock: a result computed while a report was fresh is never shown after it has expired.
+ */
+export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date.now()): RatioStatusView {
   if (status === null) {
     return { headline: "Ratio data unavailable", tone: "neutral", details: [], basis: BASIS };
   }
-  const { evaluation } = status;
+  const { evaluation, presence } = status;
   const details: string[] = [];
   const explanations = new Set(evaluation.explanations);
+  const expiredHere =
+    presence?.availability === "PRESENCE_FRESH" &&
+    presence.valid_until !== null &&
+    Date.parse(presence.valid_until) <= nowMs;
+  if (expiredHere && evaluation.ratio_state !== "NOT_CONFIGURED") {
+    return {
+      headline: "Presence data stale",
+      tone: "neutral",
+      details: ["The operator-reported count has expired. Report current presence to update."],
+      basis: BASIS,
+    };
+  }
   let headline: string;
   let tone: Tone = "neutral";
   switch (evaluation.ratio_state) {
@@ -282,21 +416,32 @@ export function ratioStatusView(status: RatioStatus | null): RatioStatusView {
         ? "Classroom inactive"
         : "No configured classroom policy in effect";
       break;
-    case "INSUFFICIENT_DATA":
-      if (!status.presence_connected) {
+    case "INSUFFICIENT_DATA": {
+      const availability = presence?.availability ?? (status.presence_connected ? "" : "PRESENCE_NOT_CONNECTED");
+      if (availability === "PRESENCE_NOT_CONNECTED") {
         headline = "Presence counts not connected";
         details.push(
-          "No attendance or staff presence source is connected yet, so no ratio is calculated. " +
+          "No presence has been reported for this classroom, so no ratio is calculated. " +
             "Camera occupancy is never used as a child or staff count.",
         );
-      } else if (explanations.has("CHILD_COUNT_STALE") || explanations.has("STAFF_COUNT_STALE")) {
+      } else if (
+        availability === "PRESENCE_STALE" ||
+        availability === "PRESENCE_NOT_YET_VALID" ||
+        explanations.has("CHILD_COUNT_STALE") ||
+        explanations.has("STAFF_COUNT_STALE")
+      ) {
         headline = "Presence data stale";
+        details.push("The operator-reported count has expired. Report current presence to update.");
+      } else if (availability === "PRESENCE_REVOKED") {
+        headline = "Ratio data unavailable";
+        details.push("The latest operator-reported count was withdrawn. No earlier report is used.");
       } else {
         headline = "Ratio data unavailable";
       }
       break;
+    }
     case "NO_CHILDREN_PRESENT":
-      headline = "No children recorded as present";
+      headline = "No children reported as present";
       tone = "ok";
       break;
     case "WITHIN_CONFIGURED_POLICY":
@@ -315,24 +460,26 @@ export function ratioStatusView(status: RatioStatus | null): RatioStatusView {
       headline = "Ratio data unavailable";
   }
   if (evaluation.child_count !== null && evaluation.staff_count !== null) {
-    details.push(
-      `Children recorded: ${evaluation.child_count} · qualified staff recorded: ${evaluation.staff_count}`,
-    );
+    details.push(`Children reported: ${evaluation.child_count}`);
+    details.push(`Qualified staff reported: ${evaluation.staff_count}`);
   }
   if (evaluation.required_staff !== null) {
-    details.push(`Qualified staff needed under the configured policy: ${evaluation.required_staff}`);
+    details.push(`Required qualified staff: ${evaluation.required_staff}`);
   }
-  if (evaluation.staff_deficit) {
-    details.push(`Additional qualified staff needed: ${evaluation.staff_deficit}`);
+  if (evaluation.staff_deficit !== null && evaluation.child_count !== null) {
+    details.push(`Staff deficit: ${evaluation.staff_deficit}`);
   }
   if (evaluation.conditions.includes("OVER_CONFIGURED_GROUP_SIZE") && evaluation.ratio_state !== "OVER_CONFIGURED_GROUP_SIZE") {
     details.push("The configured group size is also exceeded.");
+  }
+  if (presence?.availability === "PRESENCE_FRESH" && presence.valid_until) {
+    details.push(`Source: Manual (operator-reported) · fresh until ${clock(presence.valid_until)}`);
   }
   const unexplained = status.reconciliation.unexplained_observed_people;
   if (unexplained) {
     details.push(
       `The camera sees ${unexplained} more ${unexplained === 1 ? "person" : "people"} than the ` +
-        "recorded presence accounts for. They are not counted as children or staff.",
+        "reported presence accounts for. They are not counted as children or staff.",
     );
   }
   return { headline, tone, details, basis: BASIS };
