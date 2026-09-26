@@ -18,6 +18,8 @@ from veotrex_api.access import (
     require_permission,
 )
 from veotrex_api.authorization import Permission
+from veotrex_api.child_roster_api import register_child_roster_routes
+from veotrex_api.child_roster_service import ChildRosterService
 from veotrex_api.classroom_api import register_classroom_routes
 from veotrex_api.classroom_service import ClassroomService
 from veotrex_api.config import Settings, get_settings
@@ -382,6 +384,10 @@ def create_app(
     # by recognition.
     app.state.staff_roster_service = StaffRosterService(resolved_factory)
     register_staff_roster_routes(app, app.state.staff_roster_service)
+    # Facility child roster and operator attendance check-in/out (V1-04D). Human routes only;
+    # independent of any camera or face backend, and never reachable by an edge credential.
+    app.state.child_roster_service = ChildRosterService(resolved_factory)
+    register_child_roster_routes(app, app.state.child_roster_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,

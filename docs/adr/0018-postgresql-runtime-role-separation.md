@@ -105,7 +105,8 @@ the new `classroom_ratio_policies` became RUNTIME_WRITE (S,I,U). DELETE is still
 V1-04B (ADR 0025): `classroom_presence_snapshots` is RUNTIME_WRITE (S,I,U); a trigger limits
 UPDATE to one revocation, and there is no DELETE. V1-04C (ADR 0026): `staff_ratio_eligibility` is
 RUNTIME_WRITE (S,I,U) and `staff_presence_events` is RUNTIME_APPEND_ONLY (S,I); neither has DELETE,
-and no function was added.
+and no function was added. V1-04D (ADR 0027): `child_profiles` is RUNTIME_WRITE (S,I,U) and
+`child_attendance_events` is RUNTIME_APPEND_ONLY (S,I); neither has DELETE.
 
 ### The credential boundary (V1-00A-R1)
 

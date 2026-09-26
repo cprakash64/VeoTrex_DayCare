@@ -770,21 +770,25 @@ def test_a_face_recognition_count_is_never_authoritative_in_this_stage() -> None
 
 
 @pytest.mark.parametrize(
-    "source",
+    ("source", "role"),
     [
-        PresenceSource.STAFF_RECOGNITION,
-        PresenceSource.ATTENDANCE,
-        PresenceSource.OTHER_APPROVED_SOURCE,
+        (PresenceSource.STAFF_RECOGNITION, PresenceRole.QUALIFIED_STAFF),
+        (PresenceSource.OTHER_APPROVED_SOURCE, PresenceRole.CHILD),
+        # V1-04D connects ATTENDANCE for children only; it never decides visitors.
+        (PresenceSource.ATTENDANCE, PresenceRole.VISITOR),
     ],
 )
-def test_only_manual_and_roster_sources_are_connected(source: PresenceSource) -> None:
-    role = (
-        PresenceRole.QUALIFIED_STAFF
-        if source is PresenceSource.STAFF_RECOGNITION
-        else PresenceRole.CHILD
-    )
+def test_only_connected_sources_are_authoritative(
+    source: PresenceSource, role: PresenceRole
+) -> None:
     with pytest.raises(RatioPolicyError, match="source_not_authoritative"):
         require_authoritative(PresenceCount(ROOM_X, role, 1, source, NOW, 60))
+
+
+def test_attendance_is_authoritative_for_children_since_v1_04d() -> None:
+    require_authoritative(
+        PresenceCount(ROOM_X, PresenceRole.CHILD, 1, PresenceSource.ATTENDANCE, NOW, 60)
+    )
 
 
 def test_unknown_visitor_and_vision_can_never_become_staff() -> None:

@@ -11,7 +11,14 @@
  *   and people nobody accounts for are "unexplained", never children or staff.
  */
 
-import { ROSTER_MODE, rosterSummaryLines, sourceLabel, type StaffCountSummary } from "./staff-presence";
+import { attendanceSummaryLines, type ChildCountSummary } from "./children";
+import {
+  ATTENDANCE_MODE,
+  ROSTER_STAFF_MODES,
+  rosterSummaryLines,
+  sourceLabel,
+  type StaffCountSummary,
+} from "./staff-presence";
 
 export type FacilitySummary = Readonly<{
   facility_id: string;
@@ -117,6 +124,7 @@ export type PresenceSources = Readonly<{
   qualified_staff: SlotProvenance;
   visitors: SlotProvenance;
   staff_roster: StaffCountSummary | null;
+  child_attendance?: ChildCountSummary | null;
 }>;
 
 export type RatioStatus = Readonly<{
@@ -134,7 +142,8 @@ export type RatioStatus = Readonly<{
 export type PresenceReport = Readonly<{
   snapshot_id: string;
   source: string;
-  child_count: number;
+  // null for a report made in attendance mode, where children come from attendance (V1-04D).
+  child_count: number | null;
   // null for a report made in roster mode, where staff come from check-ins (V1-04C).
   qualified_staff_count: number | null;
   visitor_count: number;
@@ -176,7 +185,8 @@ export type ManualPresenceForm = Readonly<{
 }>;
 
 export type ManualPresencePayload = Readonly<{
-  child_count: number;
+  // Omitted in attendance mode: the API refuses a child number there (V1-04D).
+  child_count?: number;
   // Omitted in roster mode: the API refuses a staff number there (V1-04C).
   qualified_staff_count?: number;
   visitor_count: number;
@@ -311,16 +321,26 @@ export function parsePolicyPayload(body: unknown): PolicyPayload | null {
 export function validateManualPresence(
   input: ManualPresenceForm,
   rosterMode = false,
+  attendanceMode = false,
 ): Validation<ManualPresencePayload> {
   const errors: Record<string, string> = {};
-  const children = integer(input.child_count, 0, MANUAL_LIMITS.children);
-  if (children === null) errors.child_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.children}.`;
+  // Attendance mode: children come from check-ins and staff from the roster, so the report is
+  // visitors only - and the visitor number must be stated, never assumed to be zero.
+  const staffFromRoster = rosterMode || attendanceMode;
+  const children = attendanceMode ? null : integer(input.child_count, 0, MANUAL_LIMITS.children);
+  if (!attendanceMode && children === null) {
+    errors.child_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.children}.`;
+  }
   // In roster mode the staff count comes from check-ins; the form sends no staff number at all.
-  const staff = rosterMode ? null : integer(input.qualified_staff_count, 0, MANUAL_LIMITS.qualified_staff);
-  if (!rosterMode && staff === null) {
+  const staff = staffFromRoster ? null : integer(input.qualified_staff_count, 0, MANUAL_LIMITS.qualified_staff);
+  if (!staffFromRoster && staff === null) {
     errors.qualified_staff_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.qualified_staff}.`;
   }
-  const visitors = input.visitor_count.trim() ? integer(input.visitor_count, 0, MANUAL_LIMITS.visitors) : 0;
+  const visitors = input.visitor_count.trim()
+    ? integer(input.visitor_count, 0, MANUAL_LIMITS.visitors)
+    : attendanceMode
+      ? null
+      : 0;
   if (visitors === null) errors.visitor_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.visitors}.`;
   const validity = Number(input.valid_for_seconds);
   if (!VALIDITY_CHOICES.some((choice) => choice.seconds === validity)) {
@@ -328,8 +348,8 @@ export function validateManualPresence(
   }
   if (Object.keys(errors).length > 0) return { ok: false, errors };
   const value: ManualPresencePayload = {
-    child_count: children as number,
-    ...(rosterMode ? {} : { qualified_staff_count: staff as number }),
+    ...(attendanceMode ? {} : { child_count: children as number }),
+    ...(staffFromRoster ? {} : { qualified_staff_count: staff as number }),
     visitor_count: visitors as number,
     valid_for_seconds: validity,
   };
@@ -338,24 +358,32 @@ export function validateManualPresence(
 
 /**
  * Strict re-validation in the BFF: exactly these keys, integer values only. The staff count may be
- * absent (a roster-mode report); whether the classroom accepts that is the API's decision.
+ * absent (a roster-mode report), and child and staff counts both (an attendance-mode report);
+ * whether the classroom accepts that is the API's decision.
  */
 export function parseManualPresence(body: unknown): ManualPresencePayload | null {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
   const record = body as Record<string, unknown>;
-  const required = ["child_count", "visitor_count", "valid_for_seconds"];
+  const required = ["visitor_count", "valid_for_seconds"];
+  const attendanceMode = !("child_count" in record);
   const rosterMode = !("qualified_staff_count" in record);
-  const keys = rosterMode ? required : [...required, "qualified_staff_count"];
+  if (attendanceMode && !rosterMode) return null;
+  const keys = [
+    ...required,
+    ...(attendanceMode ? [] : ["child_count"]),
+    ...(rosterMode ? [] : ["qualified_staff_count"]),
+  ];
   if (Object.keys(record).some((key) => !keys.includes(key))) return null;
   if (keys.some((key) => typeof record[key] !== "number" || !Number.isInteger(record[key]))) return null;
   const result = validateManualPresence(
     {
-      child_count: String(record.child_count),
+      child_count: attendanceMode ? "" : String(record.child_count),
       qualified_staff_count: rosterMode ? "" : String(record.qualified_staff_count),
       visitor_count: String(record.visitor_count),
       valid_for_seconds: String(record.valid_for_seconds),
     },
-    rosterMode,
+    rosterMode && !attendanceMode,
+    attendanceMode,
   );
   return result.ok ? result.value : null;
 }
@@ -396,6 +424,8 @@ const API_MESSAGES: Readonly<Record<string, string>> = {
   invalid_qualified_staff_count: "Qualified staff present must be a whole number within the allowed range.",
   invalid_visitor_count: "Visitors present must be a whole number within the allowed range.",
   invalid_validity_seconds: "Choose how long this count stays valid.",
+  child_count_comes_from_attendance:
+    "Children are counted from attendance check-ins in this classroom; report visitors only.",
   staff_count_comes_from_roster:
     "Staff are counted from check-ins in this classroom; report children and visitors only.",
   invalid_presence_source_mode: "Choose where the staff count comes from.",
@@ -433,10 +463,13 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
   }
   const { evaluation, presence } = status;
   const sources = status.sources ?? null;
-  const rosterMode = sources?.mode === ROSTER_MODE;
+  const rosterMode = sources !== null && ROSTER_STAFF_MODES.includes(sources.mode);
+  const attendanceMode = sources?.mode === ATTENDANCE_MODE;
   const details: string[] = [];
   const explanations = new Set(evaluation.explanations);
+  // In attendance mode the manual report carries visitors only: its expiry never blocks the ratio.
   const expiredHere =
+    !attendanceMode &&
     presence?.availability === "PRESENCE_FRESH" &&
     presence.valid_until !== null &&
     Date.parse(presence.valid_until) <= nowMs;
@@ -448,19 +481,21 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
       basis: BASIS,
     };
   }
-  // A counted staff check-in that ran out since this was calculated changes the staff count:
-  // the result is not shown again until the server has re-evaluated it.
-  const rosterUntil = rosterMode ? sources?.staff_roster?.valid_until ?? null : null;
+  // A counted staff check-in or child attendance that ran out since this was calculated changes
+  // a count: the result is not shown again until the server has re-evaluated it.
+  const leaseEnds = [
+    rosterMode ? sources?.staff_roster?.valid_until ?? null : null,
+    attendanceMode ? sources?.child_attendance?.valid_until ?? null : null,
+  ].filter((value): value is string => value !== null);
   if (
-    rosterUntil !== null &&
-    Date.parse(rosterUntil) <= nowMs &&
+    leaseEnds.some((value) => Date.parse(value) <= nowMs) &&
     evaluation.ratio_state !== "NOT_CONFIGURED" &&
     evaluation.ratio_state !== "INSUFFICIENT_DATA"
   ) {
     return {
       headline: "Presence data stale",
       tone: "neutral",
-      details: ["A staff check-in has expired since this was calculated. Refreshing…"],
+      details: ["A check-in has expired since this was calculated. Refreshing…"],
       basis: BASIS,
     };
   }
@@ -518,7 +553,11 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
   if (evaluation.child_count !== null && evaluation.staff_count !== null) {
     if (sources) {
       // Every number says where it came from (V1-04C).
-      details.push(`Children reported: ${evaluation.child_count} — ${sourceLabel(sources.children.source)}`);
+      details.push(
+        attendanceMode
+          ? `Children present: ${evaluation.child_count} — ${sourceLabel(sources.children.source)}`
+          : `Children reported: ${evaluation.child_count} — ${sourceLabel(sources.children.source)}`,
+      );
       details.push(
         rosterMode
           ? `Qualified staff present: ${evaluation.staff_count} — ${sourceLabel(sources.qualified_staff.source)}`
@@ -538,7 +577,7 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
   if (evaluation.conditions.includes("OVER_CONFIGURED_GROUP_SIZE") && evaluation.ratio_state !== "OVER_CONFIGURED_GROUP_SIZE") {
     details.push("The configured group size is also exceeded.");
   }
-  if (presence?.availability === "PRESENCE_FRESH" && presence.valid_until) {
+  if (!attendanceMode && presence?.availability === "PRESENCE_FRESH" && presence.valid_until) {
     details.push(
       rosterMode
         ? `Children: Manual (operator-reported) · fresh until ${clock(presence.valid_until)}`
@@ -547,6 +586,16 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
   }
   if (rosterMode && sources?.staff_roster && evaluation.staff_count !== null) {
     details.push(...rosterSummaryLines(sources.staff_roster).slice(1));
+  }
+  if (attendanceMode && sources?.child_attendance && evaluation.child_count !== null) {
+    details.push(...attendanceSummaryLines(sources.child_attendance).slice(1));
+  }
+  if (attendanceMode && sources) {
+    details.push(
+      sources.visitors.count === null
+        ? "Visitors: not reported (not used for the configured ratio)"
+        : `Visitors reported: ${sources.visitors.count} — Manual`,
+    );
   }
   const unexplained = status.reconciliation.unexplained_observed_people;
   if (unexplained) {

@@ -86,7 +86,8 @@ class ManualPresenceRequest(BaseModel):
     where the staff count comes from check-ins (V1-04C); the service decides, per classroom."""
 
     model_config = ConfigDict(extra="forbid")
-    child_count: int = Field(strict=True)
+    # Required in MANUAL_AGGREGATE and roster modes, refused in attendance mode (V1-04D).
+    child_count: int | None = Field(default=None, strict=True)
     qualified_staff_count: int | None = Field(default=None, strict=True)
     visitor_count: int = Field(default=0, strict=True)
     valid_for_seconds: int = Field(default=MANUAL_DEFAULT_VALIDITY_SECONDS, strict=True)
@@ -97,13 +98,14 @@ class ManualPresenceRequest(BaseModel):
             qualified_staff_count=self.qualified_staff_count,
             visitor_count=self.visitor_count,
             valid_for_seconds=self.valid_for_seconds,
+            visitor_count_supplied="visitor_count" in self.model_fields_set,
         )
 
 
 class PresenceReportResponse(BaseModel):
     snapshot_id: str
     source: str
-    child_count: int
+    child_count: int | None
     qualified_staff_count: int | None
     visitor_count: int
     observed_at: str

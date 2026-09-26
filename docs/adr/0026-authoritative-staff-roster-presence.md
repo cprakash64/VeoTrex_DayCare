@@ -175,7 +175,8 @@ and per classroom: `areas.presence_source_mode`.
 
 - STAFF_RECOGNITION: **never** authoritative in this stage.
 - Vision / occupancy: **never** authoritative (unchanged from ADR 0024).
-- ATTENDANCE: not connected; no precedence is defined for it yet.
+- ATTENDANCE: not connected; no precedence is defined for it yet. (Connected for children by ADR
+  0027 in the ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF mode.)
 
 `compose_presence` enforces this with an allow-list (`AUTHORITATIVE_SOURCES`): a count from any
 other source is refused, even if smuggled into a manual resolution.

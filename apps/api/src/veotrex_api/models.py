@@ -86,7 +86,8 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
         ),
         CheckConstraint("status IN ('ACTIVE', 'ARCHIVED')", name="ck_areas_status"),
         CheckConstraint(
-            "presence_source_mode IN ('MANUAL_AGGREGATE', 'ROSTER_STAFF_PLUS_MANUAL_CHILDREN')",
+            "presence_source_mode IN ('MANUAL_AGGREGATE', 'ROSTER_STAFF_PLUS_MANUAL_CHILDREN', "
+            "'ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF')",
             name="ck_areas_presence_source_mode",
         ),
     )
@@ -102,7 +103,8 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     # Where a classroom's qualified-staff count comes from (V1-04C, ADR 0026). Explicit and
     # operator-chosen: MANUAL_AGGREGATE is the V1-04B behaviour; ROSTER_STAFF_PLUS_MANUAL_CHILDREN
     # takes staff from the check-in roster and children/visitors from the manual report. The two
-    # staff counts are never added together.
+    # staff counts are never added together. ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF (V1-04D, ADR
+    # 0027) also takes children from attendance check-ins; the manual report then has visitors only.
     presence_source_mode: Mapped[str] = mapped_column(
         String(40), nullable=False, default="MANUAL_AGGREGATE", server_default="MANUAL_AGGREGATE"
     )
@@ -894,7 +896,9 @@ class ClassroomPresenceSnapshot(Base, IdMixin, TenantOwnedMixin):
 
     facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
-    child_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL only for a report made in attendance mode (V1-04D): children then come from
+    # attendance check-ins and the manual row carries visitors alone.
+    child_count: Mapped[int | None] = mapped_column(Integer)
     # NULL only for a report made in roster mode (V1-04C): staff then come from the roster, and
     # the manual row carries children and visitors alone so no staff number can be double-counted.
     qualified_staff_count: Mapped[int | None] = mapped_column(Integer)
@@ -933,6 +937,9 @@ TENANT_OWNED_TABLES = (
     # V1-04C
     "staff_ratio_eligibility",
     "staff_presence_events",
+    # V1-04D
+    "child_profiles",
+    "child_attendance_events",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles
@@ -1224,6 +1231,150 @@ class StaffPresenceEvent(Base, IdMixin, TenantOwnedMixin):
     # The lease: CHECKED_IN / REFRESHED only. Presence is never trusted past it.
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # When the current stay in the room began; carried forward by REFRESHED.
+    checked_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------- child roster and attendance (V1-04D)
+# A child is a facility roster entry, never a biometric identity (ADR 0027). There is
+# deliberately no photo, face, embedding, date of birth, address, medical, guardian, camera or
+# track column on either table, and nothing here is ever sent to an edge node.
+
+
+class ChildProfile(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    """One child on one facility's roster. ``display_name`` exists only so authorised operators
+    can recognise the entry on their own screens; it never enters audit metadata, logs, the
+    ratio engine or any edge-facing surface. Deactivated or archived, never deleted."""
+
+    __tablename__ = "child_profiles"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_child_profiles_id_tenant"),
+        UniqueConstraint(
+            "id", "facility_id", "tenant_id", name="uq_child_profiles_id_facility_tenant"
+        ),
+        ForeignKeyConstraint(
+            ["facility_id", "tenant_id"],
+            ["facilities.id", "facilities.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_child_profiles_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_child_profiles_creator_tenant",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'INACTIVE', 'ARCHIVED')", name="ck_child_profiles_status"
+        ),
+        CheckConstraint(
+            "char_length(display_name) BETWEEN 1 AND 120 "
+            "AND display_name !~ '[[:cntrl:]<>]' AND display_name = btrim(display_name)",
+            name="ck_child_profiles_display_name",
+        ),
+        CheckConstraint(
+            "external_reference IS NULL "
+            "OR external_reference ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$'",
+            name="ck_child_profiles_external_reference",
+        ),
+        Index(
+            "uq_child_profiles_external_reference",
+            "tenant_id",
+            "facility_id",
+            "external_reference",
+            unique=True,
+            postgresql_where=text("external_reference IS NOT NULL"),
+        ),
+        Index("ix_child_profiles_facility", "tenant_id", "facility_id", "status"),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    # Identifier for a future attendance-system connector. Identifier characters only.
+    external_reference: Mapped[str | None] = mapped_column(String(64))
+    created_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+
+
+class ChildAttendanceEvent(Base, IdMixin, TenantOwnedMixin):
+    """One operator-recorded attendance check-in, refresh or check-out (V1-04D). Append-only.
+
+    Source is always ATTENDANCE. A child's current classroom is their latest event by
+    ``sequence``; ``(tenant_id, child_profile_id, sequence)`` is unique. The runtime role may
+    SELECT and INSERT, never UPDATE or DELETE.
+    """
+
+    __tablename__ = "child_attendance_events"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_child_attendance_events_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "child_profile_id",
+            "sequence",
+            name="uq_child_attendance_events_child_sequence",
+        ),
+        ForeignKeyConstraint(
+            ["area_id", "facility_id", "tenant_id"],
+            ["areas.id", "areas.facility_id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_child_attendance_events_area_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["child_profile_id", "facility_id", "tenant_id"],
+            ["child_profiles.id", "child_profiles.facility_id", "child_profiles.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_child_attendance_events_child_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["recorded_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_child_attendance_events_recorder_tenant",
+        ),
+        CheckConstraint(
+            "event_type IN ('CHECKED_IN', 'REFRESHED', 'CHECKED_OUT')",
+            name="ck_child_attendance_events_type",
+        ),
+        CheckConstraint("source = 'ATTENDANCE'", name="ck_child_attendance_events_source"),
+        CheckConstraint("sequence >= 1", name="ck_child_attendance_events_sequence"),
+        CheckConstraint(
+            "(event_type = 'CHECKED_OUT') = (valid_until IS NULL)",
+            name="ck_child_attendance_events_lease_presence",
+        ),
+        CheckConstraint(
+            "valid_until IS NULL OR (valid_until >= occurred_at + interval '30 minutes' "
+            "AND valid_until <= occurred_at + interval '12 hours')",
+            name="ck_child_attendance_events_lease_bounds",
+        ),
+        CheckConstraint(
+            "occurred_at <= created_at + interval '120 seconds'",
+            name="ck_child_attendance_events_not_future",
+        ),
+        CheckConstraint(
+            "checked_in_at <= occurred_at "
+            "AND (event_type <> 'CHECKED_IN' OR checked_in_at = occurred_at)",
+            name="ck_child_attendance_events_session_start",
+        ),
+        Index(
+            "ix_child_attendance_events_classroom",
+            "tenant_id",
+            "area_id",
+            text("occurred_at DESC"),
+            text("sequence DESC"),
+        ),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    child_profile_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="ATTENDANCE")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     checked_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     recorded_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

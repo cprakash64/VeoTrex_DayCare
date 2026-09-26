@@ -641,10 +641,15 @@ class PresenceAvailability(StrEnum):
     PRESENCE_NOT_YET_VALID = "PRESENCE_NOT_YET_VALID"  # timestamped beyond the permitted skew
 
 
-def validate_manual_counts(children: int, qualified_staff: int | None, visitors: int) -> None:
+def validate_manual_counts(
+    children: int | None, qualified_staff: int | None, visitors: int
+) -> None:
     """``qualified_staff`` is None only for a roster-mode report (V1-04C): the staff count then
-    comes from the check-in roster and the manual report carries none."""
-    checks: list[tuple[int, int, str]] = [(children, MANUAL_MAX_CHILDREN, "invalid_child_count")]
+    comes from the check-in roster and the manual report carries none. ``children`` is None only
+    for an attendance-mode report (V1-04D), which carries visitors alone."""
+    checks: list[tuple[int, int, str]] = []
+    if children is not None:
+        checks.append((children, MANUAL_MAX_CHILDREN, "invalid_child_count"))
     if qualified_staff is not None:
         checks.append(
             (qualified_staff, MANUAL_MAX_QUALIFIED_STAFF, "invalid_qualified_staff_count")
@@ -668,7 +673,7 @@ class ManualPresenceRecord:
 
     snapshot_id: UUID
     classroom_id: UUID
-    child_count: int
+    child_count: int | None  # None: reported in attendance mode (V1-04D)
     qualified_staff_count: int | None  # None: reported in roster mode (V1-04C)
     visitor_count: int
     observed_at: datetime
@@ -716,7 +721,9 @@ class ManualPresenceRecord:
 
         return PresenceSnapshot(
             self.classroom_id,
-            children=count(PresenceRole.CHILD, self.child_count),
+            children=None
+            if self.child_count is None
+            else count(PresenceRole.CHILD, self.child_count),
             qualified_staff=None
             if self.qualified_staff_count is None
             else count(PresenceRole.QUALIFIED_STAFF, self.qualified_staff_count),
@@ -756,7 +763,19 @@ def resolve_manual_presence(
     if latest.revoked:
         return PresenceResolution(PresenceAvailability.PRESENCE_REVOKED, latest, None)
     snapshot = latest.to_snapshot()
-    state = freshness(snapshot.children, now)
+    # Freshness is the report's own window, not any one slot's: an attendance-mode report has
+    # visitors only, and it is exactly as fresh as a full one made at the same moment.
+    state = freshness(
+        PresenceCount(
+            classroom_id,
+            PresenceRole.VISITOR,
+            latest.visitor_count,
+            PresenceSource.MANUAL,
+            latest.observed_at,
+            latest.valid_for_seconds,
+        ),
+        now,
+    )
     if state is Freshness.FRESH:
         return PresenceResolution(PresenceAvailability.PRESENCE_FRESH, latest, snapshot)
     if latest.observed_at - now > MAX_FUTURE_SKEW:

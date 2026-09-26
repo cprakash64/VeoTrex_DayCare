@@ -15,7 +15,10 @@ export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]
 
 export const ROSTER_MODE = "ROSTER_STAFF_PLUS_MANUAL_CHILDREN";
 export const MANUAL_MODE = "MANUAL_AGGREGATE";
-export const PRESENCE_MODES = [MANUAL_MODE, ROSTER_MODE] as const;
+// V1-04D: children from attendance check-ins, staff from the roster, visitors manual.
+export const ATTENDANCE_MODE = "ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF";
+export const PRESENCE_MODES = [MANUAL_MODE, ROSTER_MODE, ATTENDANCE_MODE] as const;
+export const ROSTER_STAFF_MODES: ReadonlyArray<string> = [ROSTER_MODE, ATTENDANCE_MODE];
 export type PresenceMode = (typeof PRESENCE_MODES)[number];
 
 // Mirrors the API: 1 minute to 4 hours, 15 minutes by default. Never unbounded.
@@ -197,16 +200,25 @@ export function sourceLabel(source: string | null | undefined): string {
       return "Manual";
     case "STAFF_ROSTER":
       return "Staff roster";
+    case "ATTENDANCE":
+      return "Attendance";
     default:
       return "Not connected";
   }
 }
 
 export function presenceModeLabel(mode: string): string {
+  if (mode === ATTENDANCE_MODE) return "Children from attendance, staff from check-ins, visitors from the manual report";
   return mode === ROSTER_MODE
     ? "Staff from check-ins, children from the manual report"
     : "All counts from the manual report";
 }
+
+export const PRESENCE_MODE_CHOICES: ReadonlyArray<{ mode: PresenceMode; label: string }> = [
+  { mode: MANUAL_MODE, label: "Manual report (children, staff, visitors)" },
+  { mode: ROSTER_MODE, label: "Staff check-ins + manual child count" },
+  { mode: ATTENDANCE_MODE, label: "Child attendance + staff check-ins" },
+];
 
 export function remainingSeconds(validUntil: string | null, nowMs: number): number | null {
   if (!validUntil) return null;

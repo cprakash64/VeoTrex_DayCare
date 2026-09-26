@@ -201,6 +201,17 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "staff_presence_events": _append(
         "operator staff check-in / refresh / check-out events; append-only by grant"
     ),
+    # V1-04D: the facility child roster is edited and deactivated/archived, never deleted;
+    # attendance is a pure event stream the runtime can only append to.
+    "child_profiles": _write(
+        "facility child roster: display name, status, external reference; never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_attendance_events": _append(
+        "operator child attendance check-in / refresh / check-out events; append-only by grant"
+    ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),

@@ -399,3 +399,59 @@ export async function deactivateEligibility(facilityId: string, eligibilityId: s
     { method: "POST" },
   );
 }
+
+// ------------------------------------------------------ child roster and attendance (V1-04D)
+import type {
+  AttendancePayload,
+  ChildPayload,
+  ChildUpdatePayload,
+  ClassroomAttendance,
+  FacilityChildren,
+} from "./children";
+
+export async function getFacilityChildren(facilityId: string): Promise<FacilityChildren | null> {
+  const response = await authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/children`);
+  if (!response.ok) return null;
+  return (await response.json()) as FacilityChildren;
+}
+
+export async function createChild(facilityId: string, payload: ChildPayload): Promise<Response> {
+  return authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/children`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateChild(childId: string, payload: ChildUpdatePayload): Promise<Response> {
+  return authorizedFetch(`/v1/children/${encodeURIComponent(childId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setChildStatus(
+  childId: string,
+  verb: "activate" | "deactivate" | "archive",
+): Promise<Response> {
+  return authorizedFetch(`/v1/children/${encodeURIComponent(childId)}/${verb}`, { method: "POST" });
+}
+
+export async function getClassroomAttendance(classroomId: string): Promise<ClassroomAttendance | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance`);
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomAttendance;
+}
+
+export async function recordAttendance(
+  classroomId: string,
+  action: "check-in" | "check-out" | "refresh",
+  payload: AttendancePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}

@@ -8,9 +8,8 @@ import {
   countedLabel,
   DEFAULT_LEASE_SECONDS,
   LEASE_CHOICES,
-  MANUAL_MODE,
   presenceModeLabel,
-  ROSTER_MODE,
+  ROSTER_STAFF_MODES,
   rosterSummaryLines,
   staffEntryView,
   staffErrorMessage,
@@ -53,7 +52,7 @@ export function StaffPresenceCard({
     );
   }
   const canEdit = presence.can_administer;
-  const rosterMode = presence.presence_source_mode === ROSTER_MODE;
+  const rosterMode = ROSTER_STAFF_MODES.includes(presence.presence_source_mode);
 
   async function send(key: string, url: string, body: unknown) {
     setWorking(key);
@@ -108,18 +107,6 @@ export function StaffPresenceCard({
       )}
       {canEdit ? (
         <div className="stack">
-          <button
-            className="secondary"
-            type="button"
-            disabled={working !== null}
-            onClick={() =>
-              send("mode", `/api/classrooms/${classroomId}/presence-source-mode`, {
-                mode: rosterMode ? MANUAL_MODE : ROSTER_MODE,
-              })
-            }
-          >
-            {rosterMode ? "Use the manual staff count instead" : "Count staff from check-ins"}
-          </button>
           <label htmlFor="staff-lease">Check-in lasts</label>
           <select
             id="staff-lease"

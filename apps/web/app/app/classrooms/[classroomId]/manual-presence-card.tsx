@@ -25,22 +25,25 @@ export function ManualPresenceCard({
   presence,
   canReport,
   rosterMode = false,
+  attendanceMode = false,
 }: {
   classroomId: string;
   presence: ClassroomPresence | null;
   canReport: boolean;
   // V1-04C: staff are counted from check-ins, so this form reports children and visitors only.
   rosterMode?: boolean;
+  // V1-04D: children come from attendance and staff from check-ins: visitors only.
+  attendanceMode?: boolean;
 }) {
   const router = useRouter();
   const current = presence?.current ?? null;
   const [values, setValues] = useState<ManualPresenceForm>({
-    child_count: current && !current.revoked_at ? String(current.child_count) : "",
+    child_count: current && !current.revoked_at && current.child_count !== null ? String(current.child_count) : "",
     qualified_staff_count:
       current && !current.revoked_at && current.qualified_staff_count !== null
         ? String(current.qualified_staff_count)
         : "",
-    visitor_count: current && !current.revoked_at ? String(current.visitor_count) : "0",
+    visitor_count: current && !current.revoked_at ? String(current.visitor_count) : attendanceMode ? "" : "0",
     valid_for_seconds: String(DEFAULT_VALIDITY_SECONDS),
   });
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
@@ -74,7 +77,7 @@ export function ManualPresenceCard({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const checked = validateManualPresence(values, rosterMode);
+    const checked = validateManualPresence(values, rosterMode, attendanceMode);
     if (!checked.ok) {
       setErrors(checked.errors);
       return;
@@ -96,8 +99,11 @@ export function ManualPresenceCard({
         <ul aria-label="Current manual presence report">
           <li>Source: Manual (operator-reported){current.submitted_by_caller ? " · reported by you" : ""}</li>
           <li>
-            Children {current.child_count} ·{" "}
-            {rosterMode || current.qualified_staff_count === null
+            {attendanceMode || current.child_count === null
+              ? "Children from attendance"
+              : `Children ${current.child_count}`}{" "}
+            ·{" "}
+            {rosterMode || attendanceMode || current.qualified_staff_count === null
               ? "qualified staff from staff check-ins"
               : `qualified staff ${current.qualified_staff_count}`}{" "}
             · visitors {current.visitor_count}
@@ -114,10 +120,20 @@ export function ManualPresenceCard({
       )}
       {canReport ? (
         <form className="stack" onSubmit={submit} noValidate>
-          {rosterMode ? (
+          {attendanceMode ? (
+            <ul className="staff-meta" aria-label="Where each count comes from">
+              <li>Children: Attendance</li>
+              <li>Qualified staff: Staff roster</li>
+              <li>Visitors: Manual (report below; left empty means not reported, not zero)</li>
+            </ul>
+          ) : rosterMode ? (
             <p className="staff-meta">Qualified staff are counted from staff check-ins in this classroom.</p>
           ) : null}
-          {COUNT_FIELDS.filter((field) => !rosterMode || field.key !== "qualified_staff_count").map((field) => (
+          {COUNT_FIELDS.filter(
+            (field) =>
+              !(attendanceMode && field.key === "child_count") &&
+              !((rosterMode || attendanceMode) && field.key === "qualified_staff_count"),
+          ).map((field) => (
             <div key={field.key}>
               <label htmlFor={`presence-${field.key}`}>{field.label}</label>
               <input

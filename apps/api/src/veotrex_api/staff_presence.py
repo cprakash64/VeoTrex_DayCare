@@ -37,6 +37,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from veotrex_api.child_attendance import ChildCountResolution
 from veotrex_api.classroom_ratio import (
     MAX_FUTURE_SKEW,
     MAX_VALIDITY_SECONDS,
@@ -100,13 +101,27 @@ class PresenceSourceMode(StrEnum):
     MANUAL_AGGREGATE = "MANUAL_AGGREGATE"
     # V1-04C: staff from the check-in roster; children and visitors from the manual report.
     ROSTER_STAFF_PLUS_MANUAL_CHILDREN = "ROSTER_STAFF_PLUS_MANUAL_CHILDREN"
+    # V1-04D: children from attendance check-ins, staff from the roster, visitors (only) from
+    # the manual report.
+    ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF = "ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF"
 
 
-# The sources this stage lets decide each ratio slot. STAFF_RECOGNITION, ATTENDANCE and
-# OTHER_APPROVED_SOURCE exist in the engine's vocabulary but are not connected; a count carrying
-# them is refused here rather than silently used.
+# Modes whose staff count comes from the check-in roster, and whose child count comes from
+# attendance check-ins.
+ROSTER_STAFF_MODES = frozenset(
+    {
+        PresenceSourceMode.ROSTER_STAFF_PLUS_MANUAL_CHILDREN,
+        PresenceSourceMode.ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF,
+    }
+)
+ATTENDANCE_CHILD_MODES = frozenset({PresenceSourceMode.ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF})
+
+
+# The sources allowed to decide each ratio slot. STAFF_RECOGNITION and OTHER_APPROVED_SOURCE exist
+# in the engine's vocabulary but are not connected; a count carrying them is refused here rather
+# than silently used. ATTENDANCE is connected for children only since V1-04D.
 AUTHORITATIVE_SOURCES: dict[PresenceRole, frozenset[PresenceSource]] = {
-    PresenceRole.CHILD: frozenset({PresenceSource.MANUAL}),
+    PresenceRole.CHILD: frozenset({PresenceSource.MANUAL, PresenceSource.ATTENDANCE}),
     PresenceRole.QUALIFIED_STAFF: frozenset({PresenceSource.MANUAL, PresenceSource.STAFF_ROSTER}),
     PresenceRole.VISITOR: frozenset({PresenceSource.MANUAL}),
 }
@@ -656,6 +671,7 @@ class CompositePresence:
     qualified_staff: SlotProvenance
     visitors: SlotProvenance
     roster: StaffCountResolution | None
+    attendance: ChildCountResolution | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -664,6 +680,7 @@ class CompositePresence:
             "qualified_staff": self.qualified_staff.as_dict(),
             "visitors": self.visitors.as_dict(),
             "staff_roster": None if self.roster is None else self.roster.as_dict(),
+            "child_attendance": None if self.attendance is None else self.attendance.as_dict(),
         }
 
 
@@ -682,6 +699,8 @@ def compose_presence(
     manual: PresenceResolution,
     roster: StaffCountResolution | None,
     now: datetime,
+    *,
+    attendance: ChildCountResolution | None = None,
 ) -> CompositePresence:
     """Build the one :class:`PresenceSnapshot` the ratio engine sees, slot by slot.
 
@@ -689,6 +708,10 @@ def compose_presence(
     ROSTER_STAFF_PLUS_MANUAL_CHILDREN: children and visitors from the latest manual report,
     qualified staff from ``roster`` alone. A staff number on the manual report is ignored, never
     added: roster staff + manual staff would count the same teacher twice.
+    ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF (V1-04D): children from ``attendance`` alone, staff from
+    ``roster`` alone, visitors from the latest manual report when there is one. A child or staff
+    number on a manual report is ignored, never added. Visitors never block the ratio, and a
+    missing or stale visitor report stays missing or stale - it is never read as zero.
 
     A revoked or absent manual report leaves children missing, so the ratio is
     INSUFFICIENT_DATA whatever the roster says; a stale one passes through as stale, as before.
@@ -706,6 +729,10 @@ def compose_presence(
         if roster is None or roster.classroom_id != classroom_id:
             raise RatioPolicyError("staff_roster_required")
         staff = roster.to_presence_count()
+    if mode in ATTENDANCE_CHILD_MODES:
+        if attendance is None or attendance.classroom_id != classroom_id:
+            raise RatioPolicyError("child_attendance_required")
+        children = attendance.to_presence_count()
     for value in (children, staff, visitors):
         require_authoritative(value)
     snapshot = (
@@ -721,5 +748,6 @@ def compose_presence(
         children=_slot(children, now),
         qualified_staff=_slot(staff, now),
         visitors=_slot(visitors, now),
-        roster=roster if mode is PresenceSourceMode.ROSTER_STAFF_PLUS_MANUAL_CHILDREN else None,
+        roster=roster if mode in ROSTER_STAFF_MODES else None,
+        attendance=attendance if mode in ATTENDANCE_CHILD_MODES else None,
     )

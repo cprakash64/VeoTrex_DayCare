@@ -5,15 +5,18 @@ import { auth0 } from "../../../../lib/auth0";
 import { policyNumbers, policyPeriod, policyStatusLabel } from "../../../../lib/classrooms";
 import { UUID_PATTERN } from "../../../../lib/ring-inventory";
 import { protectedRouteRedirect } from "../../../../lib/session-policy";
-import { ROSTER_MODE } from "../../../../lib/staff-presence";
+import { ATTENDANCE_MODE, ROSTER_MODE } from "../../../../lib/staff-presence";
 import {
   getClassroom,
+  getClassroomAttendance,
   getClassroomPresence,
   getClassroomRatioStatus,
   getClassroomStaffPresence,
 } from "../../../../lib/veotrex-api";
+import { ChildAttendanceCard } from "./child-attendance-card";
 import { ClassroomControls } from "./classroom-controls";
 import { ManualPresenceCard } from "./manual-presence-card";
+import { PresenceSourceControl } from "./presence-source-control";
 import { RatioStatusCard } from "./ratio-status-card";
 import { StaffPresenceCard } from "./staff-presence-card";
 import { PolicyForm } from "./policy-form";
@@ -25,11 +28,12 @@ export default async function ClassroomPage({ params }: Props) {
   if (destination) redirect(destination);
   const { classroomId } = await params;
   if (!UUID_PATTERN.test(classroomId)) notFound();
-  const [room, status, presence, staffPresence] = await Promise.all([
+  const [room, status, presence, staffPresence, attendance] = await Promise.all([
     getClassroom(classroomId),
     getClassroomRatioStatus(classroomId),
     getClassroomPresence(classroomId),
     getClassroomStaffPresence(classroomId),
+    getClassroomAttendance(classroomId),
   ]);
   if (room === null) notFound();
   const canEdit = room.can_administer;
@@ -57,7 +61,17 @@ export default async function ClassroomPage({ params }: Props) {
         presence={presence}
         canReport={canEdit && active}
         rosterMode={room.presence_source_mode === ROSTER_MODE}
+        attendanceMode={room.presence_source_mode === ATTENDANCE_MODE}
       />
+
+      <PresenceSourceControl
+        key={room.presence_source_mode}
+        classroomId={room.classroom_id}
+        mode={room.presence_source_mode}
+        canEdit={canEdit}
+      />
+
+      <ChildAttendanceCard classroomId={room.classroom_id} attendance={attendance} />
 
       <StaffPresenceCard classroomId={room.classroom_id} presence={staffPresence} />
 

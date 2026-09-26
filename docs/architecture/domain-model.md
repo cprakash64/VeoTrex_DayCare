@@ -9,6 +9,7 @@ Tenant
    │  ├─ ClassroomRatioPolicy (operator-configured, effective-dated; ADR 0024)
    │  ├─ ClassroomPresenceSnapshot (operator-reported counts, append-only, expiring; ADR 0025)
    │  ├─ StaffPresenceEvent (operator check-in / refresh / check-out, append-only, leased; ADR 0026)
+   │  ├─ ChildAttendanceEvent (operator check-in / refresh / check-out, append-only, leased; ADR 0027)
    │  └─ Zone
    │     └─ Camera
    ├─ CameraProviderConnection ── Camera
@@ -58,11 +59,20 @@ check them into a classroom for a bounded lease (default 15 min, max 4 h); a per
 decides their single current room. Children stay a manual aggregate count, and face recognition
 never checks anyone in.
 
+A classroom can also take its child count from attendance (ADR 0027,
+`ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF`). `ChildProfile` is a facility-scoped roster entry - a
+display name for operators' own screens, a status and an optional external reference - with no
+photo, biometric, date of birth or guardian data. `ChildAttendanceEvent` rows check a child into a
+classroom for 30 min - 12 h (default 12 h); the latest event decides the single current
+classroom. Cameras never create or change attendance. Parent/guardian association is not modelled
+yet.
+
 ## Constraints not yet modeled
 
 - Facility/building is represented by typed `Area`; whether Building deserves a separate entity is open.
 - Actor roles are placeholders pending the authorization model.
 - Tenant-specific activation of approved global policy versions requires a future effective-dated binding.
-- Child, guardian, attendance, incident, and media entities are non-goals. Staff persons and their
-  biometric templates were added in V1-02A (ADR 0019); classroom presence is modeled only as
-  anonymous role counts from approved sources (ADR 0024), never as a child entity.
+- Guardian/parent, pickup authorization, incident and media entities are non-goals. Staff persons
+  and their biometric templates were added in V1-02A (ADR 0019). Children exist only as
+  facility roster entries with operator attendance events (V1-04D, ADR 0027) - never as a
+  camera, face or biometric identity - and the ratio engine sees only aggregate counts.
