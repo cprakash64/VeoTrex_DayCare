@@ -85,8 +85,12 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
 
     facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # A classroom is an Area of kind CLASSROOM (V1-04A); no separate classroom table exists.
     kind: Mapped[str] = mapped_column(String(50), nullable=False, default="ROOM")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    # Operator-supplied configuration text ("Toddler", "Pre-K"). Never inferred from imagery,
+    # never a child's age, never a name.
+    age_band_label: Mapped[str | None] = mapped_column(String(64))
 
 
 class Zone(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
@@ -742,6 +746,69 @@ class PolicyVersion(Base, IdMixin):
     )
 
 
+class ClassroomRatioPolicy(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    """An operator-configured staff-to-child ratio for one classroom (V1-04A).
+
+    Configured policy, not certified law: the numbers are what the operator entered, with the
+    operator's own source/reference text. No jurisdictional value is stored or implied here.
+    Overlapping ACTIVE periods for one classroom are refused by the service under a per-
+    classroom advisory lock; the pure resolver is deterministic even if one ever exists.
+    """
+
+    __tablename__ = "classroom_ratio_policies"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_classroom_ratio_policies_id_tenant"),
+        ForeignKeyConstraint(
+            ["area_id", "tenant_id"],
+            ["areas.id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_classroom_ratio_policies_area_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_classroom_ratio_policies_creator_tenant",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'INACTIVE')", name="ck_classroom_ratio_policies_status"
+        ),
+        CheckConstraint(
+            "max_children_per_staff > 0", name="ck_classroom_ratio_policies_max_children"
+        ),
+        CheckConstraint("minimum_staff >= 0", name="ck_classroom_ratio_policies_minimum_staff"),
+        CheckConstraint(
+            "maximum_group_size IS NULL OR maximum_group_size > 0",
+            name="ck_classroom_ratio_policies_group_size",
+        ),
+        CheckConstraint(
+            "effective_until IS NULL OR effective_until > effective_from",
+            name="ck_classroom_ratio_policies_period",
+        ),
+        CheckConstraint("revision >= 1", name="ck_classroom_ratio_policies_revision"),
+        Index(
+            "ix_classroom_ratio_policies_area",
+            "tenant_id",
+            "area_id",
+            "status",
+            "effective_from",
+        ),
+    )
+
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    age_band_label: Mapped[str | None] = mapped_column(String(64))
+    max_children_per_staff: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_staff: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_group_size: Mapped[int | None] = mapped_column(Integer)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    source_reference: Mapped[str | None] = mapped_column(String(500))
+    created_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
 TENANT_OWNED_TABLES = (
     "facilities",
     "areas",
@@ -758,6 +825,8 @@ TENANT_OWNED_TABLES = (
     "actor_identities",
     "role_assignments",
     "audit_events",
+    # V1-04A
+    "classroom_ratio_policies",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles

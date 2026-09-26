@@ -52,6 +52,7 @@ def test_all_expected_customer_tables_are_tenant_owned() -> None:
         "actor_identities",
         "role_assignments",
         "audit_events",
+        "classroom_ratio_policies",
     }
 
 

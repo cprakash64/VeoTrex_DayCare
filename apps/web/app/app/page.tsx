@@ -27,6 +27,7 @@ export default async function ApplicationShell() {
       </section>
       <nav aria-label="Sections">
         <Link className="primary" href="/app/staff">Teachers &amp; staff</Link>
+        <Link className="secondary" href="/app/classrooms">Classrooms &amp; configured policies</Link>
         <a className="secondary" href="/app/integrations/ring/devices">Ring device inventory</a>
       </nav>
     </main>

@@ -35,3 +35,6 @@ input[type="text"], input[type="file"] { font: inherit; padding: .6rem .75rem; b
 .danger { border-color: #8a3b33; color: #ffc4bd; }
 [role="status"] { color: #9be7c7; }
 .consent { border-left: 3px solid #73d6ad; padding: .5rem 1rem; color: #a9c4b9; }
+.badge.attention { color: #f3d27a; border-color: #8a6d1f; }
+.ratio-card { border: 1px solid #2f6b58; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+.field-error { color: #f3d27a; font-size: .85rem; margin: 0; }

@@ -188,3 +188,101 @@ export async function runRecognitionTest(bytes: ArrayBuffer, mediaType: string):
     body: bytes,
   });
 }
+
+// ------------------------------------------------ classrooms and configured ratio policy (V1-04A)
+import type {
+  Classroom,
+  ClassroomPayload,
+  FacilitySummary,
+  PolicyPayload,
+  RatioStatus,
+} from "./classrooms";
+
+export async function getFacilities(): Promise<ReadonlyArray<FacilitySummary>> {
+  const response = await authorizedFetch("/v1/facilities");
+  if (!response.ok) throw new Error("Facilities are unavailable");
+  return (await response.json()) as ReadonlyArray<FacilitySummary>;
+}
+
+export async function getClassrooms(): Promise<ReadonlyArray<Classroom>> {
+  const response = await authorizedFetch("/v1/classrooms");
+  if (!response.ok) throw new Error("Classrooms are unavailable");
+  return (await response.json()) as ReadonlyArray<Classroom>;
+}
+
+export async function getClassroom(classroomId: string): Promise<Classroom | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("Classroom is unavailable");
+  return (await response.json()) as Classroom;
+}
+
+export async function getClassroomRatioStatus(classroomId: string): Promise<RatioStatus | null> {
+  const response = await authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-status`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as RatioStatus;
+}
+
+export async function createClassroom(
+  facilityId: string,
+  payload: ClassroomPayload,
+): Promise<Response> {
+  return authorizedFetch("/v1/classrooms", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ facility_id: facilityId, ...payload }),
+  });
+}
+
+export async function updateClassroom(
+  classroomId: string,
+  payload: ClassroomPayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setClassroomActive(classroomId: string, active: boolean): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/${active ? "activate" : "deactivate"}`,
+    { method: "POST" },
+  );
+}
+
+export async function createRatioPolicy(
+  classroomId: string,
+  payload: PolicyPayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateRatioPolicy(
+  classroomId: string,
+  policyId: string,
+  payload: PolicyPayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies/${encodeURIComponent(policyId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deactivateRatioPolicy(classroomId: string, policyId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies/${encodeURIComponent(policyId)}/deactivate`,
+    { method: "POST" },
+  );
+}

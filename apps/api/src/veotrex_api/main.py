@@ -18,6 +18,8 @@ from veotrex_api.access import (
     require_permission,
 )
 from veotrex_api.authorization import Permission
+from veotrex_api.classroom_api import register_classroom_routes
+from veotrex_api.classroom_service import ClassroomService
 from veotrex_api.config import Settings, get_settings
 from veotrex_api.credential_vault import (
     CredentialVault,
@@ -370,6 +372,9 @@ def create_app(
             window_seconds=60,
         ),
     )
+    # Classrooms and configured ratio policies (V1-04A).
+    app.state.classroom_service = ClassroomService(resolved_factory)
+    register_classroom_routes(app, app.state.classroom_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,

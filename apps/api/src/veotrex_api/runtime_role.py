@@ -165,9 +165,23 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "alembic_version": _no_access("migration bookkeeping"),
     "jurisdiction_policies": _no_access("policy catalog is file-backed in the API today"),
     "policy_versions": _no_access("policy catalog is file-backed in the API today"),
-    "facilities": _no_access("no API endpoint yet"),
-    "areas": _no_access("no API endpoint yet"),
-    "zones": _no_access("no API endpoint yet"),
+    # Classrooms (V1-04A): a classroom is an Area of kind CLASSROOM. Facilities and zones are
+    # read to scope and describe it; facilities and zones are still created only by the admin
+    # identity. Soft state only - DELETE is never granted.
+    "facilities": _read("classroom scope: facility name, timezone and status"),
+    "areas": _write(
+        "classroom create, rename, age-band label, activate/deactivate",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "zones": _read("classroom camera association (camera -> zone -> area)"),
+    "classroom_ratio_policies": _write(
+        "operator-configured classroom ratio policies; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),

@@ -592,3 +592,17 @@ def test_no_identity_or_biometric_state_is_introduced() -> None:
     text = Path(occupancy_module.__file__ or "").read_text(encoding="utf-8").lower()
     for forbidden in ("face_backend", "face_matching", "sface", "yunet", "cv2"):
         assert forbidden not in text, forbidden
+
+
+def test_the_dashboard_classroom_card_never_counts_people_by_role() -> None:
+    """V1-04A: the live dashboard has no presence source; it must say so, and must present the
+    camera's head count as people seen - never a role count or a ratio input - while keeping the
+    page free of demographic words (asserted by the existing presentation tests)."""
+    from veotrex_edge_agent.live.server import PAGE
+
+    assert "Presence counts not connected" in PAGE
+    assert "People seen by camera (not a presence record)" in PAGE
+    lowered = PAGE.lower()
+    for claim in ("ratio: ", "required staff", "compliant", "legal", "staff count"):
+        assert claim not in lowered, claim
+    assert "local evaluation &mdash; no identification" in PAGE

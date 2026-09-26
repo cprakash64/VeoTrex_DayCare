@@ -99,6 +99,10 @@ roles' defaults and refuses to infer the migration role when connected as the ru
 | FUNCTION_ONLY | none | encrypted_credentials, ring_pending_links, ring_webhook_inbox, tenant_identity_bindings |
 | RUNTIME_NO_ACCESS | none | alembic_version, jurisdiction_policies, policy_versions, facilities, areas, zones, edge_nodes, camera_assignments |
 
+Later stages reclassify through `TABLE_CLASSIFICATION` in `runtime_role.py`, which is the
+authoritative list. V1-04A (ADR 0024): `facilities` and `zones` became RUNTIME_READ; `areas` and
+the new `classroom_ratio_policies` became RUNTIME_WRITE (S,I,U). DELETE is still never granted.
+
 ### The credential boundary (V1-00A-R1)
 
 `encrypted_credentials` is global by design and the API holds the vault master key, so direct

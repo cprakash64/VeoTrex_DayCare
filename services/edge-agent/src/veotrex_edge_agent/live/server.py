@@ -11,6 +11,11 @@ throughput and source health. Throughput is broken down by cause (V1-03A): captu
 and preview rates, and frames not processed split into scheduler skips (intentional sampling),
 backpressure drops (the detector behind its schedule) and transport drops (lost before capture).
 
+The classroom policy card (V1-04A) is deliberately inert: the live runtime has no approved
+presence source, so it says "Presence counts not connected" and shows the camera's head count
+only as people seen - never as a role count, never as a ratio input. It keeps the page's rule of
+using no demographic words at all.
+
 Occupancy is split the same way (V1-03B): the head count is validated tracks only, and
 confirmed tracks whose evidence does not yet count are shown beside it as candidate person
 tracks - never folded in, never hidden. Configured ignore regions, their containment rule and
@@ -135,6 +140,15 @@ PAGE = """<!doctype html>
       <div class="muted" id="candidates">&nbsp;</div>
     </div>
     <div class="card"><table id="metrics"></table></div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Classroom policy</div>
+      <ul id="classroom">
+        <li>Presence counts not connected</li>
+        <li class="muted">Ratios use presence records from approved sources only. The camera's
+          head count is never a presence record and never a ratio input.</li>
+        <li id="vision-people">People seen by camera (not a presence record): 0</li>
+      </ul>
+    </div>
     <div class="card">
       <div class="muted" style="margin-bottom:6px">Camera calibration</div>
       <ul id="calibration"></ul>
@@ -272,6 +286,8 @@ async function pullState(){
     const s = d.state;
     $("occupancy").textContent = s.occupancy;
     $("peak").textContent = "peak this session: " + (d.metrics.peak_occupancy ?? 0);
+    $("vision-people").textContent = "People seen by camera (not a presence record): "
+      + (s.occupancy ?? 0);
     $("candidates").textContent = "Candidate person tracks: " + (s.candidate_tracks ?? 0)
       + " (shown, not counted)";
     calibration(d.calibration || {}, d.metrics);

@@ -5,7 +5,8 @@
 ```text
 Tenant
 └─ Facility (jurisdiction, IANA timezone)
-   ├─ Area (room/building/other typed area)
+   ├─ Area (room/building/other typed area; kind CLASSROOM = a classroom, V1-04A)
+   │  ├─ ClassroomRatioPolicy (operator-configured, effective-dated; ADR 0024)
    │  └─ Zone
    │     └─ Camera
    ├─ CameraProviderConnection ── Camera
@@ -33,9 +34,20 @@ Deletion is restrictive. Core records transition to archived/disabled states; au
 cascade. Permanent erasure requires an explicit, separately audited retention workflow that accounts
 for legal holds and statutory requirements.
 
+## Classrooms and configured ratio policy (V1-04A)
+
+A classroom is an `Area` with `kind = 'CLASSROOM'` and an optional operator `age_band_label`; its
+cameras are those whose zone belongs to it. `classroom_ratio_policies` holds the owner's
+configured numbers (children per qualified staff member, minimum staff, optional group size) for
+an effective period in facility-local days. These are configured policies, not verified law.
+Ratio evaluation takes role counts only from approved presence sources; a camera's head count
+is never a child or staff count and is used only as a reconciliation diagnostic. See ADR 0024.
+
 ## Constraints not yet modeled
 
 - Facility/building is represented by typed `Area`; whether Building deserves a separate entity is open.
 - Actor roles are placeholders pending the authorization model.
 - Tenant-specific activation of approved global policy versions requires a future effective-dated binding.
-- Child, guardian, staff-person, biometric, attendance, incident, and media entities are non-goals.
+- Child, guardian, attendance, incident, and media entities are non-goals. Staff persons and their
+  biometric templates were added in V1-02A (ADR 0019); classroom presence is modeled only as
+  anonymous role counts from approved sources (ADR 0024), never as a child entity.

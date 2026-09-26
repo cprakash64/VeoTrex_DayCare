@@ -27,3 +27,10 @@ forced into ratio models. Retention is marked unresolved rather than guessed.
 Open questions: tier extrapolation beyond listed staffing counts, mixed-age edge cases, effective-time
 timezone, amendments during an event, tenant activation/overrides, source archival, authorized review,
 pack signatures, and rule-evaluator conformance fixtures.
+
+## Relationship to configured classroom policy (V1-04A)
+
+Operators can now enter their own per-classroom ratios (ADR 0024). Those are *configured*
+policies with operator source text, evaluated by a pure engine against approved presence
+counts. They are not jurisdiction packs, are never labelled compliant or legal, and do not read
+the pack files. A future verified pack may annotate them; it must not silently replace them.
