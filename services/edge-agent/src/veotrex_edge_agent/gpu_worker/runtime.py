@@ -27,9 +27,13 @@ YOLOX_FEATURES = decoder_module.YOLOX_FEATURES
 YOLOX_ROWS = decoder_module.YOLOX_ROWS
 
 MODEL_ID = "yolox-s-fp16"
-ENGINE_SHA256 = "f204dff3573a15647266ba287f789d266fd95a912dd0a75e973ab046e3991068"
+# Rebuilt 2026-09-25 on this Jetson after its L4T 39.2.0 -> 39.2.1 upgrade, from the same pinned
+# ONNX with the same trtexec command the R39.2.0 plan recorded (ADR 0009: PLANs are built on the
+# target). A TensorRT plan is platform-qualified, so the R39.2.0 plan (f204dff3...) was retired
+# rather than relabelled.
+ENGINE_SHA256 = "ad349276d3e74250f89c0a704ee2859591908e411886f883f2819301ce790d11"
 ONNX_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
-ENGINE_SIZE = 21_356_188
+ENGINE_SIZE = 20_531_500
 INPUT_NAME = "images"
 OUTPUT_NAME = "output"
 INPUT_SHAPE = (1, 3, 640, 640)
@@ -37,10 +41,10 @@ OUTPUT_SHAPE = (1, 8_400, 85)
 INPUT_BYTES = 4_915_200
 OUTPUT_BYTES = 2_856_000
 EXPECTED_TRT = "10.16.2.10"
-EXPECTED_L4T = "39.2.0"
+EXPECTED_L4T = "39.2.1"
 EXPECTED_ARCHITECTURE = "aarch64"
 L4T_RELEASE_PATH = Path("/etc/nv_tegra_release")
-L4T_RELEASE_MARKER = "# R39 (release), REVISION: 2.0"
+L4T_RELEASE_MARKER = "# R39 (release), REVISION: 2.1"
 
 
 def _machine() -> str:
@@ -50,6 +54,20 @@ def _machine() -> str:
     consumes it is unconditional: nothing here lets a non-Jetson host load the engine.
     """
     return platform.machine()
+
+
+def l4t_release_matches(release_text: str) -> bool:
+    """Whether ``/etc/nv_tegra_release`` names EXACTLY the qualified L4T revision.
+
+    The release line is ``# R39 (release), REVISION: 2.1, GCID: ...``. The marker must be
+    followed by a comma or the end of the line, so a 2.1 qualification can never be satisfied
+    by 2.10, 2.11 or any other revision that merely shares a prefix.
+    """
+    for line in release_text.splitlines():
+        if line.startswith(L4T_RELEASE_MARKER):
+            rest = line[len(L4T_RELEASE_MARKER) :]
+            return rest == "" or rest.startswith(",")
+    return False
 
 
 class RuntimeFailure(RuntimeError):
@@ -105,7 +123,7 @@ def verify_engine(model_id: str, *, root: Path | None = None) -> tuple[Path, dic
         l4t_release = L4T_RELEASE_PATH.read_text(encoding="utf-8")
     except OSError:
         raise RuntimeFailure("platform_incompatible") from None
-    if L4T_RELEASE_MARKER not in l4t_release:
+    if not l4t_release_matches(l4t_release):
         raise RuntimeFailure("platform_incompatible")
     return resolved, {key: getattr(manifest, key) for key in required}
 

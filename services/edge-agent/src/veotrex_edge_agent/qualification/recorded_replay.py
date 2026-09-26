@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from veotrex_edge_agent.gpu_worker import GpuWorkerSupervisor
+from veotrex_edge_agent.gpu_worker.runtime import ENGINE_SHA256
 from veotrex_edge_agent.image_inference import DetectionProfile, ReferenceImageDetector
 from veotrex_edge_agent.image_pipeline import TRANSFORM_VERSION, PixelFormat
 from veotrex_edge_agent.qualification.image_decoder import decode_image
 from veotrex_edge_agent.tracking import PersonDetection, PersonTracker, TrackingConfig
 
-MODEL_SHA256 = "f204dff3573a15647266ba287f789d266fd95a912dd0a75e973ab046e3991068"
+# The digest of the plan the worker actually loads: one source of truth, so a replay report can
+# never name a retired engine.
+MODEL_SHA256 = ENGINE_SHA256
 
 
 @dataclass(frozen=True, slots=True)
