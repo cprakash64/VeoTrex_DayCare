@@ -7,7 +7,9 @@ authenticates with the operator's existing key and exposes nothing new (see
 ``docs/runbooks/sunday-live-demo.md``).
 
 The page shows the live camera frame with the tracker's boxes drawn on it, a head count,
-throughput and source health.
+throughput and source health. Throughput is broken down by cause (V1-03A): capture, inference
+and preview rates, and frames not processed split into scheduler skips (intentional sampling),
+backpressure drops (the detector behind its schedule) and transport drops (lost before capture).
 
 V1-DEMO-01 served geometry only, on a black canvas. That was a deliberate privacy choice and
 the wrong one for a monitoring demonstration, so R1 puts the picture back under bounds: the
@@ -146,7 +148,8 @@ function pill(el, text, cls){ el.textContent = text; el.className = "pill " + (c
 // the page had no way to tell the difference. The frame is now loaded by its own same-origin
 // URL, so there is no object URL to permit, to track or to revoke.
 const FRAME_URL = "/api/live/frame.jpg";
-// The server encodes at ~8 fps; asking faster only re-fetches bytes that have not changed.
+// The server encodes at most ~8 fps, and only on inference frames; asking faster only
+// re-fetches bytes that have not changed.
 const PREVIEW_INTERVAL_MS = 120;
 const PREVIEW_RETRY_MS = 400;
 // Tolerate one lost frame before replacing the picture: a single 503 between encodes is normal,
@@ -218,18 +221,30 @@ function pullPreview(){
   previewRequest += 1;
   loader.src = FRAME_URL + "?sequence=" + previewRequest;
 }
+// Inference deliberately runs on a sample of camera frames, so "not processed" is split by
+// cause: a scheduler skip is a sampling decision, a backpressure drop is the detector falling
+// behind its own schedule, and a transport drop was lost before capture. A dash means the
+// source cannot measure that number, which is different from zero.
 function rows(m){
   const p = (o) => (o && o.p50 != null) ? o.p50.toFixed(1)+" / "+o.p95.toFixed(1)+" ms" : "\u2013";
+  const fps = (v) => (v == null) ? "\u2013" : v.toFixed(1);
+  const count = (v) => (v == null) ? "\u2013" : v;
+  const scheduled = (m.inference_scheduled_fps != null)
+    ? " (target " + m.inference_scheduled_fps.toFixed(1) + ")" : "";
   return [
-    ["Processing FPS", (m.processing_fps ?? 0).toFixed(1)],
-    ["Capture FPS", (m.camera_capture_fps ?? 0).toFixed(1)],
-    ["Preview encode p50/p95", p(m.preview_encode_ms)],
+    ["Capture FPS", fps(m.camera_capture_fps ?? 0)],
+    ["Inference FPS", fps(m.effective_inference_fps ?? m.processing_fps ?? 0) + scheduled],
+    ["Preview FPS", fps(m.preview_fps)],
     ["Detector p50/p95", p(m.detector_latency_ms)],
     ["Tracker p50/p95", p(m.tracker_latency_ms)],
     ["Pipeline p50/p95", p(m.pipeline_latency_ms)],
-    ["Frames captured", m.frames_captured_total ?? 0],
-    ["Frames processed", m.video_frames_processed_total ?? 0],
-    ["Frames dropped", m.frames_dropped_total ?? 0],
+    ["Preview encode p50/p95", p(m.preview_encode_ms)],
+    ["Frames captured", m.camera_frames_captured_total ?? m.frames_captured_total ?? 0],
+    ["Inference frames processed",
+     m.inference_frames_processed_total ?? m.video_frames_processed_total ?? 0],
+    ["Inference scheduler skips", m.inference_frames_skipped_scheduler_total ?? 0],
+    ["Backpressure drops", m.inference_frames_dropped_backpressure_total ?? 0],
+    ["Transport/media drops", count(m.source_frames_dropped_total)],
     ["Ignored detections", m.detections_ignored_total ?? 0],
     ["Tracks created", m.tracks_created_total ?? 0],
     ["Reconnects", m.camera_reconnect_count ?? 0],

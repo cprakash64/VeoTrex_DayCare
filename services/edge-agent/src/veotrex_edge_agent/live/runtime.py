@@ -2,7 +2,8 @@
 
 Wires a live source to the detection and tracking stack that already exists:
 
-    LiveVideoSource -> BackpressureScheduler -> RecordedTrackingPipeline -> live state
+    LiveVideoSource -> BackpressureScheduler (+ AdaptiveInferencePacer) ->
+        RecordedTrackingPipeline -> live state
 
 The pipeline is B1A's, unchanged. ``RecordedTrackingPipeline.process`` consumes any object
 exposing ``frame_index`` / ``timestamp_ms`` / ``width`` / ``height`` / ``image``, and
@@ -10,6 +11,13 @@ exposing ``frame_index`` / ``timestamp_ms`` / ``width`` / ``height`` / ``image``
 tracker + lifecycle + metrics chain is reused without a fork and without an edit. Only the
 things that are genuinely new live here: occupancy, the timeline, source health and the
 capture-side metrics.
+
+**Inference is sampled, not exhaustive (V1-03A).** With an ``InferenceRateConfig`` the runtime
+runs the detector on the newest frame at a paced, adaptive rate instead of on every frame it can
+reach. The tracker only ever sees frames that were actually detected on, each with its own
+capture-side timestamp, so a skipped camera frame neither compresses time nor counts as a miss:
+the tracker's lost-track tolerance is in seconds, not frames. Nothing is interpolated and no box
+is synthesised between detections.
 
 No recognition of any kind runs. Nothing in this module imports the face stack, and a test
 asserts the package cannot reach it. Everyone in view is an anonymous track, which is what
@@ -28,7 +36,11 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from veotrex_edge_agent.live.preview import PreviewRenderer
-from veotrex_edge_agent.live.scheduler import BackpressureScheduler
+from veotrex_edge_agent.live.scheduler import (
+    AdaptiveInferencePacer,
+    BackpressureScheduler,
+    InferenceRateConfig,
+)
 from veotrex_edge_agent.live.source import (
     LiveSourceError,
     SourceHealth,
@@ -119,13 +131,22 @@ class LiveDemoRuntime:
         timeline: DemoTimeline | None = None,
         preview: PreviewRenderer | None = None,
         ignore_regions: IgnoreRegionSet | None = None,
+        inference_rate: InferenceRateConfig | None = None,
     ) -> None:
         # Optional on purpose: --headless and the automated tests run the whole pipeline with
         # no preview at all, so nothing about detection or tracking depends on it existing.
         self.preview = preview
         self._source = source
         self._detector = detector
-        self._scheduler = BackpressureScheduler(source, capacity=capacity)
+        # No rate means unpaced: the consumer takes the newest frame whenever it is free. The
+        # live-demo CLI always passes a rate; tests that reason about exact frame sequences
+        # rely on the unpaced form.
+        self.inference_rate = inference_rate
+        self._scheduler = BackpressureScheduler(
+            source,
+            capacity=capacity,
+            pacer=None if inference_rate is None else AdaptiveInferencePacer(inference_rate),
+        )
         self._pipeline = RecordedTrackingPipeline(
             detector, tracking_config=tracking_config, ignore_regions=ignore_regions
         )
@@ -165,15 +186,33 @@ class LiveDemoRuntime:
         ``processing_fps`` is recomputed here rather than taken from the pipeline. The
         pipeline finalises its own elapsed time in a ``finally``, which is correct for a
         recorded file that runs to completion and useless for a live session: it would read
-        0.0 on the dashboard for as long as the demo was actually running.
+        0.0 on the dashboard for as long as the demo was actually running. It is the same
+        number as ``effective_inference_fps``, measured from the first frame taken for
+        inference, so seconds spent negotiating a camera session do not dilute it.
+
+        Frame accounting, by cause (see ``scheduler`` for the exact rules):
+
+        ``camera_frames_captured_total``                 every frame the source delivered
+        ``inference_frames_selected_total``              taken for inference
+        ``inference_frames_processed_total``             detection + tracking completed
+        ``inference_frames_skipped_scheduler_total``     intentionally not sampled
+        ``inference_frames_dropped_backpressure_total``  wanted, but the detector was busy
+        ``frames_dropped_total``                         same as the line above
+        ``source_frames_dropped_total``                  lost before capture; None when the
+                                                         source cannot measure it
         """
         snapshot = self._pipeline.metrics.snapshot()
-        snapshot.update(self._scheduler.metrics.snapshot())
+        snapshot.update(self._scheduler.snapshot())
         elapsed = max(time.monotonic() - self._started_monotonic, 1e-9)
         processed = self._pipeline.metrics.video_frames_processed_total
-        snapshot["processing_fps"] = round(processed / elapsed, 3)
+        snapshot["inference_frames_processed_total"] = processed
+        snapshot["processing_fps"] = snapshot["effective_inference_fps"]
         snapshot["session_seconds"] = round(elapsed, 2)
         snapshot["camera_reconnect_count"] = getattr(self._source, "reconnect_count", 0)
+        dropped_upstream = getattr(self._source, "media_frames_dropped_total", None)
+        snapshot["source_frames_dropped_total"] = (
+            dropped_upstream if isinstance(dropped_upstream, int) else None
+        )
         snapshot["occupancy"] = self.timeline.occupancy
         snapshot["peak_occupancy"] = self.timeline.peak_occupancy
         snapshot["source_health"] = str(self._source.health)
@@ -183,17 +222,29 @@ class LiveDemoRuntime:
 
     # ------------------------------------------------------------------------- processing
     def _consume(self, max_frames: int | None = None) -> None:
-        """Drive the pipeline over scheduled frames until capture stops."""
-        seen_started: set[int] = set()
+        """Drive the pipeline over scheduled frames until capture stops.
+
+        State is published once per processed frame, from that frame's own confirmed boxes, and
+        again whenever a track ends. Occupancy is the number of tracks that have been reported
+        as appeared and not yet as gone - the same lifecycle the timeline narrates - so one
+        missed detection inside the tracker's tolerance changes neither the count nor the
+        timeline. Boxes are drawn only where the detector actually found someone on this
+        frame; nothing is predicted or interpolated onto the picture.
+        """
         live_boxes: dict[int, TrackBox] = {}
+        confidences: dict[int, float] = {}
         current_frame: Any = None
 
         def hook(image: Any, boxes: Any, timestamp_ms: float) -> None:
             nonlocal live_boxes
             bounded = list(boxes)[:MAX_RENDERED_TRACKS]
             live_boxes = {
-                int(track_id): TrackBox(int(track_id), tuple(box), 0.0) for track_id, box in bounded
+                int(track_id): TrackBox(
+                    int(track_id), tuple(box), confidences.get(int(track_id), 0.0)
+                )
+                for track_id, box in bounded
             }
+            occupancy = self._pipeline.reported_track_count
             if self.preview is not None:
                 # Drawn here because this is the one place that holds the processed frame and
                 # its own confirmed boxes together; geometry and image cannot drift apart, and
@@ -202,9 +253,10 @@ class LiveDemoRuntime:
                     image,
                     bounded,
                     frame_index=getattr(current_frame, "frame_index", 0),
-                    occupancy=len(bounded),
+                    occupancy=occupancy,
                     source_health=str(self._source.health),
                 )
+            self._publish(current_frame, live_boxes, occupancy)
 
         def frames() -> Any:
             nonlocal current_frame
@@ -212,6 +264,7 @@ class LiveDemoRuntime:
                 if self._stop.is_set():
                     return
                 current_frame = frame
+                confidences.clear()
                 yield frame
 
         self.timeline.record(DemoEventKind.TRACKING_STARTED, session_ms=self._session_ms())
@@ -224,18 +277,14 @@ class LiveDemoRuntime:
                 observation = record.observation
                 if observation is not None:
                     if observation.lifecycle is TrackLifecycle.TRACK_STARTED:
-                        seen_started.add(observation.track_id)
                         self.timeline.record(
                             DemoEventKind.PERSON_APPEARED_IN_VIEW,
                             session_ms=self._session_ms(),
                             track_id=observation.track_id,
                         )
                     # Confidence comes from the observation rather than the draw hook, which
-                    # only carries geometry.
-                    box = live_boxes.get(observation.track_id)
-                    if box is not None:
-                        box.confidence = observation.detection_confidence
-                    self._publish(current_frame, live_boxes)
+                    # only carries geometry. The hook for this frame runs after its records.
+                    confidences[observation.track_id] = observation.detection_confidence
                 summary = record.summary
                 if summary is not None:
                     self.timeline.record(
@@ -244,7 +293,9 @@ class LiveDemoRuntime:
                         track_id=summary.track_id,
                     )
                     live_boxes.pop(summary.track_id, None)
-                    self._publish(current_frame, live_boxes)
+                    # Also reached after the last frame, when the stream ends with tracks
+                    # still live and no further hook will run.
+                    self._publish(current_frame, live_boxes, self._pipeline.reported_track_count)
         except LiveSourceError as exc:
             self._failure = exc.category
         except Exception:
@@ -263,9 +314,8 @@ class LiveDemoRuntime:
                 # A frozen last frame would keep looking live after the camera has gone.
                 self.preview.clear()
 
-    def _publish(self, frame: Any, boxes: dict[int, TrackBox]) -> None:
-        """Swap in a fresh state. Occupancy is the number of confirmed tracks right now."""
-        occupancy = len(boxes)
+    def _publish(self, frame: Any, boxes: dict[int, TrackBox], occupancy: int) -> None:
+        """Swap in a fresh state. ``occupancy`` counts appeared-and-not-yet-gone tracks."""
         event = self.timeline.set_occupancy(occupancy, session_ms=self._session_ms())
         if event is not None:
             self._logger.info("live_occupancy_changed", occupancy=occupancy)

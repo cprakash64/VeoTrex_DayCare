@@ -5,8 +5,10 @@ Streams one local video through detection and tracking and emits lifecycle facts
     RecordedVideoSource -> PersonDetector -> PersonTracker -> TrackObservation / TrackSummary
 
 The tracker is the existing ``veotrex_edge_agent.tracking.PersonTracker`` (ADR 0012), used
-unmodified. Everything this module adds is the part that was missing: a streaming source, a
-detector boundary, lifecycle bookkeeping across frames, and bounded metrics.
+unmodified apart from V1-03A's additive ``source_discontinuity`` keyword, which a live frame
+sets after a reconnect and a recorded frame never does. Everything this module adds is the
+part that was missing: a streaming source, a detector boundary, lifecycle bookkeeping across
+frames, and bounded metrics.
 
 Three properties are deliberate and load-bearing:
 
@@ -70,6 +72,9 @@ class PipelineMetrics:
     tracks_completed_total: int = 0
     active_tracks: int = 0
     peak_active_tracks: int = 0
+    # Times the tracker cleared its state: a source-signalled reconnect, an over-long gap, or
+    # a change of frame geometry.
+    tracking_discontinuities_total: int = 0
     detector_latency_ms: BoundedSamples = field(
         default_factory=lambda: BoundedSamples(LATENCY_SAMPLE_CAPACITY)
     )
@@ -110,6 +115,7 @@ class PipelineMetrics:
             "tracks_completed_total": self.tracks_completed_total,
             "active_tracks": self.active_tracks,
             "peak_active_tracks": self.peak_active_tracks,
+            "tracking_discontinuities_total": self.tracking_discontinuities_total,
             "processing_seconds": round(self.processing_seconds, 4),
             "processing_fps": round(self.processing_fps, 3),
             "detector_latency_ms": self._summary(self.detector_latency_ms),
@@ -172,6 +178,15 @@ class RecordedTrackingPipeline:
     @property
     def video_metadata(self) -> VideoMetadata | None:
         return self._video_metadata
+
+    @property
+    def reported_track_count(self) -> int:
+        """Tracks reported as started and not yet ended.
+
+        Includes a track the tracker has briefly lost but not yet removed: it has not been
+        reported as ended, so as far as anything downstream knows the person is still there.
+        """
+        return sum(1 for live in self._live.values() if live.started_emitted)
 
     def _observe(
         self,
@@ -308,8 +323,22 @@ class RecordedTrackingPipeline:
             [PersonDetection(item.bbox_xyxy, item.confidence) for item in accepted],
             source_width=frame.width,
             source_height=frame.height,
+            # A live frame says when the feed was interrupted before it; a recorded frame has
+            # no such attribute and is continuous by construction.
+            source_discontinuity=bool(getattr(frame, "discontinuity", False)),
         )
         tracker_ms = (time.perf_counter_ns() - tracker_started) / 1e6
+
+        if result.discontinuity:
+            # The tracker has cleared every track without listing them as removed. Close them
+            # here, before this frame's tracks are applied, or they would linger as live
+            # forever and a reused id could be mistaken for a continuation of an old track.
+            self.metrics.tracking_discontinuities_total += 1
+            for track_id in sorted(self._live):
+                record = self._end(track_id, TrackEndReason.DISCONTINUITY)
+                if record is not None:
+                    yield record
+            self._live.clear()
 
         yield from self._apply(result, frame)
 

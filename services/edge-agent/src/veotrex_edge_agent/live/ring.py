@@ -145,6 +145,19 @@ class RingWhepSource:
     def reconnect_count(self) -> int:
         return self._reconnects
 
+    @property
+    def media_frames_dropped_total(self) -> int:
+        """Frames lost on this side of the decode worker before any consumer saw them.
+
+        Geometry this source refused, plus frames the reader could not map or validate. Frames
+        the worker's own bounded appsink discarded are not reported across the socket, so they
+        are not in this number; it is a floor, not the whole of transport loss.
+        """
+        reader_dropped = 0
+        with contextlib.suppress(Exception):
+            reader_dropped = int(self._reader.stats.get("frames_dropped_total", 0))
+        return self.metrics.frames_dropped_total + reader_dropped
+
     def describe(self) -> SourceDescription:
         width, height = self._geometry
         # No nominal fps: WHEP does not publish one, and a guessed rate on a dashboard is worse

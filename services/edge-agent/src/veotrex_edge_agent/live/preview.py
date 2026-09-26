@@ -169,6 +169,7 @@ class PreviewRenderer:
         self.previews_skipped_total = 0
         self.encode_failures_total = 0
         self._last_encode_monotonic = 0.0
+        self._first_encode_monotonic: float | None = None
         self._unavailable = False
 
     def _due(self, now: float) -> bool:
@@ -217,6 +218,8 @@ class PreviewRenderer:
             self.encode_failures_total += 1
             return None
         self._last_encode_monotonic = now
+        if self._first_encode_monotonic is None:
+            self._first_encode_monotonic = now
         self.previews_encoded_total += 1
         self.encode_ms.add((time.perf_counter_ns() - started) / 1e6)
         return frame
@@ -286,10 +289,27 @@ class PreviewRenderer:
     def clear(self) -> None:
         self.buffer.clear()
 
+    @property
+    def preview_fps(self) -> float:
+        """Encode rate between the first and the latest published preview.
+
+        Previews are drawn on inference frames, so this can never exceed the inference rate:
+        a box is only ever drawn on the frame it was detected in.
+        """
+        first = self._first_encode_monotonic
+        count = self.previews_encoded_total
+        if first is None or count < 2 or self._last_encode_monotonic <= first:
+            return 0.0
+        return (count - 1) / (self._last_encode_monotonic - first)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "previews_encoded_total": self.previews_encoded_total,
             "previews_skipped_total": self.previews_skipped_total,
+            # V1-03A names for the same two counters, and the rate they amount to.
+            "preview_frames_encoded_total": self.previews_encoded_total,
+            "preview_frames_skipped_total": self.previews_skipped_total,
+            "preview_fps": round(self.preview_fps, 3),
             "preview_encode_failures_total": self.encode_failures_total,
             "preview_target_fps": self.config.target_fps,
             "preview_encode_ms": {

@@ -1,6 +1,7 @@
 """Live camera ingestion and the real-time tracking demo (V1-DEMO-01).
 
-    LiveVideoSource -> BackpressureScheduler -> (B1A detector + tracker) -> live state
+    LiveVideoSource -> BackpressureScheduler (+ paced inference) -> (B1A detector + tracker)
+        -> live state
 
 The source is replaceable and nothing downstream knows which one is running. A local USB
 camera today and Ring WHEP once the upstream block clears are interchangeable, because the
@@ -27,7 +28,12 @@ from veotrex_edge_agent.live.preview import (
     PreviewRenderer,
 )
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime, LiveState, TrackBox
-from veotrex_edge_agent.live.scheduler import BackpressureScheduler, SchedulerMetrics
+from veotrex_edge_agent.live.scheduler import (
+    AdaptiveInferencePacer,
+    BackpressureScheduler,
+    InferenceRateConfig,
+    SchedulerMetrics,
+)
 from veotrex_edge_agent.live.source import (
     LiveFrame,
     LiveSourceError,
@@ -41,12 +47,14 @@ from veotrex_edge_agent.live.timeline import DemoEvent, DemoEventKind, DemoTimel
 
 __all__ = [
     "SOURCE_VIEWS",
+    "AdaptiveInferencePacer",
     "BackpressureScheduler",
     "CameraCandidate",
     "DemoEvent",
     "DemoEventKind",
     "DemoTimeline",
     "FakeLiveSource",
+    "InferenceRateConfig",
     "LiveDemoRuntime",
     "LiveFrame",
     "LiveSourceError",

@@ -54,6 +54,8 @@ Replace the device with the one step 1 reported. Useful options:
 | `--source synthetic` | no camera at all; a moving synthetic scene |
 | `--no-preview` | metrics only, no camera image (lower cost) |
 | `--preview-fps 5` | slower preview if the machine is busy; inference is never throttled to match |
+| `--inference-fps 6` | the default detector cadence; it adapts down under load, never above this |
+| `--inference-min-fps 3` / `--inference-max-fps 8` | the band the adaptive scheduler stays in |
 | `--duration 300` | stop automatically after five minutes |
 | `--port 8891` | change the dashboard port |
 | `--pixel-format MJPG` | the default. YUYV at 720p is capped at 9 fps by USB 2.0 bandwidth |
@@ -117,8 +119,18 @@ ssh -N -L 8891:127.0.0.1:8891 <user>@<jetson-host>
 Then open <http://127.0.0.1:8891/> on the laptop. Leave that SSH session running for the demo.
 
 The page shows the live camera image with tracking boxes drawn on it, the current head count,
-capture/processing/preview rates, detector/tracker/pipeline latency, frames dropped, and source
-health.
+capture/inference/preview rates, detector/tracker/pipeline latency, and source health. Frames
+the detector did not run on are split by cause (ADR 0022):
+
+| Row | Meaning |
+|---|---|
+| Inference scheduler skips | intentional sampling — inference was not due yet. Normal, and large |
+| Backpressure drops | inference was due but the detector was still busy. Should stay near 0 |
+| Transport/media drops | lost before capture; `–` when the source cannot measure it |
+
+`Inference FPS` shows the achieved rate and, in brackets, the rate the scheduler is currently
+aiming for. A bracketed value below `--inference-fps` means the scheduler slowed down because the
+detector got slower; it recovers gradually on its own.
 
 The picture is rendered on the Jetson onto the exact frame the tracker processed, so boxes
 cannot drift away from the person. Exactly one frame is held in memory at a time and **nothing
@@ -157,15 +169,21 @@ detector is running.
 still up, and that the port in the tunnel matches `--port`. `curl -s localhost:8891/healthz` on
 the Jetson itself distinguishes a dead demo from a dead tunnel.
 
-**Boxes lag behind the person.** Expected and by design. The detector runs slower than the
-camera, so the pipeline deliberately drops stale frames to keep latency bounded — the "frames
-dropped" counter is that policy working, not a fault. A current view with gaps beats a complete
-view that is seconds behind.
+**Boxes lag behind the person.** Expected and by design. The detector runs at ~6 fps on the
+newest camera frame, not on every frame, so a box is up to one inference period (~170 ms) plus
+one detection (~100 ms) behind a moving person. The "Inference scheduler skips" counter is that
+sampling working, not a fault. A current view with gaps beats a complete view that is seconds
+behind.
 
-**The picture looks choppier than the boxes are accurate.** The preview is encoded at about
-8 fps while tracking runs faster; that is deliberate, so the picture never costs inference more
-than a few percent. Measured on this Jetson: processing 15.7 fps without the preview and 15.1
-with it. `--preview-fps` lowers it further, `--no-preview` removes it entirely.
+**Backpressure drops are climbing.** The detector is slower than the schedule. The scheduler
+slows itself down within a second (watch the bracketed target in `Inference FPS`); if drops keep
+climbing at the minimum rate, the detector itself is slower than `--inference-min-fps` allows,
+and `inference_scheduler_state` in the final metrics reads `DETECTOR_BELOW_MINIMUM`.
+
+**The picture looks choppier than the camera.** The preview is drawn only on frames the detector
+ran on, so its rate is at most the inference rate (~6 fps) and at most `--preview-fps`. That is
+deliberate: the boxes are drawn on the frame they were detected in, so they cannot drift off the
+person. `--no-preview` removes the picture entirely.
 
 **The video area shows a broken-image icon and its alt text.** Fixed in V1-DEMO-01R1; if it
 ever comes back, the page is claiming a frame the browser refused to render. Check the browser

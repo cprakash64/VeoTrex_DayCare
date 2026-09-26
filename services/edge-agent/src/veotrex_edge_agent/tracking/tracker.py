@@ -194,7 +194,16 @@ class PersonTracker:
         *,
         source_width: int,
         source_height: int,
+        source_discontinuity: bool = False,
     ) -> TrackingFrameResult:
+        """Advance one stream by one frame.
+
+        ``source_discontinuity`` is the source saying the feed was interrupted before this
+        frame (a reconnect). It clears the stream exactly as an over-long timestamp gap does -
+        same metrics, same continuing track ids - because motion across an interruption is not
+        motion, however short the interruption was. It is ignored on a stream's first frame,
+        where there is no earlier state to separate from.
+        """
         started = time.perf_counter_ns()
         if not stream_instance_id or frame_sequence < 0 or not math.isfinite(timestamp):
             self.metrics.tracking_errors_total += 1
@@ -220,9 +229,9 @@ class PersonTracker:
         if stream.timestamp is not None and timestamp < stream.timestamp:
             self.metrics.tracking_errors_total += 1
             raise ValueError("non_monotonic_timestamp")
-        if (
-            stream.timestamp is not None
-            and timestamp - stream.timestamp > self.config.max_timestamp_gap_seconds
+        if stream.timestamp is not None and (
+            source_discontinuity
+            or timestamp - stream.timestamp > self.config.max_timestamp_gap_seconds
         ):
             self._remove_all(stream)
             discontinuity = True

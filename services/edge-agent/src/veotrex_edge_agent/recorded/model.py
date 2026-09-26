@@ -56,10 +56,13 @@ class TrackEndReason(StrEnum):
     """Why a track stopped. ``ABSENT`` is the ordinary case: the person was not matched for
     longer than the configured tolerance. ``STREAM_ENDED`` means the video simply ran out
     while the track was still live, which is not the same thing and must not be counted as a
-    disappearance."""
+    disappearance. ``DISCONTINUITY`` means the feed was interrupted (a reconnect, a long gap, a
+    geometry change) and the tracker cleared its state: the person may well still be there, but
+    nothing links what is seen after the gap to what was seen before it."""
 
     ABSENT = "ABSENT"
     STREAM_ENDED = "STREAM_ENDED"
+    DISCONTINUITY = "DISCONTINUITY"
 
 
 @dataclass(frozen=True, slots=True)

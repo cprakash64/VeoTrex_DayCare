@@ -32,6 +32,12 @@ from veotrex_edge_agent.live.preview import (
 )
 from veotrex_edge_agent.live.ring import RingWhepSource
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime
+from veotrex_edge_agent.live.scheduler import (
+    DEFAULT_INFERENCE_FPS,
+    DEFAULT_MAX_INFERENCE_FPS,
+    DEFAULT_MIN_INFERENCE_FPS,
+    InferenceRateConfig,
+)
 from veotrex_edge_agent.live.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -189,6 +195,27 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
         "--preview-quality", type=int, default=DEFAULT_JPEG_QUALITY, help="preview JPEG quality"
     )
     command.add_argument(
+        "--inference-fps",
+        type=float,
+        default=DEFAULT_INFERENCE_FPS,
+        help=(
+            "target detector rate. Inference runs on the newest frame at this cadence, not on "
+            "every camera frame, and slows automatically when the detector cannot sustain it"
+        ),
+    )
+    command.add_argument(
+        "--inference-min-fps",
+        type=float,
+        default=DEFAULT_MIN_INFERENCE_FPS,
+        help="slowest rate the adaptive scheduler may fall back to under load",
+    )
+    command.add_argument(
+        "--inference-max-fps",
+        type=float,
+        default=DEFAULT_MAX_INFERENCE_FPS,
+        help="hard ceiling on the detector rate; --inference-fps may not exceed it",
+    )
+    command.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many processed frames"
     )
     command.add_argument(
@@ -342,6 +369,38 @@ def _detector(arguments: argparse.Namespace) -> Any:
 
 
 def run_demo_cli(arguments: argparse.Namespace) -> int:
+    # Every operator setting is validated before anything is started. A refusal after the
+    # detector's GPU worker is up would return without the ``finally`` that stops it.
+    try:
+        inference_rate = InferenceRateConfig(
+            target_fps=arguments.inference_fps,
+            min_fps=arguments.inference_min_fps,
+            max_fps=arguments.inference_max_fps,
+        )
+    except ValueError as exc:
+        print(f"invalid inference rate: {exc}", file=sys.stderr)
+        return 2
+
+    preview: PreviewRenderer | None = None
+    if not arguments.headless and not arguments.no_preview:
+        try:
+            preview = PreviewRenderer(
+                PreviewConfig(
+                    target_fps=arguments.preview_fps, jpeg_quality=arguments.preview_quality
+                )
+            )
+        except ValueError as exc:
+            print(f"invalid preview setting: {exc}", file=sys.stderr)
+            return 2
+    try:
+        regions = build_ignore_regions(
+            getattr(arguments, "ignore_regions", None),
+            min_containment=arguments.ignore_containment,
+        )
+    except IgnoreRegionError as exc:
+        print(f"invalid ignore region: {exc}", file=sys.stderr)
+        return 2
+
     try:
         source = _source(arguments)
     except LiveSourceError as exc:
@@ -371,25 +430,6 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             print(f"detector unavailable: {exc}", file=sys.stderr)
             return 2
 
-    preview: PreviewRenderer | None = None
-    if not arguments.headless and not arguments.no_preview:
-        try:
-            preview = PreviewRenderer(
-                PreviewConfig(
-                    target_fps=arguments.preview_fps, jpeg_quality=arguments.preview_quality
-                )
-            )
-        except ValueError as exc:
-            print(f"invalid preview setting: {exc}", file=sys.stderr)
-            return 2
-    try:
-        regions = build_ignore_regions(
-            getattr(arguments, "ignore_regions", None),
-            min_containment=arguments.ignore_containment,
-        )
-    except IgnoreRegionError as exc:
-        print(f"invalid ignore region: {exc}", file=sys.stderr)
-        return 2
     if regions:
         # Printed, not silent. Masking part of a camera's view is a decision an operator has
         # to be able to see they made, and to undo.
@@ -398,7 +438,13 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             note = f"  {region.as_dict()}"
             print(note)
         print("  These suppress known fixed artifacts only. They are not detector qualification.")
-    runtime = LiveDemoRuntime(source, detector, preview=preview, ignore_regions=regions)
+    runtime = LiveDemoRuntime(
+        source,
+        detector,
+        preview=preview,
+        ignore_regions=regions,
+        inference_rate=inference_rate,
+    )
     server: DemoServer | None = None
     code = 0
     try:
