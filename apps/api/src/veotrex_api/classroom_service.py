@@ -15,6 +15,12 @@ the one connected presence source is MANUAL: an operator-reported, append-only, 
 aggregate snapshot (``classroom_presence_snapshots``). Storage and selection live here; the
 arithmetic stays in the engine. Nothing here counts children from a camera, and nothing
 substitutes vision occupancy for a missing or expired count.
+
+Since V1-04C a classroom's ``presence_source_mode`` says explicitly where its qualified-staff
+count comes from: the manual report (MANUAL_AGGREGATE, the default and the V1-04B behaviour) or
+the operator check-in roster (ROSTER_STAFF_PLUS_MANUAL_CHILDREN). Children and visitors always
+come from the manual report. The two staff counts are never combined
+(:func:`veotrex_api.staff_presence.compose_presence`).
 """
 
 from __future__ import annotations
@@ -62,6 +68,8 @@ from veotrex_api.models import (
     Facility,
     Zone,
 )
+from veotrex_api.staff_presence import CompositePresence, PresenceSourceMode, compose_presence
+from veotrex_api.staff_roster_store import resolve_roster
 
 CLASSROOM_KIND = "CLASSROOM"
 MAX_CLASSROOMS_PER_FACILITY = 200
@@ -90,6 +98,7 @@ VALIDATION_CATEGORIES = frozenset(
         "invalid_qualified_staff_count",
         "invalid_visitor_count",
         "invalid_validity_seconds",
+        "invalid_presence_source_mode",
     }
 )
 # How many past reports the presence endpoint returns. History is kept in full in the table;
@@ -105,6 +114,8 @@ CONFLICT_CATEGORIES = frozenset(
         "policy_period_overlaps",
         "policy_limit_reached",
         "policy_inactive",
+        # V1-04C: a roster-mode classroom takes its staff count from check-ins, never a number.
+        "staff_count_comes_from_roster",
     }
 )
 
@@ -170,6 +181,7 @@ class ClassroomSummary:
     can_administer: bool
     created_at: datetime
     updated_at: datetime
+    presence_source_mode: str = str(PresenceSourceMode.MANUAL_AGGREGATE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +192,14 @@ class RatioStatus:
     presence_connected: bool
     vision_connected: bool
     presence: PresenceResolution | None = None
+    composite: CompositePresence | None = None
 
     def as_dict(self) -> dict[str, Any]:
         resolution = self.presence
+        roster_mode = (
+            self.composite is not None
+            and self.composite.mode is PresenceSourceMode.ROSTER_STAFF_PLUS_MANUAL_CHILDREN
+        )
         return {
             "classroom_id": str(self.classroom_id),
             "evaluation": self.evaluation.as_dict(),
@@ -190,13 +207,27 @@ class RatioStatus:
             "presence_connected": self.presence_connected,
             "vision_connected": self.vision_connected,
             "policy_basis": "CONFIGURED_CLASSROOM_POLICY",
-            "presence": presence_dict(resolution, self.evaluation.evaluated_at),
+            "presence": presence_dict(
+                resolution, self.evaluation.evaluated_at, staff_from_roster=roster_mode
+            ),
+            "presence_source_mode": str(
+                PresenceSourceMode.MANUAL_AGGREGATE
+                if self.composite is None
+                else self.composite.mode
+            ),
+            # Where each ratio input came from (V1-04C), so a reader never has to guess which
+            # source produced a number.
+            "sources": None if self.composite is None else self.composite.as_dict(),
         }
 
 
-def presence_dict(resolution: PresenceResolution | None, now: datetime) -> dict[str, Any]:
+def presence_dict(
+    resolution: PresenceResolution | None, now: datetime, *, staff_from_roster: bool = False
+) -> dict[str, Any]:
     """The authoritative presence behind a status. Counts appear only while FRESH: a stale or
-    revoked report is described, never shown as if it still held."""
+    revoked report is described, never shown as if it still held. In roster mode the manual
+    report's staff number - if it has one, from before the switch - is not shown, because it is
+    not the staff count in use."""
     if resolution is None or resolution.record is None:
         availability = (
             PresenceAvailability.PRESENCE_NOT_CONNECTED
@@ -224,7 +255,9 @@ def presence_dict(resolution: PresenceResolution | None, now: datetime) -> dict[
         "valid_until": utc(record.valid_until).isoformat(),
         "freshness": str(Freshness.FRESH if fresh else Freshness.STALE),
         "child_count": record.child_count if fresh else None,
-        "qualified_staff_count": record.qualified_staff_count if fresh else None,
+        "qualified_staff_count": record.qualified_staff_count
+        if fresh and not staff_from_roster
+        else None,
         "visitor_count": record.visitor_count if fresh else None,
     }
 
@@ -232,7 +265,8 @@ def presence_dict(resolution: PresenceResolution | None, now: datetime) -> dict[
 @dataclass(frozen=True, slots=True)
 class ManualPresenceInput:
     child_count: int
-    qualified_staff_count: int
+    # Required in MANUAL_AGGREGATE mode, refused in roster mode (V1-04C).
+    qualified_staff_count: int | None
     visitor_count: int
     valid_for_seconds: int
 
@@ -244,7 +278,7 @@ class PresenceReport:
     snapshot_id: UUID
     source: str
     child_count: int
-    qualified_staff_count: int
+    qualified_staff_count: int | None
     visitor_count: int
     observed_at: datetime
     valid_until: datetime
@@ -564,6 +598,7 @@ class ClassroomService:
             can_administer=self._can(principal, Permission.ADMINISTER_FACILITY, facility.id),
             created_at=utc(area.created_at),
             updated_at=utc(area.updated_at),
+            presence_source_mode=area.presence_source_mode,
         )
 
     # ------------------------------------------------------------------------ facilities
@@ -757,6 +792,42 @@ class ClassroomService:
                     "classroom.activated" if active else "classroom.deactivated",
                     request_id,
                     {"to_status": target},
+                )
+                await session.flush()
+                await session.refresh(area)
+            return await self._summary(session, principal, area, facility, datetime.now(UTC))
+
+    async def set_presence_source_mode(
+        self, principal: AuthenticatedPrincipal, classroom_id: UUID, mode: str, request_id: str
+    ) -> ClassroomSummary:
+        """Choose where the classroom's qualified-staff count comes from (V1-04C).
+
+        Explicit and audited: nothing switches a classroom to the roster implicitly, and
+        switching back to MANUAL_AGGREGATE does not borrow the roster's number - a roster-mode
+        manual report carries no staff count, so the ratio reads STAFF_COUNT_MISSING until an
+        operator reports one.
+        """
+        self._require_any(principal, Permission.ADMINISTER_FACILITY)
+        try:
+            target = PresenceSourceMode(mode)
+        except ValueError:
+            raise ClassroomError("invalid_presence_source_mode") from None
+        async with self._factory() as session, session.begin():
+            await self._set_tenant(session, principal.tenant_id)
+            area, facility = await self._classroom(
+                session, principal, classroom_id, administer=True
+            )
+            if area.presence_source_mode != target:
+                before = area.presence_source_mode
+                area.presence_source_mode = str(target)
+                self._audit(
+                    session,
+                    principal,
+                    "classroom",
+                    area.id,
+                    "classroom.presence_source_mode_changed",
+                    request_id,
+                    {"from": before, "to": str(target)},
                 )
                 await session.flush()
                 await session.refresh(area)
@@ -1047,6 +1118,14 @@ class ClassroomService:
             )
             if area.status != "ACTIVE":
                 raise ClassroomError("classroom_inactive")
+            roster_mode = (
+                area.presence_source_mode == PresenceSourceMode.ROSTER_STAFF_PLUS_MANUAL_CHILDREN
+            )
+            if roster_mode and payload.qualified_staff_count is not None:
+                # Accepting it would store a second staff number beside the roster's.
+                raise ClassroomError("staff_count_comes_from_roster")
+            if not roster_mode and payload.qualified_staff_count is None:
+                raise ClassroomError("invalid_qualified_staff_count")
             observed = datetime.now(UTC)
             row = ClassroomPresenceSnapshot(
                 id=uuid4(),
@@ -1126,7 +1205,8 @@ class ClassroomService:
     async def ratio_status(
         self, principal: AuthenticatedPrincipal, classroom_id: UUID, *, now: datetime | None = None
     ) -> RatioStatus:
-        """policy in force -> latest authoritative manual report -> the pure engine.
+        """policy in force -> latest manual report (+ the staff roster in roster mode) -> the
+        composite snapshot -> the pure engine.
 
         Missing, stale or revoked presence is INSUFFICIENT_DATA with the reason; no earlier
         report and no camera count ever stands in for it. Vision is not connected here, so the
@@ -1136,12 +1216,19 @@ class ClassroomService:
         moment = now or datetime.now(UTC)
         async with self._factory() as session, session.begin():
             await self._set_tenant(session, principal.tenant_id)
-            area, _ = await self._classroom(session, principal, classroom_id)
+            area, facility = await self._classroom(session, principal, classroom_id)
             rows = await self._policies(session, principal.tenant_id, area.id)
             resolution = await self._resolve_presence(session, principal.tenant_id, area.id, moment)
+            mode = PresenceSourceMode(area.presence_source_mode)
+            roster = (
+                await resolve_roster(session, principal.tenant_id, facility.id, area.id, moment)
+                if mode is PresenceSourceMode.ROSTER_STAFF_PLUS_MANUAL_CHILDREN
+                else None
+            )
         selection = select_policy([policy_terms(row) for row in rows], moment)
+        composite = compose_presence(area.id, mode, resolution, roster, moment)
         fresh = (
-            resolution.snapshot
+            composite.snapshot
             if resolution.availability is PresenceAvailability.PRESENCE_FRESH
             else None
         )
@@ -1151,7 +1238,7 @@ class ClassroomService:
                 selection.policy,
                 # A stale report goes in as-is so the engine itself reports it stale; a revoked
                 # one has no snapshot and reads as missing.
-                resolution.snapshot,
+                composite.snapshot,
                 moment,
                 classroom_active=area.status == "ACTIVE",
                 policy_ambiguous=selection.ambiguous,
@@ -1160,4 +1247,5 @@ class ClassroomService:
             presence_connected=resolution.connected,
             vision_connected=False,
             presence=resolution,
+            composite=composite,
         )

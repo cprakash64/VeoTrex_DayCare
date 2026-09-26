@@ -11,6 +11,8 @@
  *   and people nobody accounts for are "unexplained", never children or staff.
  */
 
+import { ROSTER_MODE, rosterSummaryLines, sourceLabel, type StaffCountSummary } from "./staff-presence";
+
 export type FacilitySummary = Readonly<{
   facility_id: string;
   name: string;
@@ -58,6 +60,8 @@ export type Classroom = Readonly<{
   current_policy_id: string | null;
   can_administer: boolean;
   policy_basis: string;
+  // V1-04C: where the qualified-staff count comes from. Chosen explicitly per classroom.
+  presence_source_mode: string;
   created_at: string;
   updated_at: string;
 }>;
@@ -100,6 +104,21 @@ export type PresenceStatus = Readonly<{
   visitor_count: number | null;
 }>;
 
+export type SlotProvenance = Readonly<{
+  count: number | null;
+  source: string | null;
+  freshness: string;
+  valid_until: string | null;
+}>;
+
+export type PresenceSources = Readonly<{
+  mode: string;
+  children: SlotProvenance;
+  qualified_staff: SlotProvenance;
+  visitors: SlotProvenance;
+  staff_roster: StaffCountSummary | null;
+}>;
+
 export type RatioStatus = Readonly<{
   classroom_id: string;
   evaluation: RatioEvaluation;
@@ -108,13 +127,16 @@ export type RatioStatus = Readonly<{
   vision_connected: boolean;
   policy_basis: string;
   presence?: PresenceStatus;
+  presence_source_mode?: string;
+  sources?: PresenceSources | null;
 }>;
 
 export type PresenceReport = Readonly<{
   snapshot_id: string;
   source: string;
   child_count: number;
-  qualified_staff_count: number;
+  // null for a report made in roster mode, where staff come from check-ins (V1-04C).
+  qualified_staff_count: number | null;
   visitor_count: number;
   observed_at: string;
   valid_until: string;
@@ -155,7 +177,8 @@ export type ManualPresenceForm = Readonly<{
 
 export type ManualPresencePayload = Readonly<{
   child_count: number;
-  qualified_staff_count: number;
+  // Omitted in roster mode: the API refuses a staff number there (V1-04C).
+  qualified_staff_count?: number;
   visitor_count: number;
   valid_for_seconds: number;
 }>;
@@ -285,12 +308,18 @@ export function parsePolicyPayload(body: unknown): PolicyPayload | null {
   return result.ok ? result.value : null;
 }
 
-export function validateManualPresence(input: ManualPresenceForm): Validation<ManualPresencePayload> {
+export function validateManualPresence(
+  input: ManualPresenceForm,
+  rosterMode = false,
+): Validation<ManualPresencePayload> {
   const errors: Record<string, string> = {};
   const children = integer(input.child_count, 0, MANUAL_LIMITS.children);
   if (children === null) errors.child_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.children}.`;
-  const staff = integer(input.qualified_staff_count, 0, MANUAL_LIMITS.qualified_staff);
-  if (staff === null) errors.qualified_staff_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.qualified_staff}.`;
+  // In roster mode the staff count comes from check-ins; the form sends no staff number at all.
+  const staff = rosterMode ? null : integer(input.qualified_staff_count, 0, MANUAL_LIMITS.qualified_staff);
+  if (!rosterMode && staff === null) {
+    errors.qualified_staff_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.qualified_staff}.`;
+  }
   const visitors = input.visitor_count.trim() ? integer(input.visitor_count, 0, MANUAL_LIMITS.visitors) : 0;
   if (visitors === null) errors.visitor_count = `Enter a whole number from 0 to ${MANUAL_LIMITS.visitors}.`;
   const validity = Number(input.valid_for_seconds);
@@ -298,30 +327,36 @@ export function validateManualPresence(input: ManualPresenceForm): Validation<Ma
     errors.valid_for_seconds = "Choose how long this count stays valid.";
   }
   if (Object.keys(errors).length > 0) return { ok: false, errors };
-  return {
-    ok: true,
-    value: {
-      child_count: children as number,
-      qualified_staff_count: staff as number,
-      visitor_count: visitors as number,
-      valid_for_seconds: validity,
-    },
+  const value: ManualPresencePayload = {
+    child_count: children as number,
+    ...(rosterMode ? {} : { qualified_staff_count: staff as number }),
+    visitor_count: visitors as number,
+    valid_for_seconds: validity,
   };
+  return { ok: true, value };
 }
 
-/** Strict re-validation in the BFF: exactly these keys, integer values only. */
+/**
+ * Strict re-validation in the BFF: exactly these keys, integer values only. The staff count may be
+ * absent (a roster-mode report); whether the classroom accepts that is the API's decision.
+ */
 export function parseManualPresence(body: unknown): ManualPresencePayload | null {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
   const record = body as Record<string, unknown>;
-  const keys = ["child_count", "qualified_staff_count", "visitor_count", "valid_for_seconds"];
+  const required = ["child_count", "visitor_count", "valid_for_seconds"];
+  const rosterMode = !("qualified_staff_count" in record);
+  const keys = rosterMode ? required : [...required, "qualified_staff_count"];
   if (Object.keys(record).some((key) => !keys.includes(key))) return null;
   if (keys.some((key) => typeof record[key] !== "number" || !Number.isInteger(record[key]))) return null;
-  const result = validateManualPresence({
-    child_count: String(record.child_count),
-    qualified_staff_count: String(record.qualified_staff_count),
-    visitor_count: String(record.visitor_count),
-    valid_for_seconds: String(record.valid_for_seconds),
-  });
+  const result = validateManualPresence(
+    {
+      child_count: String(record.child_count),
+      qualified_staff_count: rosterMode ? "" : String(record.qualified_staff_count),
+      visitor_count: String(record.visitor_count),
+      valid_for_seconds: String(record.valid_for_seconds),
+    },
+    rosterMode,
+  );
   return result.ok ? result.value : null;
 }
 
@@ -361,6 +396,9 @@ const API_MESSAGES: Readonly<Record<string, string>> = {
   invalid_qualified_staff_count: "Qualified staff present must be a whole number within the allowed range.",
   invalid_visitor_count: "Visitors present must be a whole number within the allowed range.",
   invalid_validity_seconds: "Choose how long this count stays valid.",
+  staff_count_comes_from_roster:
+    "Staff are counted from check-ins in this classroom; report children and visitors only.",
+  invalid_presence_source_mode: "Choose where the staff count comes from.",
   effective_period_inverted: "The last day cannot be before the first day.",
 };
 
@@ -394,6 +432,8 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
     return { headline: "Ratio data unavailable", tone: "neutral", details: [], basis: BASIS };
   }
   const { evaluation, presence } = status;
+  const sources = status.sources ?? null;
+  const rosterMode = sources?.mode === ROSTER_MODE;
   const details: string[] = [];
   const explanations = new Set(evaluation.explanations);
   const expiredHere =
@@ -405,6 +445,22 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
       headline: "Presence data stale",
       tone: "neutral",
       details: ["The operator-reported count has expired. Report current presence to update."],
+      basis: BASIS,
+    };
+  }
+  // A counted staff check-in that ran out since this was calculated changes the staff count:
+  // the result is not shown again until the server has re-evaluated it.
+  const rosterUntil = rosterMode ? sources?.staff_roster?.valid_until ?? null : null;
+  if (
+    rosterUntil !== null &&
+    Date.parse(rosterUntil) <= nowMs &&
+    evaluation.ratio_state !== "NOT_CONFIGURED" &&
+    evaluation.ratio_state !== "INSUFFICIENT_DATA"
+  ) {
+    return {
+      headline: "Presence data stale",
+      tone: "neutral",
+      details: ["A staff check-in has expired since this was calculated. Refreshing…"],
       basis: BASIS,
     };
   }
@@ -460,8 +516,18 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
       headline = "Ratio data unavailable";
   }
   if (evaluation.child_count !== null && evaluation.staff_count !== null) {
-    details.push(`Children reported: ${evaluation.child_count}`);
-    details.push(`Qualified staff reported: ${evaluation.staff_count}`);
+    if (sources) {
+      // Every number says where it came from (V1-04C).
+      details.push(`Children reported: ${evaluation.child_count} — ${sourceLabel(sources.children.source)}`);
+      details.push(
+        rosterMode
+          ? `Qualified staff present: ${evaluation.staff_count} — ${sourceLabel(sources.qualified_staff.source)}`
+          : `Qualified staff reported: ${evaluation.staff_count} — ${sourceLabel(sources.qualified_staff.source)}`,
+      );
+    } else {
+      details.push(`Children reported: ${evaluation.child_count}`);
+      details.push(`Qualified staff reported: ${evaluation.staff_count}`);
+    }
   }
   if (evaluation.required_staff !== null) {
     details.push(`Required qualified staff: ${evaluation.required_staff}`);
@@ -473,7 +539,14 @@ export function ratioStatusView(status: RatioStatus | null, nowMs: number = Date
     details.push("The configured group size is also exceeded.");
   }
   if (presence?.availability === "PRESENCE_FRESH" && presence.valid_until) {
-    details.push(`Source: Manual (operator-reported) · fresh until ${clock(presence.valid_until)}`);
+    details.push(
+      rosterMode
+        ? `Children: Manual (operator-reported) · fresh until ${clock(presence.valid_until)}`
+        : `Source: Manual (operator-reported) · fresh until ${clock(presence.valid_until)}`,
+    );
+  }
+  if (rosterMode && sources?.staff_roster && evaluation.staff_count !== null) {
+    details.push(...rosterSummaryLines(sources.staff_roster).slice(1));
   }
   const unexplained = status.reconciliation.unexplained_observed_people;
   if (unexplained) {

@@ -5,14 +5,17 @@ import { auth0 } from "../../../../lib/auth0";
 import { policyNumbers, policyPeriod, policyStatusLabel } from "../../../../lib/classrooms";
 import { UUID_PATTERN } from "../../../../lib/ring-inventory";
 import { protectedRouteRedirect } from "../../../../lib/session-policy";
+import { ROSTER_MODE } from "../../../../lib/staff-presence";
 import {
   getClassroom,
   getClassroomPresence,
   getClassroomRatioStatus,
+  getClassroomStaffPresence,
 } from "../../../../lib/veotrex-api";
 import { ClassroomControls } from "./classroom-controls";
 import { ManualPresenceCard } from "./manual-presence-card";
 import { RatioStatusCard } from "./ratio-status-card";
+import { StaffPresenceCard } from "./staff-presence-card";
 import { PolicyForm } from "./policy-form";
 
 type Props = { params: Promise<{ classroomId: string }> };
@@ -22,10 +25,11 @@ export default async function ClassroomPage({ params }: Props) {
   if (destination) redirect(destination);
   const { classroomId } = await params;
   if (!UUID_PATTERN.test(classroomId)) notFound();
-  const [room, status, presence] = await Promise.all([
+  const [room, status, presence, staffPresence] = await Promise.all([
     getClassroom(classroomId),
     getClassroomRatioStatus(classroomId),
     getClassroomPresence(classroomId),
+    getClassroomStaffPresence(classroomId),
   ]);
   if (room === null) notFound();
   const canEdit = room.can_administer;
@@ -52,7 +56,10 @@ export default async function ClassroomPage({ params }: Props) {
         classroomId={room.classroom_id}
         presence={presence}
         canReport={canEdit && active}
+        rosterMode={room.presence_source_mode === ROSTER_MODE}
       />
+
+      <StaffPresenceCard classroomId={room.classroom_id} presence={staffPresence} />
 
       <section aria-labelledby="camera-heading">
         <h2 id="camera-heading">Cameras</h2>

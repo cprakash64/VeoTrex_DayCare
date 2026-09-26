@@ -8,6 +8,7 @@ Tenant
    ├─ Area (room/building/other typed area; kind CLASSROOM = a classroom, V1-04A)
    │  ├─ ClassroomRatioPolicy (operator-configured, effective-dated; ADR 0024)
    │  ├─ ClassroomPresenceSnapshot (operator-reported counts, append-only, expiring; ADR 0025)
+   │  ├─ StaffPresenceEvent (operator check-in / refresh / check-out, append-only, leased; ADR 0026)
    │  └─ Zone
    │     └─ Camera
    ├─ CameraProviderConnection ── Camera
@@ -48,6 +49,14 @@ The first connected presence source is MANUAL (ADR 0025): an operator reports ch
 qualified staff and visitors for a room as an append-only, short-lived snapshot (30 s - 15 min,
 default 2 min). Only the latest report can be authoritative; once revoked or expired the ratio
 is `INSUFFICIENT_DATA` and no earlier report is reused.
+
+A classroom's qualified-staff count can instead come from the staff roster (ADR 0026), chosen
+explicitly per classroom (`presence_source_mode`). `StaffRatioEligibility` places a tenant-wide
+`StaffProfile` on a facility's roster and records whether an operator designated them as counting
+toward the configured classroom policy (not a verified qualification). `StaffPresenceEvent` rows
+check them into a classroom for a bounded lease (default 15 min, max 4 h); a person's latest event
+decides their single current room. Children stay a manual aggregate count, and face recognition
+never checks anyone in.
 
 ## Constraints not yet modeled
 

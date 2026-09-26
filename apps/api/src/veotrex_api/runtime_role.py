@@ -190,6 +190,17 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
         "INSERT",
         "UPDATE",
     ),
+    # V1-04C: operator ratio-eligibility designations are edited and deactivated, never deleted;
+    # staff check-in/out is a pure event stream, so the runtime can only append to it.
+    "staff_ratio_eligibility": _write(
+        "facility staff roster and counts-toward-ratio designation; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "staff_presence_events": _append(
+        "operator staff check-in / refresh / check-out events; append-only by grant"
+    ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),

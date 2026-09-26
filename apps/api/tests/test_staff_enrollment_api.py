@@ -498,4 +498,20 @@ async def test_templates_never_leave_the_api_and_logs_carry_no_biometric_materia
     # No route serves a template: the OpenAPI surface has no template path.
     paths = (await client.get("/openapi.json")).json()["paths"]
     assert not any("template" in path for path in paths)
-    assert all(path.startswith("/v1/staff") or "staff" not in path for path in paths)
+    # V1-04C adds facility- and classroom-scoped roster routes. They carry designations and
+    # check-in events only (no image, template or face data) and are enumerated here so any
+    # other staff path outside /v1/staff still fails.
+    roster_paths = {
+        "/v1/facilities/{facility_id}/staff-ratio-eligibility",
+        "/v1/facilities/{facility_id}/staff-ratio-eligibility/{eligibility_id}",
+        "/v1/facilities/{facility_id}/staff-ratio-eligibility/{eligibility_id}/deactivate",
+        "/v1/classrooms/{classroom_id}/staff-presence",
+        "/v1/classrooms/{classroom_id}/staff-presence/check-in",
+        "/v1/classrooms/{classroom_id}/staff-presence/refresh",
+        "/v1/classrooms/{classroom_id}/staff-presence/check-out",
+    }
+    assert roster_paths <= set(paths)
+    assert all(
+        path.startswith("/v1/staff") or path in roster_paths or "staff" not in path
+        for path in paths
+    )

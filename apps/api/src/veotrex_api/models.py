@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -84,6 +85,10 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
             name="fk_areas_facility_tenant",
         ),
         CheckConstraint("status IN ('ACTIVE', 'ARCHIVED')", name="ck_areas_status"),
+        CheckConstraint(
+            "presence_source_mode IN ('MANUAL_AGGREGATE', 'ROSTER_STAFF_PLUS_MANUAL_CHILDREN')",
+            name="ck_areas_presence_source_mode",
+        ),
     )
 
     facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
@@ -94,6 +99,13 @@ class Area(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
     # Operator-supplied configuration text ("Toddler", "Pre-K"). Never inferred from imagery,
     # never a child's age, never a name.
     age_band_label: Mapped[str | None] = mapped_column(String(64))
+    # Where a classroom's qualified-staff count comes from (V1-04C, ADR 0026). Explicit and
+    # operator-chosen: MANUAL_AGGREGATE is the V1-04B behaviour; ROSTER_STAFF_PLUS_MANUAL_CHILDREN
+    # takes staff from the check-in roster and children/visitors from the manual report. The two
+    # staff counts are never added together.
+    presence_source_mode: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="MANUAL_AGGREGATE", server_default="MANUAL_AGGREGATE"
+    )
 
 
 class Zone(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
@@ -883,7 +895,9 @@ class ClassroomPresenceSnapshot(Base, IdMixin, TenantOwnedMixin):
     facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     child_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    qualified_staff_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL only for a report made in roster mode (V1-04C): staff then come from the roster, and
+    # the manual row carries children and visitors alone so no staff number can be double-counted.
+    qualified_staff_count: Mapped[int | None] = mapped_column(Integer)
     visitor_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="MANUAL")
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -916,6 +930,9 @@ TENANT_OWNED_TABLES = (
     "classroom_ratio_policies",
     # V1-04B
     "classroom_presence_snapshots",
+    # V1-04C
+    "staff_ratio_eligibility",
+    "staff_presence_events",
 )
 
 # The organization-to-Tenant binding is the pre-context root of trust. Runtime roles
@@ -1042,3 +1059,173 @@ class StaffFaceTemplate(Base, IdMixin, TenantOwnedMixin):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ------------------------------------------------------ staff roster and presence (V1-04C)
+# Three separate things about an adult staff member, kept in three places on purpose:
+#   StaffProfile           - who the enrolled person is (V1-02A);
+#   StaffRatioEligibility  - whether an operator placed them on a facility's roster and whether
+#                            they count toward the configured classroom ratio;
+#   StaffPresenceEvent     - whether an operator checked them into a classroom, and until when.
+# Face recognition is none of these and writes to none of them (ADR 0026).
+
+
+class StaffRatioEligibility(Base, IdMixin, TenantOwnedMixin, TimestampMixin):
+    """An operator's designation of one staff profile at one facility (V1-04C).
+
+    ``counts_toward_ratio`` means *the operator designated this person as counting toward the
+    configured classroom policy* - not that VeoTrex verified a licence, a qualification or any
+    legal status. At most one ACTIVE row per (tenant, facility, staff), enforced by a partial
+    unique index; rows are deactivated, never deleted.
+    """
+
+    __tablename__ = "staff_ratio_eligibility"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_staff_ratio_eligibility_id_tenant"),
+        ForeignKeyConstraint(
+            ["facility_id", "tenant_id"],
+            ["facilities.id", "facilities.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_ratio_eligibility_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["staff_profile_id", "tenant_id"],
+            ["staff_profiles.id", "staff_profiles.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_ratio_eligibility_profile_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["created_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_ratio_eligibility_creator_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["deactivated_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_ratio_eligibility_deactivator_tenant",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'INACTIVE')", name="ck_staff_ratio_eligibility_status"
+        ),
+        CheckConstraint(
+            "effective_until IS NULL OR effective_until > effective_from",
+            name="ck_staff_ratio_eligibility_period",
+        ),
+        CheckConstraint("revision >= 1", name="ck_staff_ratio_eligibility_revision"),
+        CheckConstraint(
+            "(status = 'INACTIVE') = (deactivated_at IS NOT NULL) "
+            "AND (deactivated_at IS NULL) = (deactivated_by_actor_id IS NULL)",
+            name="ck_staff_ratio_eligibility_deactivation",
+        ),
+        Index(
+            "uq_staff_ratio_eligibility_active",
+            "tenant_id",
+            "facility_id",
+            "staff_profile_id",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+        Index("ix_staff_ratio_eligibility_facility", "tenant_id", "facility_id", "status"),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    staff_profile_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    counts_toward_ratio: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # Operator reference text ("per owner staffing plan 2026-09"). Never shown to the ratio
+    # engine, never audited verbatim.
+    note: Mapped[str | None] = mapped_column(String(500))
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deactivated_by_actor_id: Mapped[UUID | None] = mapped_column(Uuid)
+
+
+class StaffPresenceEvent(Base, IdMixin, TenantOwnedMixin):
+    """One operator-recorded staff check-in, refresh or check-out (V1-04C). Append-only.
+
+    No image, face, embedding, track or camera reference exists here: the source is always the
+    operator-driven STAFF_ROSTER. A person's current room is their latest event by ``sequence``;
+    ``(tenant_id, staff_profile_id, sequence)`` is unique, so two writers that saw the same state
+    cannot both commit. The runtime role may SELECT and INSERT, never UPDATE or DELETE.
+    """
+
+    __tablename__ = "staff_presence_events"
+    __table_args__ = (
+        UniqueConstraint("id", "tenant_id", name="uq_staff_presence_events_id_tenant"),
+        UniqueConstraint(
+            "tenant_id",
+            "staff_profile_id",
+            "sequence",
+            name="uq_staff_presence_events_staff_sequence",
+        ),
+        ForeignKeyConstraint(
+            ["area_id", "facility_id", "tenant_id"],
+            ["areas.id", "areas.facility_id", "areas.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_presence_events_area_facility_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["staff_profile_id", "tenant_id"],
+            ["staff_profiles.id", "staff_profiles.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_presence_events_profile_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["recorded_by_actor_id", "tenant_id"],
+            ["actors.id", "actors.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_staff_presence_events_recorder_tenant",
+        ),
+        CheckConstraint(
+            "event_type IN ('CHECKED_IN', 'REFRESHED', 'CHECKED_OUT')",
+            name="ck_staff_presence_events_type",
+        ),
+        CheckConstraint("source = 'STAFF_ROSTER'", name="ck_staff_presence_events_source"),
+        CheckConstraint("sequence >= 1", name="ck_staff_presence_events_sequence"),
+        CheckConstraint(
+            "(event_type = 'CHECKED_OUT') = (valid_until IS NULL)",
+            name="ck_staff_presence_events_lease_presence",
+        ),
+        CheckConstraint(
+            "valid_until IS NULL OR (valid_until >= occurred_at + interval '60 seconds' "
+            "AND valid_until <= occurred_at + interval '4 hours')",
+            name="ck_staff_presence_events_lease_bounds",
+        ),
+        CheckConstraint(
+            "occurred_at <= created_at + interval '120 seconds'",
+            name="ck_staff_presence_events_not_future",
+        ),
+        CheckConstraint(
+            "checked_in_at <= occurred_at "
+            "AND (event_type <> 'CHECKED_IN' OR checked_in_at = occurred_at)",
+            name="ck_staff_presence_events_session_start",
+        ),
+        Index(
+            "ix_staff_presence_events_classroom",
+            "tenant_id",
+            "area_id",
+            text("occurred_at DESC"),
+            text("sequence DESC"),
+        ),
+    )
+
+    facility_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    area_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    staff_profile_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="STAFF_ROSTER")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The lease: CHECKED_IN / REFRESHED only. Presence is never trusted past it.
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the current stay in the room began; carried forward by REFRESHED.
+    checked_in_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_by_actor_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

@@ -313,3 +313,89 @@ export async function revokeManualPresence(classroomId: string, snapshotId: stri
     { method: "POST" },
   );
 }
+
+// -------------------------------------------------- staff roster and staff check-in (V1-04C)
+import type {
+  ClassroomStaffPresence,
+  EligibilityCreatePayload,
+  EligibilityUpdatePayload,
+  FacilityRoster,
+  PresenceMode,
+  StaffPresencePayload,
+} from "./staff-presence";
+
+export async function getClassroomStaffPresence(classroomId: string): Promise<ClassroomStaffPresence | null> {
+  const response = await authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/staff-presence`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomStaffPresence;
+}
+
+export async function recordStaffPresence(
+  classroomId: string,
+  action: "check-in" | "check-out" | "refresh",
+  payload: StaffPresencePayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/staff-presence/${action}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function setPresenceSourceMode(classroomId: string, mode: PresenceMode): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence-source-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function getFacilityRoster(
+  facilityId: string,
+  staffProfileId?: string,
+): Promise<FacilityRoster | null> {
+  const query = staffProfileId ? `?${new URLSearchParams({ staff_profile_id: staffProfileId })}` : "";
+  const response = await authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility${query}`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as FacilityRoster;
+}
+
+export async function createEligibility(
+  facilityId: string,
+  payload: EligibilityCreatePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateEligibility(
+  facilityId: string,
+  eligibilityId: string,
+  payload: EligibilityUpdatePayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility/${encodeURIComponent(eligibilityId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deactivateEligibility(facilityId: string, eligibilityId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility/${encodeURIComponent(eligibilityId)}/deactivate`,
+    { method: "POST" },
+  );
+}

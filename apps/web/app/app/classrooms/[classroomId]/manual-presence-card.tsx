@@ -24,16 +24,22 @@ export function ManualPresenceCard({
   classroomId,
   presence,
   canReport,
+  rosterMode = false,
 }: {
   classroomId: string;
   presence: ClassroomPresence | null;
   canReport: boolean;
+  // V1-04C: staff are counted from check-ins, so this form reports children and visitors only.
+  rosterMode?: boolean;
 }) {
   const router = useRouter();
   const current = presence?.current ?? null;
   const [values, setValues] = useState<ManualPresenceForm>({
     child_count: current && !current.revoked_at ? String(current.child_count) : "",
-    qualified_staff_count: current && !current.revoked_at ? String(current.qualified_staff_count) : "",
+    qualified_staff_count:
+      current && !current.revoked_at && current.qualified_staff_count !== null
+        ? String(current.qualified_staff_count)
+        : "",
     visitor_count: current && !current.revoked_at ? String(current.visitor_count) : "0",
     valid_for_seconds: String(DEFAULT_VALIDITY_SECONDS),
   });
@@ -68,7 +74,7 @@ export function ManualPresenceCard({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const checked = validateManualPresence(values);
+    const checked = validateManualPresence(values, rosterMode);
     if (!checked.ok) {
       setErrors(checked.errors);
       return;
@@ -90,8 +96,11 @@ export function ManualPresenceCard({
         <ul aria-label="Current manual presence report">
           <li>Source: Manual (operator-reported){current.submitted_by_caller ? " · reported by you" : ""}</li>
           <li>
-            Children {current.child_count} · qualified staff {current.qualified_staff_count} · visitors{" "}
-            {current.visitor_count}
+            Children {current.child_count} ·{" "}
+            {rosterMode || current.qualified_staff_count === null
+              ? "qualified staff from staff check-ins"
+              : `qualified staff ${current.qualified_staff_count}`}{" "}
+            · visitors {current.visitor_count}
           </li>
           <li>Reported at {new Date(current.observed_at).toLocaleTimeString()}</li>
           <li>Valid until {new Date(current.valid_until).toLocaleTimeString()}</li>
@@ -105,7 +114,10 @@ export function ManualPresenceCard({
       )}
       {canReport ? (
         <form className="stack" onSubmit={submit} noValidate>
-          {COUNT_FIELDS.map((field) => (
+          {rosterMode ? (
+            <p className="staff-meta">Qualified staff are counted from staff check-ins in this classroom.</p>
+          ) : null}
+          {COUNT_FIELDS.filter((field) => !rosterMode || field.key !== "qualified_staff_count").map((field) => (
             <div key={field.key}>
               <label htmlFor={`presence-${field.key}`}>{field.label}</label>
               <input

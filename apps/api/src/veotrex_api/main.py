@@ -73,6 +73,8 @@ from veotrex_api.staff_api import (
 )
 from veotrex_api.staff_media import ALLOWED_MEDIA_TYPES, StaffMediaStore
 from veotrex_api.staff_recognition import StaffRecognitionService
+from veotrex_api.staff_roster_api import register_staff_roster_routes
+from veotrex_api.staff_roster_service import StaffRosterService
 from veotrex_api.staff_service import StaffEnrollmentService
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
@@ -375,6 +377,11 @@ def create_app(
     # Classrooms and configured ratio policies (V1-04A).
     app.state.classroom_service = ClassroomService(resolved_factory)
     register_classroom_routes(app, app.state.classroom_service)
+    # Facility staff roster, ratio eligibility and operator staff check-in/out (V1-04C). Always
+    # registered and independent of the face backend: presence is recorded by an operator, never
+    # by recognition.
+    app.state.staff_roster_service = StaffRosterService(resolved_factory)
+    register_staff_roster_routes(app, app.state.staff_roster_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,

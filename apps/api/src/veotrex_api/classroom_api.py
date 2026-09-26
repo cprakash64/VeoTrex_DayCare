@@ -80,11 +80,14 @@ class PolicyRequest(BaseModel):
 
 class ManualPresenceRequest(BaseModel):
     """Aggregate counts only. There is deliberately no field for a name, an identifier of a
-    person, a timestamp (the server's clock is used) or a camera observation."""
+    person, a timestamp (the server's clock is used) or a camera observation.
+
+    ``qualified_staff_count`` is required in MANUAL_AGGREGATE mode and refused in roster mode,
+    where the staff count comes from check-ins (V1-04C); the service decides, per classroom."""
 
     model_config = ConfigDict(extra="forbid")
     child_count: int = Field(strict=True)
-    qualified_staff_count: int = Field(strict=True)
+    qualified_staff_count: int | None = Field(default=None, strict=True)
     visitor_count: int = Field(default=0, strict=True)
     valid_for_seconds: int = Field(default=MANUAL_DEFAULT_VALIDITY_SECONDS, strict=True)
 
@@ -101,7 +104,7 @@ class PresenceReportResponse(BaseModel):
     snapshot_id: str
     source: str
     child_count: int
-    qualified_staff_count: int
+    qualified_staff_count: int | None
     visitor_count: int
     observed_at: str
     valid_until: str
@@ -192,8 +195,14 @@ class ClassroomResponse(BaseModel):
     current_policy_id: str | None
     can_administer: bool
     policy_basis: str = "CONFIGURED_CLASSROOM_POLICY"
+    presence_source_mode: str
     created_at: str
     updated_at: str
+
+
+class PresenceSourceModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: str = Field(min_length=1, max_length=40)
 
 
 def _policy(value: PolicySummary) -> PolicyResponse:
@@ -242,6 +251,7 @@ def _classroom(value: ClassroomSummary) -> ClassroomResponse:
         policies=[_policy(policy) for policy in value.policies],
         current_policy_id=None if value.current_policy_id is None else str(value.current_policy_id),
         can_administer=value.can_administer,
+        presence_source_mode=value.presence_source_mode,
         created_at=value.created_at.isoformat(),
         updated_at=value.updated_at.isoformat(),
     )
@@ -373,6 +383,24 @@ def register_classroom_routes(app: FastAPI, service: ClassroomService) -> None:
             return _classroom(
                 await service.set_classroom_active(
                     context.principal, classroom_id, False, _request_id(request)
+                )
+            )
+        except ClassroomError as exc:
+            raise _http(exc) from None
+
+    @app.post(
+        "/v1/classrooms/{classroom_id}/presence-source-mode", response_model=ClassroomResponse
+    )
+    async def set_presence_source_mode(
+        classroom_id: UUID,
+        payload: PresenceSourceModeRequest,
+        request: Request,
+        context: Annotated[PrincipalContext, Depends(require_administer_facility)],
+    ) -> ClassroomResponse:
+        try:
+            return _classroom(
+                await service.set_presence_source_mode(
+                    context.principal, classroom_id, payload.mode, _request_id(request)
                 )
             )
         except ClassroomError as exc:

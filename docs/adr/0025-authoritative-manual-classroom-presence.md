@@ -153,6 +153,10 @@ append-only.
 
 ### Source precedence is deferred on purpose
 
+(Decided for QUALIFIED_STAFF by ADR 0026: an explicit per-classroom `presence_source_mode`; staff
+come from the manual report or from the check-in roster, never both. CHILD and VISITOR stay
+MANUAL; STAFF_RECOGNITION and vision are never authoritative.)
+
 MANUAL is the only connected source, and the latest report wins. Future adapters would plug in as
 `PresenceCount` producers:
 

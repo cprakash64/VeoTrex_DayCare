@@ -641,12 +641,16 @@ class PresenceAvailability(StrEnum):
     PRESENCE_NOT_YET_VALID = "PRESENCE_NOT_YET_VALID"  # timestamped beyond the permitted skew
 
 
-def validate_manual_counts(children: int, qualified_staff: int, visitors: int) -> None:
-    for value, maximum, category in (
-        (children, MANUAL_MAX_CHILDREN, "invalid_child_count"),
-        (qualified_staff, MANUAL_MAX_QUALIFIED_STAFF, "invalid_qualified_staff_count"),
-        (visitors, MANUAL_MAX_VISITORS, "invalid_visitor_count"),
-    ):
+def validate_manual_counts(children: int, qualified_staff: int | None, visitors: int) -> None:
+    """``qualified_staff`` is None only for a roster-mode report (V1-04C): the staff count then
+    comes from the check-in roster and the manual report carries none."""
+    checks: list[tuple[int, int, str]] = [(children, MANUAL_MAX_CHILDREN, "invalid_child_count")]
+    if qualified_staff is not None:
+        checks.append(
+            (qualified_staff, MANUAL_MAX_QUALIFIED_STAFF, "invalid_qualified_staff_count")
+        )
+    checks.append((visitors, MANUAL_MAX_VISITORS, "invalid_visitor_count"))
+    for value, maximum, category in checks:
         if not _strict_int(value) or not 0 <= value <= maximum:
             raise RatioPolicyError(category)
 
@@ -665,7 +669,7 @@ class ManualPresenceRecord:
     snapshot_id: UUID
     classroom_id: UUID
     child_count: int
-    qualified_staff_count: int
+    qualified_staff_count: int | None  # None: reported in roster mode (V1-04C)
     visitor_count: int
     observed_at: datetime
     valid_until: datetime
@@ -697,7 +701,8 @@ class ManualPresenceRecord:
 
     def to_snapshot(self) -> PresenceSnapshot:
         """Explicit role slots from an explicit MANUAL source. Nothing else is filled: there is
-        no UNKNOWN count here, and nothing from a camera."""
+        no UNKNOWN count here, and nothing from a camera. A roster-mode report has no staff
+        count, so its staff slot stays empty rather than becoming zero."""
 
         def count(role: PresenceRole, value: int) -> PresenceCount:
             return PresenceCount(
@@ -712,7 +717,9 @@ class ManualPresenceRecord:
         return PresenceSnapshot(
             self.classroom_id,
             children=count(PresenceRole.CHILD, self.child_count),
-            qualified_staff=count(PresenceRole.QUALIFIED_STAFF, self.qualified_staff_count),
+            qualified_staff=None
+            if self.qualified_staff_count is None
+            else count(PresenceRole.QUALIFIED_STAFF, self.qualified_staff_count),
             visitors=count(PresenceRole.VISITOR, self.visitor_count),
         )
 
