@@ -271,7 +271,9 @@ describe("child UI source guarantees (V1-04D)", () => {
       for (const forbidden of ["<img", "<video", 'type="file"', "FormData", "getUserMedia", "date_of_birth", "dateOfBirth"]) {
         expect(text, file).not.toContain(forbidden);
       }
-      expect(text, file).not.toMatch(/face_|faceMatch|photo_|guardian[_A-Z]|embedding[_A-Z]|biometric[_A-Z]|recognition-test|runRecognitionTest|track_id/);
+      // V1-04E added a non-biometric guardian association (ids, names, labels and dates only), so
+      // guardian identifiers are allowed here; guardians.test.ts pins what that UI may not do.
+      expect(text, file).not.toMatch(/face_|faceMatch|photo_|embedding[_A-Z]|biometric[_A-Z]|recognition-test|runRecognitionTest|track_id/);
     }
   });
 

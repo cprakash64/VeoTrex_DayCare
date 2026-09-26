@@ -58,6 +58,9 @@ def test_all_expected_customer_tables_are_tenant_owned() -> None:
         "staff_presence_events",
         "child_profiles",
         "child_attendance_events",
+        "guardian_contacts",
+        "child_guardian_links",
+        "child_release_events",
     }
 
 

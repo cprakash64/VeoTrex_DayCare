@@ -212,6 +212,23 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "child_attendance_events": _append(
         "operator child attendance check-in / refresh / check-out events; append-only by grant"
     ),
+    # V1-04E: guardian contacts and their child links are edited and deactivated, never
+    # deleted; an authorized release is a pure event the runtime can only append.
+    "guardian_contacts": _write(
+        "facility guardian/contact roster: display name, status, external reference; never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_guardian_links": _write(
+        "child <-> contact association and pickup authorization; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_release_events": _append(
+        "authorized child release records paired with their check-out; append-only by grant"
+    ),
     # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
     # Nodes and assignments are still managed only by the admin identity.
     "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),

@@ -61,6 +61,8 @@ export type AttendanceEvent = Readonly<{
   occurred_at: string;
   valid_until: string | null;
   recorded_by_caller: boolean;
+  // V1-04E: true only for the check-out of an authorized release.
+  released: boolean;
 }>;
 
 export type ClassroomAttendance = Readonly<{

@@ -4,14 +4,14 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import {
-  type ChildSummary,
-  childErrorMessage,
-  childStatusLabel,
-  type FacilityChildren,
-  validateChildForm,
-} from "../../../lib/children";
+  type FacilityGuardians,
+  type GuardianSummary,
+  guardianErrorMessage,
+  guardianStatusLabel,
+  validateGuardianForm,
+} from "../../../lib/guardians";
 
-function ChildForm({
+function GuardianForm({
   submitLabel,
   initial,
   busy,
@@ -28,7 +28,7 @@ function ChildForm({
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const checked = validateChildForm(name, reference);
+    const checked = validateGuardianForm(name, reference);
     if (!checked.ok) {
       setErrors(checked.errors);
       return;
@@ -51,7 +51,7 @@ function ChildForm({
       </label>
       {errors.display_name ? <p className="field-error">{errors.display_name}</p> : null}
       <label>
-        Reference in your attendance system (optional)
+        Reference in your own records (optional)
         <input
           value={reference}
           maxLength={64}
@@ -69,11 +69,10 @@ function ChildForm({
 }
 
 /**
- * One facility's child roster (V1-04D). Operators add, rename, deactivate, reactivate and
- * archive entries. There is deliberately no photo, date-of-birth or camera field; authorized
- * pickup people are managed on each child's own page (V1-04E).
+ * One facility's adult contacts (V1-04E). Operators add, rename, deactivate, reactivate and
+ * archive entries. There is deliberately no photo, identity-document, phone, email or camera field.
  */
-export function ChildRosterPanel({ roster, canAdd }: { roster: FacilityChildren; canAdd: boolean }) {
+export function GuardianRosterPanel({ roster, canAdd }: { roster: FacilityGuardians; canAdd: boolean }) {
   const router = useRouter();
   const [working, setWorking] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -88,54 +87,63 @@ export function ChildRosterPanel({ roster, canAdd }: { roster: FacilityChildren;
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const result = (await response.json()) as { category?: string | null };
-      if (!response.ok) setMessage(childErrorMessage(result.category));
+      if (!response.ok) setMessage(guardianErrorMessage(result.category));
       else router.refresh();
     } catch {
-      setMessage(childErrorMessage(null));
+      setMessage(guardianErrorMessage(null));
     } finally {
       setWorking(null);
     }
   }
 
   const busy = working !== null;
-  const lifecycle = (child: ChildSummary) => {
+  const lifecycle = (contact: GuardianSummary) => {
     const verbs: Array<{ verb: string; label: string; danger?: boolean }> = [];
-    if (child.status === "ACTIVE") verbs.push({ verb: "deactivate", label: "Deactivate" });
-    if (child.status === "INACTIVE") verbs.push({ verb: "activate", label: "Reactivate" });
-    if (child.status !== "ARCHIVED") verbs.push({ verb: "archive", label: "Archive", danger: true });
+    if (contact.status === "ACTIVE") verbs.push({ verb: "deactivate", label: "Deactivate" });
+    if (contact.status === "INACTIVE") verbs.push({ verb: "activate", label: "Reactivate" });
+    if (contact.status !== "ARCHIVED") verbs.push({ verb: "archive", label: "Archive", danger: true });
     return verbs;
   };
 
   return (
-    <section aria-labelledby={`children-${roster.facility_id}`}>
-      <h2 id={`children-${roster.facility_id}`}>{roster.facility_name}</h2>
-      {roster.children.length === 0 ? <p>No children on this roster yet.</p> : null}
-      <ul className="staff-list" aria-label={`Child roster for ${roster.facility_name}`}>
-        {roster.children.map((child) => (
-          <li className="staff-row" key={child.child_id}>
+    <section aria-labelledby={`contacts-${roster.facility_id}`}>
+      <h2 id={`contacts-${roster.facility_id}`}>{roster.facility_name}</h2>
+      {roster.guardians.length === 0 ? <p>No contacts at this facility yet.</p> : null}
+      <ul className="staff-list" aria-label={`Contacts at ${roster.facility_name}`}>
+        {roster.guardians.map((contact) => (
+          <li className="staff-row" key={contact.guardian_contact_id}>
             <div>
-              <h3>{child.display_name}</h3>
+              <h3>{contact.display_name}</h3>
               <p className="staff-meta">
-                {child.external_reference ? `Reference ${child.external_reference}` : "No external reference"} ·{" "}
-                <a href={`/app/children/${child.child_id}`}>Authorized pickup people</a>
+                {contact.active_link_count === 1
+                  ? "Associated with 1 child"
+                  : `Associated with ${contact.active_link_count} children`}
+                {contact.external_reference ? ` · Reference ${contact.external_reference}` : ""}
               </p>
-              {child.can_administer && child.status !== "ARCHIVED" ? (
+              {contact.can_administer && contact.status !== "ARCHIVED" ? (
                 <details>
                   <summary>Edit or change status</summary>
-                  <ChildForm
+                  <GuardianForm
                     submitLabel="Save"
                     busy={busy}
-                    initial={{ display_name: child.display_name, external_reference: child.external_reference ?? "" }}
-                    onSubmit={(value) => send(`edit:${child.child_id}`, `/api/children/${child.child_id}`, "PATCH", value)}
+                    initial={{
+                      display_name: contact.display_name,
+                      external_reference: contact.external_reference ?? "",
+                    }}
+                    onSubmit={(value) =>
+                      send(`edit:${contact.guardian_contact_id}`, `/api/guardians/${contact.guardian_contact_id}`, "PATCH", value)
+                    }
                   />
                   <p>
-                    {lifecycle(child).map(({ verb, label, danger }) => (
+                    {lifecycle(contact).map(({ verb, label, danger }) => (
                       <button
                         key={verb}
                         className={danger ? "secondary danger" : "secondary"}
                         type="button"
                         disabled={busy}
-                        onClick={() => send(`${verb}:${child.child_id}`, `/api/children/${child.child_id}/${verb}`, "POST")}
+                        onClick={() =>
+                          send(`${verb}:${contact.guardian_contact_id}`, `/api/guardians/${contact.guardian_contact_id}/${verb}`, "POST")
+                        }
                       >
                         {label}
                       </button>
@@ -144,18 +152,20 @@ export function ChildRosterPanel({ roster, canAdd }: { roster: FacilityChildren;
                 </details>
               ) : null}
             </div>
-            <span className={`badge ${child.status === "ACTIVE" ? "ready" : "inactive"}`}>{childStatusLabel(child.status)}</span>
+            <span className={`badge ${contact.status === "ACTIVE" ? "ready" : "inactive"}`}>
+              {guardianStatusLabel(contact.status)}
+            </span>
           </li>
         ))}
       </ul>
       {canAdd ? (
         <details>
-          <summary>Add a child to this roster</summary>
-          <ChildForm
-            submitLabel="Add child"
+          <summary>Add a contact</summary>
+          <GuardianForm
+            submitLabel="Add contact"
             busy={busy}
             initial={{ display_name: "", external_reference: "" }}
-            onSubmit={(value) => send("add", `/api/facilities/${roster.facility_id}/children`, "POST", value)}
+            onSubmit={(value) => send("add", `/api/facilities/${roster.facility_id}/guardians`, "POST", value)}
           />
         </details>
       ) : null}

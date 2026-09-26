@@ -117,6 +117,9 @@ class AttendanceEventResponse(BaseModel):
     occurred_at: str
     valid_until: str | None
     recorded_by_caller: bool
+    # True for the CHECKED_OUT event of an authorized release (V1-04E); every other check-out
+    # is an administrative one and never looks like a pickup.
+    released: bool
 
 
 class AttendanceResponse(BaseModel):
@@ -160,7 +163,7 @@ def _children(value: FacilityChildren) -> FacilityChildrenResponse:
     )
 
 
-def _attendance(value: ClassroomAttendance) -> AttendanceResponse:
+def attendance_response(value: ClassroomAttendance) -> AttendanceResponse:
     return AttendanceResponse(
         classroom_id=str(value.classroom_id),
         facility_id=str(value.facility_id),
@@ -199,6 +202,7 @@ def _attendance(value: ClassroomAttendance) -> AttendanceResponse:
                 occurred_at=event.occurred_at.isoformat(),
                 valid_until=_iso(event.valid_until),
                 recorded_by_caller=event.recorded_by_caller,
+                released=event.released,
             )
             for event in value.recent_events
         ],
@@ -335,7 +339,9 @@ def register_child_roster_routes(app: FastAPI, service: ChildRosterService) -> N
         context: Annotated[PrincipalContext, Depends(require_read_operational)],
     ) -> AttendanceResponse:
         try:
-            return _attendance(await service.get_attendance(context.principal, classroom_id))
+            return attendance_response(
+                await service.get_attendance(context.principal, classroom_id)
+            )
         except ClassroomError as exc:
             raise _http(exc) from None
 
@@ -347,7 +353,7 @@ def register_child_roster_routes(app: FastAPI, service: ChildRosterService) -> N
         context: Annotated[PrincipalContext, Depends(require_administer_facility)],
     ) -> AttendanceResponse:
         try:
-            return _attendance(
+            return attendance_response(
                 await service.check_in(
                     context.principal,
                     classroom_id,
@@ -367,7 +373,7 @@ def register_child_roster_routes(app: FastAPI, service: ChildRosterService) -> N
         context: Annotated[PrincipalContext, Depends(require_administer_facility)],
     ) -> AttendanceResponse:
         try:
-            return _attendance(
+            return attendance_response(
                 await service.refresh(
                     context.principal,
                     classroom_id,
@@ -387,7 +393,7 @@ def register_child_roster_routes(app: FastAPI, service: ChildRosterService) -> N
         context: Annotated[PrincipalContext, Depends(require_administer_facility)],
     ) -> AttendanceResponse:
         try:
-            return _attendance(
+            return attendance_response(
                 await service.check_out(
                     context.principal, classroom_id, payload.child_profile_id, _request_id(request)
                 )

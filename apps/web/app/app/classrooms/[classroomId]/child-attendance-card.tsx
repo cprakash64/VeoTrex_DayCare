@@ -11,7 +11,9 @@ import {
   type ClassroomAttendance,
   DEFAULT_ATTENDANCE_LEASE_SECONDS,
 } from "../../../../lib/children";
+import type { ReleaseOptions } from "../../../../lib/guardians";
 import { ATTENDANCE_MODE } from "../../../../lib/staff-presence";
+import { ChildRelease } from "./child-release";
 
 const EVENT_LABELS: Readonly<Record<string, string>> = {
   CHECKED_IN: "Checked in",
@@ -27,9 +29,11 @@ const EVENT_LABELS: Readonly<Record<string, string>> = {
 export function ChildAttendanceCard({
   classroomId,
   attendance,
+  releaseOptions,
 }: {
   classroomId: string;
   attendance: ClassroomAttendance | null;
+  releaseOptions: ReleaseOptions | null;
 }) {
   const router = useRouter();
   const [now, setNow] = useState(() => Date.now());
@@ -50,6 +54,7 @@ export function ChildAttendanceCard({
     );
   }
   const canEdit = attendance.can_administer && attendance.classroom_active;
+  const releasable = new Map((releaseOptions?.children ?? []).map((item) => [item.child_profile_id, item]));
   const counted = attendance.presence_source_mode === ATTENDANCE_MODE;
 
   async function act(action: "check-in" | "check-out" | "refresh", childId: string) {
@@ -118,6 +123,7 @@ export function ChildAttendanceCard({
           {attendance.children.map((entry) => {
             const view = attendanceEntryView(entry, now);
             const busy = working !== null;
+            const release = view.state === "here" ? releasable.get(entry.child_profile_id) : undefined;
             return (
               <li className="staff-row" key={entry.child_profile_id}>
                 <div>
@@ -153,17 +159,27 @@ export function ChildAttendanceCard({
                           Refresh
                         </button>
                       ) : null}{" "}
-                      {view.canCheckOut ? (
-                        <button
-                          className="secondary danger"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => act("check-out", entry.child_profile_id)}
-                        >
-                          Check out
-                        </button>
-                      ) : null}
                     </p>
+                  ) : null}
+                  {canEdit && release ? (
+                    <ChildRelease classroomId={classroomId} childName={entry.display_name} options={release} disabled={busy} />
+                  ) : null}
+                  {canEdit && view.canCheckOut ? (
+                    <details>
+                      <summary>Correction</summary>
+                      <p className="staff-meta">
+                        An administrative check-out records that the child left this room without a pickup
+                        record - for example to correct a mistake. Use Release child for a normal pickup.
+                      </p>
+                      <button
+                        className="secondary danger"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => act("check-out", entry.child_profile_id)}
+                      >
+                        Administrative check-out
+                      </button>
+                    </details>
                   ) : null}
                 </div>
                 <span className={`badge ${view.tone}`}>
@@ -182,7 +198,7 @@ export function ChildAttendanceCard({
             {attendance.recent_events.map((event) => (
               <li key={event.event_id}>
                 {new Date(event.occurred_at).toLocaleTimeString()} · {event.display_name} ·{" "}
-                {EVENT_LABELS[event.event_type] ?? event.event_type}
+                {event.released ? "Released to an authorized adult" : (EVENT_LABELS[event.event_type] ?? event.event_type)}
                 {event.recorded_by_caller ? " · by you" : ""}
               </li>
             ))}

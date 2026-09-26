@@ -12,6 +12,7 @@ import {
   getClassroomPresence,
   getClassroomRatioStatus,
   getClassroomStaffPresence,
+  getReleaseOptions,
 } from "../../../../lib/veotrex-api";
 import { ChildAttendanceCard } from "./child-attendance-card";
 import { ClassroomControls } from "./classroom-controls";
@@ -28,12 +29,13 @@ export default async function ClassroomPage({ params }: Props) {
   if (destination) redirect(destination);
   const { classroomId } = await params;
   if (!UUID_PATTERN.test(classroomId)) notFound();
-  const [room, status, presence, staffPresence, attendance] = await Promise.all([
+  const [room, status, presence, staffPresence, attendance, releaseOptions] = await Promise.all([
     getClassroom(classroomId),
     getClassroomRatioStatus(classroomId),
     getClassroomPresence(classroomId),
     getClassroomStaffPresence(classroomId),
     getClassroomAttendance(classroomId),
+    getReleaseOptions(classroomId),
   ]);
   if (room === null) notFound();
   const canEdit = room.can_administer;
@@ -71,7 +73,7 @@ export default async function ClassroomPage({ params }: Props) {
         canEdit={canEdit}
       />
 
-      <ChildAttendanceCard classroomId={room.classroom_id} attendance={attendance} />
+      <ChildAttendanceCard classroomId={room.classroom_id} attendance={attendance} releaseOptions={releaseOptions} />
 
       <StaffPresenceCard classroomId={room.classroom_id} presence={staffPresence} />
 

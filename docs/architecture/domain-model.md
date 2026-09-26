@@ -64,15 +64,23 @@ A classroom can also take its child count from attendance (ADR 0027,
 display name for operators' own screens, a status and an optional external reference - with no
 photo, biometric, date of birth or guardian data. `ChildAttendanceEvent` rows check a child into a
 classroom for 30 min - 12 h (default 12 h); the latest event decides the single current
-classroom. Cameras never create or change attendance. Parent/guardian association is not modelled
-yet.
+classroom. Cameras never create or change attendance.
+
+Pickup is modelled without biometrics (ADR 0028). `GuardianContact` is a facility-scoped adult
+contact (display name, status, optional external reference - no photo, document, phone or
+email). `ChildGuardianLink` associates a contact with a child: an operator relationship label with
+no legal meaning, and separately a `pickup_authorized` flag with an effective period.
+`ChildReleaseEvent` is the append-only record of an authorized release, tied by composite FK to the
+exact CHECKED_OUT attendance event and the exact link that authorized it. A direct check-out stays
+an administrative action and never creates a release.
 
 ## Constraints not yet modeled
 
 - Facility/building is represented by typed `Area`; whether Building deserves a separate entity is open.
 - Actor roles are placeholders pending the authorization model.
 - Tenant-specific activation of approved global policy versions requires a future effective-dated binding.
-- Guardian/parent, pickup authorization, incident and media entities are non-goals. Staff persons
+- Incident and media entities are non-goals. Guardian contacts and pickup authorization are
+  operator records (V1-04E, ADR 0028), never camera or biometric identities. Staff persons
   and their biometric templates were added in V1-02A (ADR 0019). Children exist only as
   facility roster entries with operator attendance events (V1-04D, ADR 0027) - never as a
   camera, face or biometric identity - and the ratio engine sees only aggregate counts.

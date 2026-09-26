@@ -48,6 +48,8 @@ from veotrex_api.face_backend import (
     backend_for,
     supports_recognition,
 )
+from veotrex_api.guardian_api import register_guardian_routes
+from veotrex_api.guardian_service import GuardianService
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.request_media import (
@@ -388,6 +390,10 @@ def create_app(
     # independent of any camera or face backend, and never reachable by an edge credential.
     app.state.child_roster_service = ChildRosterService(resolved_factory)
     register_child_roster_routes(app, app.state.child_roster_service)
+    # Guardian contacts, child associations and authorized release (V1-04E). Human routes only;
+    # no camera, face backend or edge credential can reach them, and no route accepts an image.
+    app.state.guardian_service = GuardianService(resolved_factory)
+    register_guardian_routes(app, app.state.guardian_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,

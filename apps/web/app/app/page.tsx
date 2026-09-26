@@ -29,6 +29,7 @@ export default async function ApplicationShell() {
         <Link className="primary" href="/app/staff">Teachers &amp; staff</Link>
         <Link className="secondary" href="/app/classrooms">Classrooms &amp; configured policies</Link>
         <Link className="secondary" href="/app/children">Child rosters</Link>
+        <Link className="secondary" href="/app/guardians">Guardians &amp; contacts</Link>
         <a className="secondary" href="/app/integrations/ring/devices">Ring device inventory</a>
       </nav>
     </main>

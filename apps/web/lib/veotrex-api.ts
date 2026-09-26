@@ -455,3 +455,90 @@ export async function recordAttendance(
     body: JSON.stringify(payload),
   });
 }
+
+// --------------------------------------- guardian contacts, links and release (V1-04E)
+import type { ChildSummary } from "./children";
+import type {
+  ChildGuardians,
+  FacilityGuardians,
+  GuardianPayload,
+  GuardianUpdatePayload,
+  LinkPayload,
+  LinkUpdatePayload,
+  ReleaseHistory,
+  ReleaseOptions,
+  ReleasePayload,
+} from "./guardians";
+
+async function jsonOrNull<T>(path: string): Promise<T | null> {
+  const response = await authorizedFetch(path);
+  if (!response.ok) return null;
+  return (await response.json()) as T;
+}
+
+function sendJson(path: string, method: "POST" | "PATCH", payload?: unknown): Promise<Response> {
+  return authorizedFetch(path, {
+    method,
+    ...(payload === undefined
+      ? {}
+      : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
+  });
+}
+
+export async function getChild(childId: string): Promise<ChildSummary | null> {
+  return jsonOrNull<ChildSummary>(`/v1/children/${encodeURIComponent(childId)}`);
+}
+
+export async function getFacilityGuardians(facilityId: string): Promise<FacilityGuardians | null> {
+  return jsonOrNull<FacilityGuardians>(`/v1/facilities/${encodeURIComponent(facilityId)}/guardians`);
+}
+
+export async function createGuardian(facilityId: string, payload: GuardianPayload): Promise<Response> {
+  return sendJson(`/v1/facilities/${encodeURIComponent(facilityId)}/guardians`, "POST", payload);
+}
+
+export async function updateGuardian(guardianId: string, payload: GuardianUpdatePayload): Promise<Response> {
+  return sendJson(`/v1/guardians/${encodeURIComponent(guardianId)}`, "PATCH", payload);
+}
+
+export async function setGuardianStatus(
+  guardianId: string,
+  verb: "activate" | "deactivate" | "archive",
+): Promise<Response> {
+  return sendJson(`/v1/guardians/${encodeURIComponent(guardianId)}/${verb}`, "POST");
+}
+
+export async function getChildGuardians(childId: string): Promise<ChildGuardians | null> {
+  return jsonOrNull<ChildGuardians>(`/v1/children/${encodeURIComponent(childId)}/guardians`);
+}
+
+export async function createChildLink(childId: string, payload: LinkPayload): Promise<Response> {
+  return sendJson(`/v1/children/${encodeURIComponent(childId)}/guardians`, "POST", payload);
+}
+
+export async function updateChildLink(childId: string, linkId: string, payload: LinkUpdatePayload): Promise<Response> {
+  return sendJson(
+    `/v1/children/${encodeURIComponent(childId)}/guardians/${encodeURIComponent(linkId)}`,
+    "PATCH",
+    payload,
+  );
+}
+
+export async function deactivateChildLink(childId: string, linkId: string): Promise<Response> {
+  return sendJson(
+    `/v1/children/${encodeURIComponent(childId)}/guardians/${encodeURIComponent(linkId)}/deactivate`,
+    "POST",
+  );
+}
+
+export async function getReleaseHistory(childId: string): Promise<ReleaseHistory | null> {
+  return jsonOrNull<ReleaseHistory>(`/v1/children/${encodeURIComponent(childId)}/release-history`);
+}
+
+export async function getReleaseOptions(classroomId: string): Promise<ReleaseOptions | null> {
+  return jsonOrNull<ReleaseOptions>(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/release-options`);
+}
+
+export async function releaseChild(classroomId: string, payload: ReleasePayload): Promise<Response> {
+  return sendJson(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/release`, "POST", payload);
+}

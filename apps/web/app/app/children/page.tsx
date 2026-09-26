@@ -6,7 +6,8 @@ import { getFacilities, getFacilityChildren } from "../../../lib/veotrex-api";
 import { ChildRosterPanel } from "./child-roster-panel";
 
 // Facility child rosters (V1-04D). Names and optional identifiers only: no photographs, no
-// biometrics, no dates of birth and no guardians. Shown to authenticated operators only.
+// biometrics and no dates of birth. Authorized pickup people live on each child's page (V1-04E).
+// Shown to authenticated operators only.
 export default async function ChildrenPage() {
   const destination = protectedRouteRedirect(await auth0.getSession());
   if (destination) redirect(destination);
@@ -25,8 +26,8 @@ export default async function ChildrenPage() {
       <p>
         A roster entry lets staff check a child into a classroom so attendance can supply the child count.
         It holds a name your staff recognise and, optionally, an identifier from your own attendance
-        system. VeoTrex stores no photographs, faces, dates of birth or guardian details, and cameras never
-        identify children.
+        system. Open a child to manage who is authorized to collect them. VeoTrex stores no photographs,
+        faces or dates of birth, and cameras never identify children or the adults who collect them.
       </p>
       {facilities.length === 0 ? <p>No facility is available to you.</p> : null}
       {facilities.map((facility, index) => {

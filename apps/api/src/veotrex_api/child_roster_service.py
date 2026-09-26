@@ -59,12 +59,22 @@ from veotrex_api.classroom_service import (
     ClassroomService,
     utc,
 )
-from veotrex_api.models import Area, ChildAttendanceEvent, ChildProfile, Facility
+from veotrex_api.models import (
+    Area,
+    ChildAttendanceEvent,
+    ChildProfile,
+    ChildReleaseEvent,
+    Facility,
+)
 
 MAX_CHILDREN_PER_FACILITY = 1000
 # How many of a classroom's past attendance events one response returns. The stream is kept in
 # full in the table; this only bounds a response.
 ATTENDANCE_HISTORY_LIMIT = 20
+# A direct check-out is an operator's administrative action (a correction, or a child leaving
+# without a recorded pickup). It never creates a release record and is labelled as such in the
+# audit, so it can never be mistaken for an authorized release (V1-04E).
+CHECKOUT_KIND_ADMINISTRATIVE = "ADMINISTRATIVE_CHECKOUT"
 
 CHILD_VALIDATION_CATEGORIES = frozenset(
     {
@@ -137,6 +147,7 @@ class AttendanceEventSummary:
     occurred_at: datetime
     valid_until: datetime | None
     recorded_by_caller: bool
+    released: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +484,21 @@ class ChildRosterService(ClassroomService):
                 .limit(ATTENDANCE_HISTORY_LIMIT)
             )
         ).all()
+        checkout_ids = [row.id for row in history if row.event_type == "CHECKED_OUT"]
+        released: set[UUID] = (
+            set(
+                (
+                    await session.scalars(
+                        select(ChildReleaseEvent.attendance_event_id).where(
+                            ChildReleaseEvent.tenant_id == principal.tenant_id,
+                            ChildReleaseEvent.attendance_event_id.in_(checkout_ids),
+                        )
+                    )
+                ).all()
+            )
+            if checkout_ids
+            else set()
+        )
         return ClassroomAttendance(
             classroom_id=area.id,
             facility_id=facility.id,
@@ -491,6 +517,7 @@ class ChildRosterService(ClassroomService):
                     occurred_at=utc(row.occurred_at),
                     valid_until=None if row.valid_until is None else utc(row.valid_until),
                     recorded_by_caller=row.recorded_by_actor_id == principal.actor_id,
+                    released=row.id in released,
                 )
                 for row in history
             ),
@@ -636,6 +663,8 @@ class ChildRosterService(ClassroomService):
             metadata["valid_until"] = utc(last.valid_until).isoformat()
         if transition.kind is AttendanceTransitionKind.MOVED:
             metadata["from_classroom_id"] = str(rows[0].area_id)
+        if transition.kind is AttendanceTransitionKind.CHECKED_OUT:
+            metadata["checkout_kind"] = CHECKOUT_KIND_ADMINISTRATIVE
         action = {
             AttendanceTransitionKind.CHECKED_IN: "attendance.checked_in",
             AttendanceTransitionKind.MOVED: "attendance.moved",

@@ -208,7 +208,8 @@ wording.
 ### Future boundaries (not implemented)
 
 - **Parent / guardian association and pickup authorisation are NOT implemented in this stage.**
-  They need their own ADR covering consent, verification, retention and access.
+  They need their own ADR covering consent, verification, retention and access. (Implemented
+  without biometrics in V1-04E - see ADR 0028.)
 - **External attendance connector**: a future integration may key on `external_reference` to
   write ATTENDANCE events through the same pure transitions and the same append-only table, with
   its own actor identity and freshness semantics; it must never infer attendance from cameras.
