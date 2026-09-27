@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from test_classroom_api import create_classroom, stack  # noqa: F401 - fixture
+from tests_text import without_identifiers
 
 from veotrex_api import camera_portal
 from veotrex_api.models import (
@@ -406,7 +407,7 @@ async def test_portal_audits_carry_geometry_but_no_label(stack: dict[str, Any]) 
     ]
     assert events[1].metadata_["changed_fields"] == ["label", "inside_side"]
     assert events[1].metadata_["after"]["inside_side"] == "LEFT"
-    rendered = str([event.metadata_ for event in events]).lower()
+    rendered = without_identifiers(str([event.metadata_ for event in events]).lower())
     for forbidden in ("secret", "label':", "track", "face", "image", "person"):
         assert forbidden not in rendered, forbidden
 

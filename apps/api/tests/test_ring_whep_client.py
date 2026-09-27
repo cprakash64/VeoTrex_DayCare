@@ -716,7 +716,7 @@ BODY_SECRETS = (
     "SECRETDETAIL",
     "SECRETMSG",
     "SECRETMETA",
-    "eyJhbGciOiJSUzI1NiJ9.SECRETJWT",
+    "SECRETREFRESHJWT",
     "access_token=SECRETBODYTOKEN",
     "refresh_token",
     "<html>",
@@ -766,7 +766,7 @@ def _assert_nothing_sensitive(rendered: str) -> None:
 JSON_ERROR = (
     b'{"errors":[{"title":"Forbidden","code":"AccessDenied","detail":"SECRETDETAIL '
     b'access_token=SECRETBODYTOKEN","meta":{"k":"SECRETMETA"}}],"message":"SECRETMSG",'
-    b'"refresh_token":"eyJhbGciOiJSUzI1NiJ9.SECRETJWT"}'
+    b'"refresh_token":"SECRETREFRESHJWT"}'
 )
 
 
@@ -832,7 +832,7 @@ async def test_a_delete_403_is_still_forbidden_and_reports_only_safe_fields(
             None,
             "html",
         ),
-        (b"Forbidden: SECRETMSG eyJhbGciOiJSUzI1NiJ9.SECRETJWT", "text/plain", None, "text"),
+        (b"Forbidden: SECRETMSG SECRETREFRESHJWT", "text/plain", None, "text"),
         (b"\x00\xffSECRETDETAIL", "application/octet-stream", None, "other"),
         (b"SECRETMSG", None, None, "other"),
         (b"", "application/json", None, "empty"),

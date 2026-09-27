@@ -34,6 +34,7 @@ from test_child_roster_api import (
 from test_classroom_api import create_classroom, stack  # noqa: F401 - fixture
 from test_classroom_presence_api import status
 from test_staff_roster_api import act, teacher
+from tests_text import without_identifiers
 
 from veotrex_api.access import AuthenticatedPrincipal
 from veotrex_api.authorization import Permission, Role, RoleGrant
@@ -1223,7 +1224,7 @@ async def test_guardian_link_and_release_audits_carry_no_pii(stack: dict[str, An
     assert released["authorization_link_revision"] == 4
     assert released["verification_method"] == "KNOWN_TO_STAFF"
     assert released["checkout_kind"] == "AUTHORIZED_RELEASE"
-    rendered = str([event.metadata_ for event in events]).lower()
+    rendered = without_identifiers(str([event.metadata_ for event in events]).lower())
     for forbidden in (
         "secret",
         "private person",

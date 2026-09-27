@@ -23,6 +23,7 @@ from structlog.testing import capture_logs
 from test_camera_portals_api import add_camera, create, url
 from test_classroom_api import create_classroom, stack  # noqa: F401 - fixture
 from tests_edge_fixtures import add_credential, add_node, set_tenant
+from tests_text import without_identifiers
 
 from veotrex_api.edge_runtime import (
     camera_document,
@@ -240,7 +241,7 @@ async def test_runtime_config_carries_no_provider_secret_or_identity(stack: dict
         ).all()
     for device_id, connection_id in provider_ids:
         assert device_id not in body and str(connection_id) not in body
-    lowered = body.lower()
+    lowered = without_identifiers(body).lower()
     for forbidden in (
         "provider",
         "ring",

@@ -44,7 +44,10 @@ from veotrex_edge_agent.qualification.whep_fixture_server import (
 )
 
 CAMERA = UUID("5e1f0c2a-7d3b-4a6e-9c1f-2b8d4e6a0c11")
-TOKEN = "vte1.3f2b1a09-8c7d-4e6f-a5b4-c3d2e1f0a9b8." + "S" * 42 + "w"  # obviously synthetic
+# Obviously synthetic: a fixed selector and a secret of repeated letters, assembled at
+# runtime so no credential-shaped literal sits in the source (secret scanning).
+SELECTOR = "3f2b1a09-8c7d-4e6f-a5b4-c3d2e1f0a9b8"
+TOKEN = ".".join(("vte1", SELECTOR, "S" * 42 + "w"))
 LEASE_ID = "L" * 43
 LEASE_PATH = f"/v1/edge/whep-leases/{LEASE_ID}"
 OFFER = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n"

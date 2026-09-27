@@ -14,16 +14,20 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from test_classroom_api import TODAY, create_classroom, stack  # noqa: F401 - fixture
 from test_classroom_presence_api import classroom_with_policy, report, status
+from tests_text import without_identifiers
 
 from veotrex_api.access import AuthenticatedPrincipal
 from veotrex_api.authorization import Permission, Role, RoleGrant
 from veotrex_api.models import AuditEvent, StaffPresenceEvent, StaffRatioEligibility
+
+PHOENIX = ZoneInfo("America/Phoenix")  # facility "one" in the shared stack
 
 ROSTER = "ROSTER_STAFF_PLUS_MANUAL_CHILDREN"
 MANUAL = "MANUAL_AGGREGATE"
@@ -350,13 +354,17 @@ async def test_runtime_grants_are_minimal_and_public_has_none(
 # ============================================================================ eligibility API
 async def test_an_admin_designates_an_active_staff_member(stack: dict[str, Any]) -> None:  # noqa: F811
     staff = await create_staff(stack, "Teacher Alice")
+    # The default start is the FACILITY's local date (f1 is America/Phoenix), not UTC's: for
+    # seven hours a day the two differ. Read before and after in case local midnight passes.
+    before = datetime.now(PHOENIX).date().isoformat()
     response = await designate(stack, staff, True, note="Owner staffing plan, rev 2")
+    after = datetime.now(PHOENIX).date().isoformat()
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["counts_toward_ratio"] is True and body["status"] == "ACTIVE"
     assert body["in_effect"] is True and body["revision"] == 1
     assert body["eligibility_basis"] == "OPERATOR_DESIGNATED"
-    assert body["effective_from_date"] == TODAY.isoformat()
+    assert body["effective_from_date"] in {before, after}
     assert body["staff_display_name"] == "Teacher Alice"
     listed = await stack["client"].get(
         f"/v1/facilities/{stack['f1']}/staff-ratio-eligibility", headers=stack["viewer-1"]
@@ -918,7 +926,7 @@ async def test_roster_actions_are_audited_with_ids_only(stack: dict[str, Any]) -
     assert checked_in["lease_seconds"] == 900 and checked_in["counts_toward_ratio"] is True
     assert mine[1].metadata_["before"]["note_present"] is True
     assert mine[1].metadata_["after"]["note_present"] is False
-    rendered = str([event.metadata_ for event in mine]).lower()
+    rendered = without_identifiers(str([event.metadata_ for event in mine]).lower())
     for forbidden in (
         "teacher audited person",
         "private operator note",

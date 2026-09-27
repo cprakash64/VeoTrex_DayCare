@@ -20,6 +20,7 @@ from sqlalchemy.exc import DBAPIError
 from test_classroom_api import create_classroom, stack  # noqa: F401 - fixture
 from test_classroom_presence_api import classroom_with_policy, report, status
 from test_staff_roster_api import act, principal, set_mode, status_at, teacher
+from tests_text import without_identifiers
 
 from veotrex_api.models import AuditEvent, ChildAttendanceEvent, ChildProfile
 
@@ -830,7 +831,7 @@ async def test_roster_and_attendance_audits_carry_no_child_pii(stack: dict[str, 
     moved = mine[6].metadata_
     assert (moved["from_classroom_id"], moved["classroom_id"]) == (room_x, room_y)
     assert mine[5].metadata_["lease_seconds"] == 7200
-    rendered = str([event.metadata_ for event in mine]).lower()
+    rendered = without_identifiers(str([event.metadata_ for event in mine]).lower())
     for forbidden in (
         "private name",
         "renamed secret",
