@@ -188,3 +188,417 @@ export async function runRecognitionTest(bytes: ArrayBuffer, mediaType: string):
     body: bytes,
   });
 }
+
+// ------------------------------------------------ classrooms and configured ratio policy (V1-04A)
+import type {
+  Classroom,
+  ClassroomPayload,
+  FacilitySummary,
+  PolicyPayload,
+  RatioStatus,
+} from "./classrooms";
+
+export async function getFacilities(): Promise<ReadonlyArray<FacilitySummary>> {
+  const response = await authorizedFetch("/v1/facilities");
+  if (!response.ok) throw new Error("Facilities are unavailable");
+  return (await response.json()) as ReadonlyArray<FacilitySummary>;
+}
+
+export async function getClassrooms(): Promise<ReadonlyArray<Classroom>> {
+  const response = await authorizedFetch("/v1/classrooms");
+  if (!response.ok) throw new Error("Classrooms are unavailable");
+  return (await response.json()) as ReadonlyArray<Classroom>;
+}
+
+export async function getClassroom(classroomId: string): Promise<Classroom | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("Classroom is unavailable");
+  return (await response.json()) as Classroom;
+}
+
+export async function getClassroomRatioStatus(classroomId: string): Promise<RatioStatus | null> {
+  const response = await authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-status`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as RatioStatus;
+}
+
+export async function createClassroom(
+  facilityId: string,
+  payload: ClassroomPayload,
+): Promise<Response> {
+  return authorizedFetch("/v1/classrooms", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ facility_id: facilityId, ...payload }),
+  });
+}
+
+export async function updateClassroom(
+  classroomId: string,
+  payload: ClassroomPayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setClassroomActive(classroomId: string, active: boolean): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/${active ? "activate" : "deactivate"}`,
+    { method: "POST" },
+  );
+}
+
+export async function createRatioPolicy(
+  classroomId: string,
+  payload: PolicyPayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateRatioPolicy(
+  classroomId: string,
+  policyId: string,
+  payload: PolicyPayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies/${encodeURIComponent(policyId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deactivateRatioPolicy(classroomId: string, policyId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/ratio-policies/${encodeURIComponent(policyId)}/deactivate`,
+    { method: "POST" },
+  );
+}
+
+// ---------------------------------------------------------------- manual presence (V1-04B)
+import type { ClassroomPresence, ManualPresencePayload } from "./classrooms";
+
+export async function getClassroomPresence(classroomId: string): Promise<ClassroomPresence | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence`);
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomPresence;
+}
+
+export async function submitManualPresence(
+  classroomId: string,
+  payload: ManualPresencePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence/manual`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function revokeManualPresence(classroomId: string, snapshotId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/presence/${encodeURIComponent(snapshotId)}/revoke`,
+    { method: "POST" },
+  );
+}
+
+// -------------------------------------------------- staff roster and staff check-in (V1-04C)
+import type {
+  ClassroomStaffPresence,
+  EligibilityCreatePayload,
+  EligibilityUpdatePayload,
+  FacilityRoster,
+  PresenceMode,
+  StaffPresencePayload,
+} from "./staff-presence";
+
+export async function getClassroomStaffPresence(classroomId: string): Promise<ClassroomStaffPresence | null> {
+  const response = await authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/staff-presence`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomStaffPresence;
+}
+
+export async function recordStaffPresence(
+  classroomId: string,
+  action: "check-in" | "check-out" | "refresh",
+  payload: StaffPresencePayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/classrooms/${encodeURIComponent(classroomId)}/staff-presence/${action}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function setPresenceSourceMode(classroomId: string, mode: PresenceMode): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/presence-source-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function getFacilityRoster(
+  facilityId: string,
+  staffProfileId?: string,
+): Promise<FacilityRoster | null> {
+  const query = staffProfileId ? `?${new URLSearchParams({ staff_profile_id: staffProfileId })}` : "";
+  const response = await authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility${query}`,
+  );
+  if (!response.ok) return null;
+  return (await response.json()) as FacilityRoster;
+}
+
+export async function createEligibility(
+  facilityId: string,
+  payload: EligibilityCreatePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateEligibility(
+  facilityId: string,
+  eligibilityId: string,
+  payload: EligibilityUpdatePayload,
+): Promise<Response> {
+  return authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility/${encodeURIComponent(eligibilityId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deactivateEligibility(facilityId: string, eligibilityId: string): Promise<Response> {
+  return authorizedFetch(
+    `/v1/facilities/${encodeURIComponent(facilityId)}/staff-ratio-eligibility/${encodeURIComponent(eligibilityId)}/deactivate`,
+    { method: "POST" },
+  );
+}
+
+// ------------------------------------------------------ child roster and attendance (V1-04D)
+import type {
+  AttendancePayload,
+  ChildPayload,
+  ChildUpdatePayload,
+  ClassroomAttendance,
+  FacilityChildren,
+} from "./children";
+
+export async function getFacilityChildren(facilityId: string): Promise<FacilityChildren | null> {
+  const response = await authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/children`);
+  if (!response.ok) return null;
+  return (await response.json()) as FacilityChildren;
+}
+
+export async function createChild(facilityId: string, payload: ChildPayload): Promise<Response> {
+  return authorizedFetch(`/v1/facilities/${encodeURIComponent(facilityId)}/children`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateChild(childId: string, payload: ChildUpdatePayload): Promise<Response> {
+  return authorizedFetch(`/v1/children/${encodeURIComponent(childId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setChildStatus(
+  childId: string,
+  verb: "activate" | "deactivate" | "archive",
+): Promise<Response> {
+  return authorizedFetch(`/v1/children/${encodeURIComponent(childId)}/${verb}`, { method: "POST" });
+}
+
+export async function getClassroomAttendance(classroomId: string): Promise<ClassroomAttendance | null> {
+  const response = await authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance`);
+  if (!response.ok) return null;
+  return (await response.json()) as ClassroomAttendance;
+}
+
+export async function recordAttendance(
+  classroomId: string,
+  action: "check-in" | "check-out" | "refresh",
+  payload: AttendancePayload,
+): Promise<Response> {
+  return authorizedFetch(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// --------------------------------------- guardian contacts, links and release (V1-04E)
+import type { ChildSummary } from "./children";
+import type {
+  ChildGuardians,
+  FacilityGuardians,
+  GuardianPayload,
+  GuardianUpdatePayload,
+  LinkPayload,
+  LinkUpdatePayload,
+  ReleaseHistory,
+  ReleaseOptions,
+  ReleasePayload,
+} from "./guardians";
+
+async function jsonOrNull<T>(path: string): Promise<T | null> {
+  const response = await authorizedFetch(path);
+  if (!response.ok) return null;
+  return (await response.json()) as T;
+}
+
+function sendJson(path: string, method: "POST" | "PATCH", payload?: unknown): Promise<Response> {
+  return authorizedFetch(path, {
+    method,
+    ...(payload === undefined
+      ? {}
+      : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
+  });
+}
+
+export async function getChild(childId: string): Promise<ChildSummary | null> {
+  return jsonOrNull<ChildSummary>(`/v1/children/${encodeURIComponent(childId)}`);
+}
+
+export async function getFacilityGuardians(facilityId: string): Promise<FacilityGuardians | null> {
+  return jsonOrNull<FacilityGuardians>(`/v1/facilities/${encodeURIComponent(facilityId)}/guardians`);
+}
+
+export async function createGuardian(facilityId: string, payload: GuardianPayload): Promise<Response> {
+  return sendJson(`/v1/facilities/${encodeURIComponent(facilityId)}/guardians`, "POST", payload);
+}
+
+export async function updateGuardian(guardianId: string, payload: GuardianUpdatePayload): Promise<Response> {
+  return sendJson(`/v1/guardians/${encodeURIComponent(guardianId)}`, "PATCH", payload);
+}
+
+export async function setGuardianStatus(
+  guardianId: string,
+  verb: "activate" | "deactivate" | "archive",
+): Promise<Response> {
+  return sendJson(`/v1/guardians/${encodeURIComponent(guardianId)}/${verb}`, "POST");
+}
+
+export async function getChildGuardians(childId: string): Promise<ChildGuardians | null> {
+  return jsonOrNull<ChildGuardians>(`/v1/children/${encodeURIComponent(childId)}/guardians`);
+}
+
+export async function createChildLink(childId: string, payload: LinkPayload): Promise<Response> {
+  return sendJson(`/v1/children/${encodeURIComponent(childId)}/guardians`, "POST", payload);
+}
+
+export async function updateChildLink(childId: string, linkId: string, payload: LinkUpdatePayload): Promise<Response> {
+  return sendJson(
+    `/v1/children/${encodeURIComponent(childId)}/guardians/${encodeURIComponent(linkId)}`,
+    "PATCH",
+    payload,
+  );
+}
+
+export async function deactivateChildLink(childId: string, linkId: string): Promise<Response> {
+  return sendJson(
+    `/v1/children/${encodeURIComponent(childId)}/guardians/${encodeURIComponent(linkId)}/deactivate`,
+    "POST",
+  );
+}
+
+export async function getReleaseHistory(childId: string): Promise<ReleaseHistory | null> {
+  return jsonOrNull<ReleaseHistory>(`/v1/children/${encodeURIComponent(childId)}/release-history`);
+}
+
+export async function getReleaseOptions(classroomId: string): Promise<ReleaseOptions | null> {
+  return jsonOrNull<ReleaseOptions>(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/release-options`);
+}
+
+export async function releaseChild(classroomId: string, payload: ReleasePayload): Promise<Response> {
+  return sendJson(`/v1/classrooms/${encodeURIComponent(classroomId)}/attendance/release`, "POST", payload);
+}
+
+// ----------------------------------------------------------- camera portals (V1-05A)
+import type { CameraPortals, PortalPayload, PortalUpdatePayload } from "./portals";
+
+function portalsPath(classroomId: string, cameraId: string): string {
+  return `/v1/classrooms/${encodeURIComponent(classroomId)}/cameras/${encodeURIComponent(cameraId)}/portals`;
+}
+
+export async function getCameraPortals(classroomId: string, cameraId: string): Promise<CameraPortals | null> {
+  return jsonOrNull<CameraPortals>(portalsPath(classroomId, cameraId));
+}
+
+export async function createCameraPortal(
+  classroomId: string,
+  cameraId: string,
+  payload: PortalPayload,
+): Promise<Response> {
+  return sendJson(portalsPath(classroomId, cameraId), "POST", payload);
+}
+
+export async function updateCameraPortal(
+  classroomId: string,
+  cameraId: string,
+  portalId: string,
+  payload: PortalUpdatePayload,
+): Promise<Response> {
+  return sendJson(`${portalsPath(classroomId, cameraId)}/${encodeURIComponent(portalId)}`, "PATCH", payload);
+}
+
+export async function archiveCameraPortal(classroomId: string, cameraId: string, portalId: string): Promise<Response> {
+  return sendJson(`${portalsPath(classroomId, cameraId)}/${encodeURIComponent(portalId)}/archive`, "POST");
+}
+
+// ----------------------------------------------------- room transitions (V1-05B)
+import {
+  parseTransitionPage,
+  transitionQuery,
+  type RoomTransitionResult,
+  type TransitionType,
+} from "./room-transitions";
+
+/** One bounded page of a classroom's anonymous room transitions, newest first. */
+export async function getRoomTransitions(
+  classroomId: string,
+  cursor: string | null,
+  type: TransitionType | null,
+): Promise<RoomTransitionResult> {
+  let response: Response;
+  try {
+    response = await authorizedFetch(
+      `/v1/classrooms/${encodeURIComponent(classroomId)}/room-transitions?${transitionQuery(cursor, type)}`,
+    );
+  } catch {
+    return { status: "error" };
+  }
+  if (response.status === 404) return { status: "not_found" };
+  if (!response.ok) return { status: "error" };
+  const page = parseTransitionPage(await response.json().catch(() => null));
+  return page === null ? { status: "error" } : { status: "ok", page };
+}

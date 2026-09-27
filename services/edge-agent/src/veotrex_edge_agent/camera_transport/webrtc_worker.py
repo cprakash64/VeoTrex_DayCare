@@ -5,6 +5,19 @@ Launched as ``/usr/bin/python3 -I webrtc_worker.py --fd N``. It owns one recvonl
 ``webrtcbin`` peer and the fixed receive route
 ``webrtcbin -> depay -> parse -> nvv4l2decoder -> fakesink``.
 
+Two egress modes, chosen by the parent in START (V1-DEMO-03C):
+
+``metadata`` (the default, R5A-R2)  the route ends in ``fakesink`` and only timing metadata leaves;
+                                    this is what transport qualification measures.
+``frames``                          the route ends in a bounded ``appsink`` (``max-buffers=1
+                                    drop=true sync=false``) and each decoded BGR frame leaves as a
+                                    sealed, read-only memfd beside a small JSON header - the exact
+                                    transport ``frame_worker.py`` uses, whose memfd helper is
+                                    loaded from this same directory. At most
+                                    ``MAX_FRAMES_IN_FLIGHT`` unacknowledged frames exist, and a
+                                    frame the parent cannot take right now is dropped and counted,
+                                    never queued: newest frame wins.
+
 Deliberately credential-free: the WHEP Bearer token never enters this process. The worker emits a
 complete (non-trickle) SDP offer to the parent, the parent performs the authenticated exchange,
 and the answer comes back down the same inherited AF_UNIX/SOCK_SEQPACKET socket. Media buffers are
@@ -14,6 +27,7 @@ never copied, retained, or written; probes record timing metadata and sizes only
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import ctypes
 import json
@@ -50,6 +64,15 @@ START_FIELDS = frozenset(
         "gather_timeout_seconds",
     }
 )
+EGRESS_MODES = frozenset({"metadata", "frames"})
+# Frame egress bounds, shared in spirit with frame_worker.py.
+MAX_FRAMES_IN_FLIGHT = 2
+MAX_FRAME_BYTES = 4096 * 4096 * 3
+# Elements whose runtime failure is a decode failure rather than a transport failure.
+DECODER_ELEMENTS = ("nvv4l2decoder", "nvvidconv", "openh264dec", "avdec_h264", "avdec_h265")
+# Only these are required before START; the decoder is checked when the video pad appears, so a
+# host without NVDEC can still run the software route.
+REQUIRED_RUNTIME_ELEMENTS = ("webrtcbin", "nicesrc", "nicesink")
 CLOCK_TIME_NONE = 2**64 - 1
 
 
@@ -76,6 +99,26 @@ class Channel:
             except OSError:
                 self.closed = True
 
+    def send_frame(self, value: dict[str, Any], fd: int) -> bool:
+        """Hand one frame descriptor to the parent without ever blocking.
+
+        False means the parent's socket buffer is full: it is behind, so the caller drops the
+        frame. Blocking would stall the decoder; queueing would defeat newest-frame-wins.
+        """
+        data = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
+        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]
+        with self._lock:
+            if self.closed:
+                return False
+            try:
+                self.sock.sendmsg([data], ancillary, socket.MSG_DONTWAIT)
+                return True
+            except BlockingIOError:
+                return False
+            except OSError:
+                self.closed = True
+                return False
+
     def receive(self, timeout: float) -> dict[str, Any] | None:
         ready, _, _ = select.select([self.sock], [], [], timeout)
         if not ready:
@@ -92,8 +135,14 @@ class Channel:
 
 
 def validate_start(message: dict[str, Any]) -> dict[str, Any]:
-    if set(message) != START_FIELDS or message.get("type") != "START":
+    # ``egress`` is the one optional field; everything else is exactly the R5A-R2 contract.
+    if set(message) - {"egress"} != START_FIELDS or message.get("type") != "START":
         raise ValueError("invalid_start")
+    egress = message.get("egress", "metadata")
+    if egress not in EGRESS_MODES:
+        raise ValueError("invalid_egress")
+    if egress == "frames" and message.get("decoder") == "none":
+        raise ValueError("frames_require_a_decoder")
     if message.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("protocol_version_mismatch")
     generation = message.get("generation")
@@ -137,12 +186,57 @@ def load_gstreamer() -> tuple[Any, Any, Any, Any]:
     return Gst, GstWebRTC, GstSdp, GLib
 
 
+def load_frame_egress() -> Any:
+    """``frame_worker.create_sealed_frame_memfd``, loaded from this worker's own directory.
+
+    Running under ``-I`` removes the script directory from ``sys.path`` on purpose, so the
+    sibling is loaded by exact path instead: only that one reviewed file, never a search path.
+    """
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "frame_worker.py")
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise RuntimeError("DECODER_START_FAILED")
+    spec = importlib.util.spec_from_file_location("veotrex_frame_egress", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("DECODER_START_FAILED")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.create_sealed_frame_memfd
+
+
+def packed_bgr(data: memoryview, width: int, height: int) -> bytes | memoryview | None:
+    """The frame as tightly packed BGR rows, or None when the buffer cannot be one.
+
+    GStreamer pads each BGR row to a multiple of four bytes, so a width whose row is not
+    already aligned arrives strided. Aligned rows (every common camera width) are passed
+    through without a copy; strided rows are packed once.
+    """
+    row = width * 3
+    expected = row * height
+    if len(data) == expected:
+        return data
+    stride = (row + 3) & ~3
+    if stride == row or len(data) < stride * height:
+        return None
+    return b"".join(data[index * stride : index * stride + row] for index in range(height))
+
+
 class WebRtcReceiver:
     def __init__(self, channel: Channel, start: dict[str, Any]) -> None:
         self.channel = channel
         self.generation = int(start["generation"])
         self.codec = str(start["codec"])
         self.decoder_mode = str(start["decoder"])
+        self.egress = str(start.get("egress", "metadata"))
+        self.create_frame_memfd = load_frame_egress() if self.egress == "frames" else None
+        self.decoder_name: str | None = None
+        self.video_linked = False
+        self.frames_in_flight = 0
+        self.frame_sequence = 0
+        self.frames_published = 0
+        self.frames_dropped = 0
+        self.frame_discontinuity = True
         self.gather_timeout = float(start["gather_timeout_seconds"])
         self.gst, self.webrtc, self.sdp_module, self.glib = load_gstreamer()
         self.lock = threading.Lock()
@@ -270,7 +364,9 @@ class WebRtcReceiver:
         caps = pad.get_current_caps() or pad.query_caps(None)
         structure = caps.get_structure(0) if caps and caps.get_size() else None
         if structure is None or structure.get_string("media") != "video":
-            return
+            return  # audio or data: never linked, never decoded
+        if self.video_linked:
+            return  # exactly one video route per session
         encoding = (structure.get_string("encoding-name") or "").upper()
         route = CODEC_ROUTES.get(encoding)
         if route is None:
@@ -289,18 +385,35 @@ class WebRtcReceiver:
             return
         if decoder_name:
             names.append(decoder_name)
-        names.append("fakesink")
+        self.decoder_name = decoder_name
+        if self.egress == "frames":
+            if decoder_name == HARDWARE_DECODER:
+                # NVMM back to system memory; NV12 is the transform the VIC accepts (see
+                # frame_worker.py for the measured failure without it).
+                names += ["nvvidconv", "capsfilter:video/x-raw,format=NV12"]
+            names += ["videoconvert", "capsfilter:video/x-raw,format=BGR", "appsink"]
+        else:
+            names.append("fakesink")
         elements = []
         for index, name in enumerate(names):
-            element = gst.ElementFactory.make(name, f"{name}-{index}")
+            factory, _, caps_text = name.partition(":")
+            element = gst.ElementFactory.make(factory, f"{factory}-{index}")
             if element is None:
                 self._fail("DECODER_START_FAILED")
                 return
+            if caps_text:
+                element.set_property("caps", gst.Caps.from_string(caps_text))
             elements.append(element)
         sink = elements[-1]
         sink.set_property("sync", False)
         sink.set_property("async", False)
         sink.set_property("enable-last-sample", False)  # never retain a decoded frame
+        if self.egress == "frames":
+            # One buffer, oldest dropped: GStreamer discards upstream instead of growing.
+            sink.set_property("max-buffers", 1)
+            sink.set_property("drop", True)
+            sink.set_property("emit-signals", True)
+            sink.connect("new-sample", self._on_frame_sample)
         for element in elements:
             self.pipeline.add(element)
         for index in range(len(elements) - 1):
@@ -312,9 +425,12 @@ class WebRtcReceiver:
         if pad.link(elements[0].get_static_pad("sink")) != gst.PadLinkReturn.OK:
             self._fail("WEBRTC_NEGOTIATION_FAILED")
             return
-        elements[0].get_static_pad("sink").add_probe(gst.PadProbeType.BUFFER, self._rtp_probe)
-        if decoder_name:
-            sink.get_static_pad("sink").add_probe(gst.PadProbeType.BUFFER, self._decoded_probe)
+        self.video_linked = True
+        if self.egress == "metadata":
+            # Timing probes are the qualification's measurement; the frame route needs none.
+            elements[0].get_static_pad("sink").add_probe(gst.PadProbeType.BUFFER, self._rtp_probe)
+            if decoder_name:
+                sink.get_static_pad("sink").add_probe(gst.PadProbeType.BUFFER, self._decoded_probe)
         if not self.negotiated_sent:
             self.negotiated_sent = True
             self.channel.send(
@@ -331,6 +447,73 @@ class WebRtcReceiver:
     @staticmethod
     def _timestamp(value: int) -> int:
         return -1 if value == CLOCK_TIME_NONE else int(value)
+
+    # --- frame egress (frames mode only) ---------------------------------------------
+    def acknowledge(self, count: object) -> None:
+        amount = count if isinstance(count, int) and not isinstance(count, bool) else 1
+        with self.lock:
+            self.frames_in_flight = max(0, self.frames_in_flight - max(1, amount))
+
+    def _on_frame_sample(self, sink: Any) -> Any:
+        gst = self.gst
+        sample = sink.emit("pull-sample")
+        if sample is None or self.create_frame_memfd is None:
+            return gst.FlowReturn.OK
+        with self.lock:
+            if self.frames_in_flight >= MAX_FRAMES_IN_FLIGHT:
+                # The parent still holds what it was given: drop this one, never queue it.
+                self.frames_dropped += 1
+                return gst.FlowReturn.OK
+        buffer = sample.get_buffer()
+        caps = sample.get_caps()
+        structure = caps.get_structure(0) if caps and caps.get_size() else None
+        if buffer is None or structure is None:
+            return gst.FlowReturn.OK
+        ok_w, width = structure.get_int("width")
+        ok_h, height = structure.get_int("height")
+        expected = width * height * 3 if ok_w and ok_h else 0
+        if not 0 < expected <= MAX_FRAME_BYTES:
+            self.frames_dropped += 1
+            return gst.FlowReturn.OK
+        ok, mapped = buffer.map(gst.MapFlags.READ)
+        if not ok:
+            self.frames_dropped += 1
+            return gst.FlowReturn.OK
+        try:
+            payload = packed_bgr(memoryview(mapped.data), width, height)
+            fd = None if payload is None else self.create_frame_memfd(memoryview(payload))
+        except Exception:
+            fd = None
+        finally:
+            buffer.unmap(mapped)
+        if fd is None:
+            self.frames_dropped += 1
+            return gst.FlowReturn.OK
+        try:
+            self.frame_sequence += 1
+            header = {
+                "type": "FRAME",
+                "generation": self.generation,
+                "sequence": self.frame_sequence,
+                "format": "BGR",
+                "width": width,
+                "height": height,
+                "bytes": expected,
+                "pts_ns": self._timestamp(buffer.pts),
+                "arrival_ns": time.monotonic_ns(),
+                "discontinuity": self.frame_discontinuity,
+            }
+            if self.channel.send_frame(header, fd):
+                self.frame_discontinuity = False
+                self.frames_published += 1
+                with self.lock:
+                    self.frames_in_flight += 1
+            else:
+                self.frames_dropped += 1
+        finally:
+            # SCM_RIGHTS duplicated it into the parent; this copy is always closed.
+            os.close(fd)
+        return gst.FlowReturn.OK
 
     def _append(self, target: list[list[int]], sample: list[int]) -> None:
         with self.lock:
@@ -416,9 +599,10 @@ class WebRtcReceiver:
                 if message.type == gst.MessageType.ERROR:
                     error, _debug = message.parse_error()
                     source = message.src.get_name() if message.src else ""
+                    # Only a bounded category leaves; the GStreamer text never does.
                     outcome = (
                         "DECODER_FAILED"
-                        if "nvv4l2decoder" in source
+                        if any(name in source for name in DECODER_ELEMENTS)
                         else "WEBRTC_CONNECTION_FAILED"
                     )
                     del error
@@ -446,6 +630,8 @@ class WebRtcReceiver:
                 if kind == "STOP":
                     outcome = "STOPPED"
                     break
+                if kind == "ACK":
+                    self.acknowledge(command.get("count", 1))
                 if kind == "ANSWER":
                     try:
                         self.apply_answer(validate_sdp(command.get("sdp")))
@@ -512,7 +698,7 @@ def main() -> int:
                     "plugins": plugins,
                 }
             )
-            if not all(plugins.values()):
+            if not all(plugins[name] for name in REQUIRED_RUNTIME_ELEMENTS):
                 channel.send(
                     {"type": "FAILED", "generation": 0, "category": "WEBRTC_RUNTIME_UNAVAILABLE"}
                 )

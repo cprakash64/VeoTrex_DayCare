@@ -24,12 +24,21 @@ They are **not** a substitute for detector qualification: masking an area hides 
 is in it, so a region drawn around a doorway would hide the people coming through it. That is
 why a single region may not cover more than half the frame, the regions together may not cover
 more than three quarters of it, and their number is bounded.
+
+**Nothing is suppressed invisibly (V1-03B).** Configured regions, their labels and the
+containment rule are reported on the live status and dashboard and outlined on the preview, and
+every suppressed detection is counted. A region is only ever applied because an operator
+configured it: the live runtime may *suggest* a region for a persistent low-confidence track,
+but it never applies one, because a person who stands still looks exactly like a fixed object
+to a system that cannot tell them apart.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterable, Sequence
@@ -44,9 +53,19 @@ MAX_TOTAL_AREA_FRACTION = 0.75
 # How much of a detection must lie inside a region before it is treated as that region's
 # artifact rather than as something in front of it.
 DEFAULT_MIN_CONTAINMENT = 0.8
-# A label is for the operator's own notes ("poster by the door"). It is never shown to a
-# viewer, never logged with imagery, and never used for classification.
+# Below this, a containment rule suppresses detections that mostly lie *outside* the region -
+# a person standing in front of it. Permitted, because an operator may need it, but reported as
+# a warning wherever the regions are shown.
+LOW_CONTAINMENT_WARNING_BELOW = 0.5
+# A region narrower or shorter than this fraction of the frame cannot contain a detection the
+# validator would keep; it is a typo, not a mask.
+MIN_REGION_SIDE_FRACTION = 0.005
+# A label is for the operator's own notes ("poster by the door"). It is shown only on the
+# loopback operator dashboard and status, never drawn into the picture, never logged with
+# imagery, and never used for classification. The character set is restricted so a label can
+# never carry markup into the page.
 MAX_LABEL_LENGTH = 40
+LABEL_PATTERN = re.compile(r"^[A-Za-z0-9 _.()/:#-]*$")
 
 
 class IgnoreRegionError(ValueError):
@@ -66,8 +85,12 @@ class IgnoreRegion:
     def __post_init__(self) -> None:
         for name in ("x1", "y1", "x2", "y2"):
             value = getattr(self, name)
-            if not isinstance(value, int | float) or value != value:  # NaN is not a coordinate
-                raise IgnoreRegionError(f"{name} must be a number")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))  # NaN and infinity are not coordinates
+            ):
+                raise IgnoreRegionError(f"{name} must be a finite number")
             if not 0.0 <= float(value) <= 1.0:
                 raise IgnoreRegionError(
                     f"{name} must be normalized to the frame, between 0 and 1, got {value}"
@@ -76,6 +99,11 @@ class IgnoreRegion:
             raise IgnoreRegionError(
                 "a region needs positive width and height, with x1 < x2 and y1 < y2"
             )
+        if min(self.x2 - self.x1, self.y2 - self.y1) < MIN_REGION_SIDE_FRACTION:
+            raise IgnoreRegionError(
+                f"a region must be at least {MIN_REGION_SIDE_FRACTION:.1%} of the frame "
+                "in each dimension"
+            )
         if self.area > MAX_REGION_AREA_FRACTION:
             raise IgnoreRegionError(
                 f"a single region may not cover more than "
@@ -83,6 +111,10 @@ class IgnoreRegion:
             )
         if len(self.label) > MAX_LABEL_LENGTH:
             raise IgnoreRegionError(f"label must be at most {MAX_LABEL_LENGTH} characters")
+        if not LABEL_PATTERN.match(self.label):
+            raise IgnoreRegionError(
+                "label may contain only letters, digits, spaces and . _ - ( ) / : #"
+            )
 
     @property
     def area(self) -> float:
@@ -128,7 +160,7 @@ class IgnoreRegionSet:
             raise IgnoreRegionError(
                 f"at most {MAX_IGNORE_REGIONS} ignore regions, got {len(self.regions)}"
             )
-        if not 0.0 < self.min_containment <= 1.0:
+        if not (math.isfinite(self.min_containment) and 0.0 < self.min_containment <= 1.0):
             raise IgnoreRegionError("min_containment must be greater than 0 and at most 1")
         total = sum(region.area for region in self.regions)
         if total > MAX_TOTAL_AREA_FRACTION:
@@ -154,6 +186,25 @@ class IgnoreRegionSet:
 
     def as_dicts(self) -> list[dict[str, float | str]]:
         return [region.as_dict() for region in self.regions]
+
+    @property
+    def low_containment(self) -> bool:
+        """The rule suppresses detections that are mostly outside the region."""
+        return bool(self.regions) and self.min_containment < LOW_CONTAINMENT_WARNING_BELOW
+
+    def status(self) -> dict[str, Any]:
+        """Everything an operator needs to audit what is being suppressed. No pixels."""
+        return {
+            "count": len(self.regions),
+            "regions": self.as_dicts(),
+            "min_containment": round(self.min_containment, 4),
+            "rule": (
+                "a detection is ignored before tracking when at least min_containment of its "
+                "area lies inside one region"
+            ),
+            "total_area_fraction": round(sum(region.area for region in self.regions), 4),
+            "low_containment_warning": self.low_containment,
+        }
 
 
 def parse_ignore_region(text: str) -> IgnoreRegion:

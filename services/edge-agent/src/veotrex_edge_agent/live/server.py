@@ -7,7 +7,20 @@ authenticates with the operator's existing key and exposes nothing new (see
 ``docs/runbooks/sunday-live-demo.md``).
 
 The page shows the live camera frame with the tracker's boxes drawn on it, a head count,
-throughput and source health.
+throughput and source health. Throughput is broken down by cause (V1-03A): capture, inference
+and preview rates, and frames not processed split into scheduler skips (intentional sampling),
+backpressure drops (the detector behind its schedule) and transport drops (lost before capture).
+
+The classroom policy card (V1-04A) is deliberately inert: the live runtime has no approved
+presence source, so it says "Presence counts not connected" and shows the camera's head count
+only as people seen - never as a role count, never as a ratio input. It keeps the page's rule of
+using no demographic words at all.
+
+Occupancy is split the same way (V1-03B): the head count is validated tracks only, and
+confirmed tracks whose evidence does not yet count are shown beside it as candidate person
+tracks - never folded in, never hidden. Configured ignore regions, their containment rule and
+the number of detections they suppressed are listed, so no suppression is invisible. Every
+operator-supplied string reaches the page through ``textContent``, never as markup.
 
 V1-DEMO-01 served geometry only, on a black canvas. That was a deliberate privacy choice and
 the wrong one for a monitoring demonstration, so R1 puts the picture back under bounds: the
@@ -123,8 +136,30 @@ PAGE = """<!doctype html>
       <div class="muted">People currently visible</div>
       <div class="count" id="occupancy">0</div>
       <div class="muted" id="peak">&nbsp;</div>
+      <div class="muted">counted in occupancy &mdash; validated tracks only</div>
+      <div class="muted" id="candidates">&nbsp;</div>
     </div>
     <div class="card"><table id="metrics"></table></div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Classroom policy</div>
+      <ul id="classroom">
+        <li>Presence counts not connected</li>
+        <li class="muted">Ratios use presence records from approved sources only. The camera's
+          head count is never a presence record and never a ratio input.</li>
+        <li id="vision-people">People seen by camera (not a presence record): 0</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Camera calibration</div>
+      <ul id="calibration"></ul>
+    </div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Room transitions</div>
+      <div class="muted" id="transition-counts">&nbsp;</div>
+      <ul id="transitions"></ul>
+      <div class="muted">Counted only when a track crosses a configured doorway line. Appearing
+        in or leaving the view is not an entry or an exit. Anonymous; nobody is identified.</div>
+    </div>
     <div class="card">
       <div class="muted" style="margin-bottom:6px">Activity</div>
       <ul id="timeline"></ul>
@@ -146,7 +181,8 @@ function pill(el, text, cls){ el.textContent = text; el.className = "pill " + (c
 // the page had no way to tell the difference. The frame is now loaded by its own same-origin
 // URL, so there is no object URL to permit, to track or to revoke.
 const FRAME_URL = "/api/live/frame.jpg";
-// The server encodes at ~8 fps; asking faster only re-fetches bytes that have not changed.
+// The server encodes at most ~8 fps, and only on inference frames; asking faster only
+// re-fetches bytes that have not changed.
 const PREVIEW_INTERVAL_MS = 120;
 const PREVIEW_RETRY_MS = 400;
 // Tolerate one lost frame before replacing the picture: a single 503 between encodes is normal,
@@ -218,18 +254,30 @@ function pullPreview(){
   previewRequest += 1;
   loader.src = FRAME_URL + "?sequence=" + previewRequest;
 }
+// Inference deliberately runs on a sample of camera frames, so "not processed" is split by
+// cause: a scheduler skip is a sampling decision, a backpressure drop is the detector falling
+// behind its own schedule, and a transport drop was lost before capture. A dash means the
+// source cannot measure that number, which is different from zero.
 function rows(m){
   const p = (o) => (o && o.p50 != null) ? o.p50.toFixed(1)+" / "+o.p95.toFixed(1)+" ms" : "\u2013";
+  const fps = (v) => (v == null) ? "\u2013" : v.toFixed(1);
+  const count = (v) => (v == null) ? "\u2013" : v;
+  const scheduled = (m.inference_scheduled_fps != null)
+    ? " (target " + m.inference_scheduled_fps.toFixed(1) + ")" : "";
   return [
-    ["Processing FPS", (m.processing_fps ?? 0).toFixed(1)],
-    ["Capture FPS", (m.camera_capture_fps ?? 0).toFixed(1)],
-    ["Preview encode p50/p95", p(m.preview_encode_ms)],
+    ["Capture FPS", fps(m.camera_capture_fps ?? 0)],
+    ["Inference FPS", fps(m.effective_inference_fps ?? m.processing_fps ?? 0) + scheduled],
+    ["Preview FPS", fps(m.preview_fps)],
     ["Detector p50/p95", p(m.detector_latency_ms)],
     ["Tracker p50/p95", p(m.tracker_latency_ms)],
     ["Pipeline p50/p95", p(m.pipeline_latency_ms)],
-    ["Frames captured", m.frames_captured_total ?? 0],
-    ["Frames processed", m.video_frames_processed_total ?? 0],
-    ["Frames dropped", m.frames_dropped_total ?? 0],
+    ["Preview encode p50/p95", p(m.preview_encode_ms)],
+    ["Frames captured", m.camera_frames_captured_total ?? m.frames_captured_total ?? 0],
+    ["Inference frames processed",
+     m.inference_frames_processed_total ?? m.video_frames_processed_total ?? 0],
+    ["Inference scheduler skips", m.inference_frames_skipped_scheduler_total ?? 0],
+    ["Backpressure drops", m.inference_frames_dropped_backpressure_total ?? 0],
+    ["Transport/media drops", count(m.source_frames_dropped_total)],
     ["Ignored detections", m.detections_ignored_total ?? 0],
     ["Tracks created", m.tracks_created_total ?? 0],
     ["Reconnects", m.camera_reconnect_count ?? 0],
@@ -245,6 +293,12 @@ async function pullState(){
     const s = d.state;
     $("occupancy").textContent = s.occupancy;
     $("peak").textContent = "peak this session: " + (d.metrics.peak_occupancy ?? 0);
+    $("vision-people").textContent = "People seen by camera (not a presence record): "
+      + (s.occupancy ?? 0);
+    $("candidates").textContent = "Candidate person tracks: " + (s.candidate_tracks ?? 0)
+      + " (shown, not counted)";
+    calibration(d.calibration || {}, d.metrics);
+    transitions(d.room_transitions || {});
     pill($("kind"), s.source.is_live ? s.source.kind : s.source.kind + " (not live)",
          s.source.is_live ? "ok" : "warn");
     const h = s.source.health;
@@ -270,6 +324,51 @@ async function pullState(){
     waitingPlaceholder();
   }
   if (!stopped) stateTimer = setTimeout(pullState, STATE_INTERVAL_MS);
+}
+// Built with textContent only: region labels are operator-supplied text, and no
+// operator-supplied string is ever interpreted as markup.
+function calibration(c, m){
+  const list = $("calibration");
+  const items = [];
+  const regions = c.regions || [];
+  items.push("Ignore regions: " + regions.length + (regions.length ? "" : " (none configured)"));
+  regions.forEach((r, i) => items.push(
+    "  " + (i + 1) + ". " + (r.label || "(no label)") + " \u2014 " +
+    [r.x1, r.y1, r.x2, r.y2].map(v => Number(v).toFixed(3)).join(", ")));
+  if (regions.length) {
+    items.push("Rule: ignored when \u2265 " + Math.round((c.min_containment ?? 0) * 100)
+      + "% of a detection lies inside one region");
+    if (c.low_containment_warning)
+      items.push("WARNING: containment below 50% can hide a person standing in front");
+  }
+  items.push("Detections suppressed: " + (c.detections_suppressed_total ?? 0));
+  items.push("Candidates flagged for review: " + (m.nuisance_review_candidates ?? 0)
+    + " (review only \u2014 never masked automatically)");
+  list.replaceChildren(...items.map(text => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    return li;
+  }));
+}
+// Room transitions (V1-05A). Portal labels are operator-supplied text: textContent only.
+function transitions(t){
+  const portals = t.portals || [];
+  const labels = {};
+  portals.forEach((p, i) => { labels[p.portal_id] = p.label || ("door " + (i + 1)); });
+  $("transition-counts").textContent = portals.length
+    ? ("Entries: " + (t.entries_total ?? 0) + " \u00b7 Exits: " + (t.exits_total ?? 0)
+       + " \u00b7 portals: " + portals.length)
+    : "No doorway configured \u2014 entries and exits are not measured.";
+  const items = (t.recent || []).map(e => {
+    const verb = e.kind === "PERSON_ENTERED_ROOM" ? "Entered via " : "Exited via ";
+    return verb + (labels[e.portal_id] || e.portal_id) + " \u00b7 track " + e.track_id;
+  });
+  const list = $("transitions");
+  list.replaceChildren(...(items.length ? items : ["No room transitions yet."]).map(text => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    return li;
+  }));
 }
 function teardown(){
   stopped = true;
@@ -321,6 +420,9 @@ def build_handler(runtime: LiveDemoRuntime) -> type[BaseHTTPRequestHandler]:
                     "timeline": runtime.timeline.recent(MAX_TIMELINE_EVENTS),
                     "failure": runtime.failure,
                     "running": runtime.running,
+                    "calibration": runtime.calibration(),
+                    "occupancy_diagnostics": runtime.occupancy_diagnostics(),
+                    "room_transitions": runtime.room_transitions(),
                 }
                 self._send(
                     200,

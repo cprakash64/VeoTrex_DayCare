@@ -178,6 +178,8 @@ def test_api_image_does_not_run_a_development_server() -> None:
     api = "\n".join(_uncommented(API_DOCKERFILE.read_text()))
     assert "--reload" not in api
     assert "--workers" in api
+    # V1-DEMO-03B: the edge WHEP lease registry is process-local; one worker is load-bearing.
+    assert '"--workers", "1"' in api
     web = "\n".join(_uncommented(WEB_DOCKERFILE.read_text()))
     assert "next dev" not in web
     assert "NODE_ENV=production" in web

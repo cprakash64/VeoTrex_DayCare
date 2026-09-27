@@ -208,7 +208,7 @@ def trusted_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
         "compatibility": {
             "architecture": "aarch64",
             "cuda": "13.2",
-            "l4t": "39.2.0",
+            "l4t": runtime_module.EXPECTED_L4T,
             "tensorrt": "10.16.2.10",
         },
         "upstream_url": "https://example.invalid/model.onnx",
@@ -277,7 +277,7 @@ def test_wrong_engine_hash_is_rejected(tmp_path: Path, monkeypatch: pytest.Monke
             {
                 "architecture": "aarch64",
                 "cuda": "13.2",
-                "l4t": "39.2.0",
+                "l4t": runtime_module.EXPECTED_L4T,
                 "tensorrt": "wrong",
             },
         ),
@@ -346,3 +346,228 @@ def test_repeated_descriptor_transport_does_not_leak() -> None:
         left.close()
         right.close()
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+# ---------------------------------------------- R39.2.1 qualification (hotfix, 2026-09-25)
+PINNED_ONNX_SHA256 = "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"
+R39_2_1_RELEASE = (
+    "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64, "
+    "DATE: Fri Aug  7 05:54:22 AM UTC 2026\n"
+    "# KERNEL_VARIANT: oot\n"
+)
+R39_2_0_RELEASE = R39_2_1_RELEASE.replace("REVISION: 2.1,", "REVISION: 2.0,")
+
+
+def _host_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    release = tmp_path / "host_nv_tegra_release"
+    release.write_text(text)
+    monkeypatch.setattr(runtime_module, "_machine", lambda: "aarch64")
+    monkeypatch.setattr(runtime_module, "L4T_RELEASE_PATH", release)
+
+
+def _edit_manifest(manifest_path: Path, **changes: object) -> None:
+    manifest = json.loads(manifest_path.read_text())
+    for key, value in changes.items():
+        if key in {"architecture", "cuda", "l4t", "tensorrt"}:
+            manifest["compatibility"][key] = value
+        else:
+            manifest[key] = value
+    manifest_path.write_text(json.dumps(manifest))
+
+
+def test_the_qualified_platform_is_exactly_r39_2_1() -> None:
+    assert runtime_module.EXPECTED_L4T == "39.2.1"
+    assert runtime_module.L4T_RELEASE_MARKER == "# R39 (release), REVISION: 2.1"
+    assert runtime_module.EXPECTED_TRT == "10.16.2.10"
+    assert runtime_module.EXPECTED_ARCHITECTURE == "aarch64"
+    # The rebuilt plan is a new artifact of the same pinned parent.
+    assert runtime_module.ONNX_SHA256 == PINNED_ONNX_SHA256
+    assert runtime_module.ENGINE_SHA256 != (
+        "f204dff3573a15647266ba287f789d266fd95a912dd0a75e973ab046e3991068"
+    ), "the R39.2.0 plan must not be relabelled as R39.2.1"
+
+
+def test_r39_2_1_manifest_on_r39_2_1_host_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, _ = trusted_store(tmp_path, monkeypatch)
+    _host_release(tmp_path, monkeypatch, R39_2_1_RELEASE)
+    resolved, contract = verify_engine("yolox-s-fp16", root=tmp_path)
+    assert resolved == engine and contract["parent_onnx_sha256"] == PINNED_ONNX_SHA256
+
+
+def test_r39_2_0_manifest_on_r39_2_1_host_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manifest_path = trusted_store(tmp_path, monkeypatch)
+    _edit_manifest(manifest_path, l4t="39.2.0")
+    _host_release(tmp_path, monkeypatch, R39_2_1_RELEASE)
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+def test_r39_2_1_manifest_on_r39_2_0_host_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_store(tmp_path, monkeypatch)
+    _host_release(tmp_path, monkeypatch, R39_2_0_RELEASE)
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "release",
+    [
+        R39_2_1_RELEASE.replace("REVISION: 2.1,", "REVISION: 2.10,"),
+        R39_2_1_RELEASE.replace("REVISION: 2.1,", "REVISION: 2.11,"),
+        R39_2_1_RELEASE.replace("# R39", "# R40"),
+        R39_2_1_RELEASE.replace("# R39", "# R3"),
+        "# R39 (release), REVISION: 2.1x\n",
+        "junk\n# R39 (release), REVISION: 2.0, GCID: 1\n",
+        "",
+    ],
+)
+def test_only_the_exact_l4t_revision_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: str
+) -> None:
+    trusted_store(tmp_path, monkeypatch)
+    _host_release(tmp_path, monkeypatch, release)
+    with pytest.raises(RuntimeFailure, match="platform_incompatible"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+def test_the_l4t_marker_may_end_the_line() -> None:
+    assert runtime_module.l4t_release_matches("# R39 (release), REVISION: 2.1\n")
+    assert runtime_module.l4t_release_matches(R39_2_1_RELEASE)
+    assert not runtime_module.l4t_release_matches(R39_2_0_RELEASE)
+
+
+@pytest.mark.parametrize(
+    ("changes", "category"),
+    [
+        ({"architecture": "x86_64"}, "platform_incompatible"),
+        ({"tensorrt": "10.16.2.9"}, "platform_incompatible"),
+        ({"cuda": "13.0"}, "platform_incompatible"),
+        ({"l4t": "39.2"}, "platform_incompatible"),
+        ({"parent_onnx_sha256": "0" * 64}, "manifest_contract_mismatch"),
+        ({"precision": "fp32"}, "manifest_contract_mismatch"),
+        ({"artifact_status": "candidate"}, "manifest_contract_mismatch"),
+        (
+            {"outputs": [{"dtype": "float32", "name": "output", "shape": [1, 8400, 84]}]},
+            "manifest_contract_mismatch",
+        ),
+        (
+            {"inputs": [{"dtype": "float32", "name": "input", "shape": [1, 3, 640, 640]}]},
+            "manifest_contract_mismatch",
+        ),
+        ({"byte_size": 5}, "artifact_size_mismatch"),
+        ({"sha256": "1" * 64}, "artifact_hash_mismatch"),
+    ],
+)
+def test_every_other_contract_field_still_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changes: dict[str, object],
+    category: str,
+) -> None:
+    _, manifest_path = trusted_store(tmp_path, monkeypatch)
+    _edit_manifest(manifest_path, **changes)
+    _host_release(tmp_path, monkeypatch, R39_2_1_RELEASE)
+    with pytest.raises(RuntimeFailure, match=category):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+def test_the_runtime_constants_bind_size_and_digest_not_just_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A self-consistent manifest for a different plan is still refused by the constants."""
+    engine, manifest_path = trusted_store(tmp_path, monkeypatch)
+    engine.write_bytes(b"other")
+    _edit_manifest(
+        manifest_path, sha256=hashlib.sha256(b"other").hexdigest(), byte_size=len(b"other")
+    )
+    _host_release(tmp_path, monkeypatch, R39_2_1_RELEASE)
+    with pytest.raises(RuntimeFailure, match="manifest_contract_mismatch"):
+        verify_engine("yolox-s-fp16", root=tmp_path)
+
+
+def test_a_symlinked_directory_or_outside_root_engine_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    engine, manifest_path = trusted_store(store, monkeypatch)
+    _host_release(tmp_path, monkeypatch, R39_2_1_RELEASE)
+    outside = tmp_path / "outside_engines"
+    engine.parent.rename(outside)
+    (store / "yolox-s" / "engines").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeFailure) as caught:
+        verify_engine("yolox-s-fp16", root=store)
+    assert str(caught.value) in {"artifact_symlink_rejected", "artifact_outside_trusted_root"}
+    assert manifest_path.name.endswith(".plan.manifest.json")
+
+
+# -------------------------------------------- detector surfaces bounded worker categories
+class _FailingSupervisor:
+    failure: BaseException = RuntimeError("unset")
+    stopped = 0
+
+    def start(self) -> dict[str, object]:
+        return {}
+
+    def load_model(self, model_id: str = "yolox-s-fp16") -> dict[str, object]:
+        raise type(self).failure
+
+    def stop(self) -> None:
+        type(self).stopped += 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        ("platform_incompatible", "gpu_worker_platform_incompatible"),
+        ("tensorrt_version_mismatch", "gpu_worker_tensorrt_version_mismatch"),
+        ("artifact_hash_mismatch", "gpu_worker_artifact_hash_mismatch"),
+        ("engine_tensor_contract_mismatch", "gpu_worker_engine_tensor_contract_mismatch"),
+        ("worker_error", "gpu_worker_start_failed"),
+        ("inference_failed", "gpu_worker_start_failed"),
+        ("/opt/secret/path.plan", "gpu_worker_start_failed"),
+    ],
+)
+def test_the_detector_surfaces_only_allowlisted_worker_categories(
+    monkeypatch: pytest.MonkeyPatch, failure: str, category: str
+) -> None:
+    from veotrex_edge_agent import gpu_worker
+    from veotrex_edge_agent.gpu_worker.supervisor import WorkerFailure
+    from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
+
+    _FailingSupervisor.failure = WorkerFailure(failure)
+    _FailingSupervisor.stopped = 0
+    monkeypatch.setattr(gpu_worker, "GpuWorkerSupervisor", _FailingSupervisor)
+    with pytest.raises(DetectorUnavailable) as caught:
+        YoloxPersonDetector(environment="test").start()
+    assert str(caught.value) == category
+    assert _FailingSupervisor.stopped == 1, "a failed load never leaves the worker running"
+
+
+def test_non_worker_exceptions_are_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    from veotrex_edge_agent import gpu_worker
+    from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
+
+    _FailingSupervisor.failure = RuntimeError(
+        "platform_incompatible at /home/x/.env VEOTREX_SECRET=abc"
+    )
+    monkeypatch.setattr(gpu_worker, "GpuWorkerSupervisor", _FailingSupervisor)
+    with pytest.raises(DetectorUnavailable) as caught:
+        YoloxPersonDetector(environment="test").start()
+    assert str(caught.value) == "gpu_worker_start_failed"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+def test_every_surfaced_category_is_one_the_supervisor_can_produce() -> None:
+    from veotrex_edge_agent.gpu_worker import supervisor
+    from veotrex_edge_agent.recorded.yolox import SURFACED_WORKER_FAILURES
+
+    source = Path(supervisor.__file__).read_text()
+    for category in SURFACED_WORKER_FAILURES:
+        assert f'"{category}"' in source, category

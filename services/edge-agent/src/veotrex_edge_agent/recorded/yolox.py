@@ -44,6 +44,38 @@ MODEL_VERSION = "r4b"
 PERSON_CLASS_ID = 0
 
 
+# Worker failures an operator can act on, surfaced as ``gpu_worker_<category>``. These are
+# already sanitized by the supervisor (its own allowlist); this narrower list decides which of
+# them are worth distinguishing at the detector boundary. Everything else, including any
+# non-WorkerFailure exception, stays the generic ``gpu_worker_start_failed``.
+SURFACED_WORKER_FAILURES = frozenset(
+    {
+        "platform_incompatible",
+        "architecture_mismatch",
+        "tensorrt_version_mismatch",
+        "cuda_runtime_version_mismatch",
+        "cuda_device_unavailable",
+        "artifact_unavailable",
+        "artifact_hash_mismatch",
+        "artifact_size_mismatch",
+        "artifact_symlink_rejected",
+        "manifest_contract_mismatch",
+        "engine_deserialize_failed",
+        "engine_tensor_contract_mismatch",
+        "worker_timeout",
+    }
+)
+
+
+def detector_failure_category(exc: BaseException) -> str:
+    """The bounded category a failed worker start or model load is reported as."""
+    from veotrex_edge_agent.gpu_worker.supervisor import WorkerFailure
+
+    if isinstance(exc, WorkerFailure) and str(exc) in SURFACED_WORKER_FAILURES:
+        return f"gpu_worker_{exc}"
+    return "gpu_worker_start_failed"
+
+
 class DetectorUnavailable(Exception):
     """This detector cannot run here. Raised at construction or start, never per frame."""
 
@@ -90,12 +122,13 @@ class YoloxPersonDetector:
         try:
             supervisor.start()
             loaded = supervisor.load_model()
-        except Exception:
+        except Exception as exc:
             # A worker that started but failed to load must not be left running; stopping it
             # must not mask the load failure that is about to be reported.
+            category = detector_failure_category(exc)
             with contextlib.suppress(Exception):
                 supervisor.stop()
-            raise DetectorUnavailable("gpu_worker_start_failed") from None
+            raise DetectorUnavailable(category) from None
         self._supervisor = supervisor
         self._detector = ReferenceImageDetector(supervisor)
         return {

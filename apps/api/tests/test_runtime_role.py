@@ -82,6 +82,10 @@ def test_classification_semantics_are_explicit() -> None:
     assert TABLE_CLASSIFICATION["ring_webhook_inbox"].access is TableAccess.FUNCTION_ONLY
     assert TABLE_CLASSIFICATION["ring_pending_links"].access is TableAccess.FUNCTION_ONLY
     assert TABLE_CLASSIFICATION["tenant_identity_bindings"].access is TableAccess.FUNCTION_ONLY
+    # V1-DEMO-03B: credential digests are function-only; nodes and assignments are read-only.
+    assert TABLE_CLASSIFICATION["edge_node_credentials"].access is TableAccess.FUNCTION_ONLY
+    assert TABLE_CLASSIFICATION["edge_nodes"].privileges == {"SELECT"}
+    assert TABLE_CLASSIFICATION["camera_assignments"].privileges == {"SELECT"}
     assert TABLE_CLASSIFICATION["alembic_version"].access is TableAccess.RUNTIME_NO_ACCESS
     assert TABLE_CLASSIFICATION["audit_events"].privileges == {"SELECT", "INSERT"}
     assert TABLE_CLASSIFICATION["cameras"].privileges == {"SELECT", "INSERT", "UPDATE"}
@@ -708,8 +712,9 @@ def test_probe_from_the_runtime_role_passes_every_check(
         results = probe(connection, role=runtime_role_name, migration_role=migration_role)
     failed = [result for result in results if not result.passed]
     assert not failed, [(result.check, result.detail) for result in failed]
-    # V1-01A-2-R1: identity gate, artifact guard, then the active checks (21 in total).
-    assert len(results) == 21
+    # V1-01A-2-R1: identity gate, artifact guard, then the active checks (21 in total);
+    # V1-DEMO-03B adds the two edge-credential checks.
+    assert len(results) == 23
     assert results[0].check == "runtime role identity" and results[1].check.startswith("no prior")
     assert not any(result.check == PROBE_ABORTED for result in results)
     databases = [result for result in results if result.check == "cannot create databases"]

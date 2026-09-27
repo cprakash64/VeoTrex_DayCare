@@ -159,14 +159,91 @@ TABLE_CLASSIFICATION: Mapping[str, TableClassification] = {
     "ring_pending_links": _function_only("pending-link state machine functions"),
     "ring_webhook_inbox": _function_only("webhook inbox functions"),
     "tenant_identity_bindings": _function_only("resolve_tenant_identity_binding"),
+    # Machine credentials (migration 0008): digests only, reached through the authentication
+    # function alone, so a compromised API cannot enumerate or rewrite them.
+    "edge_node_credentials": _function_only("authenticate_edge_node_credential"),
     "alembic_version": _no_access("migration bookkeeping"),
     "jurisdiction_policies": _no_access("policy catalog is file-backed in the API today"),
     "policy_versions": _no_access("policy catalog is file-backed in the API today"),
-    "facilities": _no_access("no API endpoint yet"),
-    "areas": _no_access("no API endpoint yet"),
-    "zones": _no_access("no API endpoint yet"),
-    "edge_nodes": _no_access("no API endpoint yet"),
-    "camera_assignments": _no_access("no API endpoint yet"),
+    # Classrooms (V1-04A): a classroom is an Area of kind CLASSROOM. Facilities and zones are
+    # read to scope and describe it; facilities and zones are still created only by the admin
+    # identity. Soft state only - DELETE is never granted.
+    "facilities": _read("classroom scope: facility name, timezone and status"),
+    "areas": _write(
+        "classroom create, rename, age-band label, activate/deactivate",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "zones": _read("classroom camera association (camera -> zone -> area)"),
+    # V1-04B: append-only operator head counts. UPDATE exists only for the single revocation a
+    # trigger permits (migration 0010); DELETE is never granted.
+    "classroom_presence_snapshots": _write(
+        "manual classroom presence reports; revocation is the only permitted update",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "classroom_ratio_policies": _write(
+        "operator-configured classroom ratio policies; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    # V1-04C: operator ratio-eligibility designations are edited and deactivated, never deleted;
+    # staff check-in/out is a pure event stream, so the runtime can only append to it.
+    "staff_ratio_eligibility": _write(
+        "facility staff roster and counts-toward-ratio designation; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "staff_presence_events": _append(
+        "operator staff check-in / refresh / check-out events; append-only by grant"
+    ),
+    # V1-04D: the facility child roster is edited and deactivated/archived, never deleted;
+    # attendance is a pure event stream the runtime can only append to.
+    "child_profiles": _write(
+        "facility child roster: display name, status, external reference; never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_attendance_events": _append(
+        "operator child attendance check-in / refresh / check-out events; append-only by grant"
+    ),
+    # V1-04E: guardian contacts and their child links are edited and deactivated, never
+    # deleted; an authorized release is a pure event the runtime can only append.
+    "guardian_contacts": _write(
+        "facility guardian/contact roster: display name, status, external reference; never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_guardian_links": _write(
+        "child <-> contact association and pickup authorization; deactivated, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    "child_release_events": _append(
+        "authorized child release records paired with their check-out; append-only by grant"
+    ),
+    # V1-05A: operator doorway lines per camera; edited or archived, never deleted.
+    "camera_portals": _write(
+        "camera doorway lines for anonymous room entry/exit; archived, never deleted",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+    ),
+    # Edge WHEP broker (V1-DEMO-03B): read-only camera authorization of an authenticated node.
+    # Nodes and assignments are still managed only by the admin identity.
+    # V1-05B: anonymous room entry/exit reported by edge nodes; append-only by grant.
+    "room_transition_events": _append(
+        "anonymous room entry/exit events from edge nodes; append-only by grant"
+    ),
+    "edge_nodes": _read("edge broker: authenticated node status in camera authorization"),
+    "camera_assignments": _read("edge broker: the node's active camera assignment"),
 }
 
 # The intentionally exposed SECURITY DEFINER surface. Each was created with a fixed
@@ -189,6 +266,7 @@ RUNTIME_FUNCTION_GRANTS: tuple[str, ...] = (
     "vault_credential_open(uuid, text, text, uuid)",
     "vault_credential_replace(uuid, text, text, uuid, integer, integer, bytea, bytea)",
     "vault_credential_delete(uuid, text, text, uuid)",
+    "authenticate_edge_node_credential(uuid, bytea)",
 )
 # ``vault_credential_authorized`` is deliberately absent: it is the private predicate the four
 # vault functions call as their owner, and the runtime must not be able to probe it.
@@ -986,6 +1064,16 @@ def probe(
         "vault open of an unknown credential discloses nothing",
         "SELECT count(*) FROM public.vault_credential_open("
         "gen_random_uuid(), 'RING', 'ring_pending_link', gen_random_uuid()) WHERE outcome = 'ok'",
+        0,
+    )
+    expect_refused(
+        "cannot read edge node credentials directly",
+        "SELECT count(*) FROM public.edge_node_credentials",
+    )
+    expect_count(
+        "edge credential authentication of an unknown selector discloses nothing",
+        "SELECT count(*) FROM public.authenticate_edge_node_credential("
+        "gen_random_uuid(), decode(repeat('00', 32), 'hex'))",
         0,
     )
     expect_refused("cannot create tables", f"CREATE TABLE public.{PROBE_ARTIFACT} (id int)")

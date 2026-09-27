@@ -52,6 +52,17 @@ def test_all_expected_customer_tables_are_tenant_owned() -> None:
         "actor_identities",
         "role_assignments",
         "audit_events",
+        "classroom_ratio_policies",
+        "classroom_presence_snapshots",
+        "staff_ratio_eligibility",
+        "staff_presence_events",
+        "child_profiles",
+        "child_attendance_events",
+        "guardian_contacts",
+        "child_guardian_links",
+        "child_release_events",
+        "camera_portals",
+        "room_transition_events",
     }
 
 

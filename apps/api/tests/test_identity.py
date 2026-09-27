@@ -90,8 +90,10 @@ async def test_valid_token_is_normalized_and_cached() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"exp": datetime.now(UTC) - timedelta(minutes=1)},
-        {"nbf": datetime.now(UTC) + timedelta(minutes=5)},
+        # Offsets, resolved when the test runs: an absolute time taken at collection goes
+        # stale in a long suite (a "future" nbf became valid after a 12-minute run).
+        {"exp": timedelta(minutes=-1)},
+        {"nbf": timedelta(minutes=5)},
         {"iss": "https://wrong-issuer.example/"},
         {"aud": "https://wrong-audience.example"},
         {"sub": None},
@@ -101,10 +103,12 @@ async def test_valid_token_is_normalized_and_cached() -> None:
 async def test_invalid_registered_or_required_claims_fail_closed(
     overrides: dict[str, Any],
 ) -> None:
+    now = datetime.now(UTC)
+    claims = {k: now + v if isinstance(v, timedelta) else v for k, v in overrides.items()}
     private_key, jwk = signing_material("claim-key")
     verifier = Auth0IdentityVerifier(settings(), StubFetcher({"keys": [jwk]}))
     with pytest.raises(IdentityVerificationError):
-        await verifier.verify(token(private_key, "claim-key", overrides=overrides))
+        await verifier.verify(token(private_key, "claim-key", overrides=claims))
 
 
 async def test_wrong_key_malformed_token_and_algorithm_confusion_are_rejected() -> None:

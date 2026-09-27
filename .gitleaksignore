@@ -1,0 +1,18 @@
+# Exact gitleaks fingerprints (commit:path:rule:line) for reviewed FALSE POSITIVES that are
+# already part of published history. History is never rewritten, so each finding is excused
+# here individually - no path, rule or regex allowlist. A new or moved occurrence has a new
+# fingerprint and is still reported.
+#
+# All five are synthetic test fixtures, rewritten in "fix(ci): repair PR validation failures"
+# so the current source no longer contains a credential-shaped literal:
+#
+# - An edge machine token of the form vte1.<hand-picked selector uuid>.<"S" * 42 + "w">. The
+#   flagged literal is the public version tag and selector; the secret part was never a
+#   literal. Now assembled at runtime from a SELECTOR constant.
+91598c1670f7fc79f3803ec7dca9d76209397371:services/edge-agent/tests/test_broker_whep.py:generic-api-key:47
+c49eb2e2fec33f14712c49a27a03ba091ba28ab8:services/edge-agent/tests/test_ring_brokered_live.py:generic-api-key:53
+c49eb2e2fec33f14712c49a27a03ba091ba28ab8:services/edge-agent/tests/test_ring_webrtc_e2e.py:generic-api-key:48
+d0821f31ee3c67603c4b674e5e7afc3dbf970aa2:services/edge-agent/tests/test_managed_edge.py:generic-api-key:67
+# - A JWT-shaped marker in a synthetic Ring error body: a base64 {"alg":"RS256"} header
+#   followed by the word SECRETJWT, not a token. Now the plain marker SECRETREFRESHJWT.
+94b9d5b1ac02655964303a4bc909cc99402b0e4f:apps/api/tests/test_ring_whep_client.py:generic-api-key:769

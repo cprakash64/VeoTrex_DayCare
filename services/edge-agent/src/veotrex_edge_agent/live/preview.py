@@ -21,13 +21,20 @@ the dashboard falls back to an explicit placeholder instead of a convincing lie.
 
 The overlay draws the tracker's *current confirmed* boxes and a track number. It never draws a
 name, an identity, an age, a classification or a score, because none of those exist here.
+
+Since V1-03B a confirmed track whose evidence does not yet count toward occupancy is drawn
+thin and grey and labelled "Candidate N" rather than "Track N" - shown, not hidden, and not
+counted in the head count on the strip. Configured ignore regions are outlined and numbered, so
+an operator can always see which part of the view is being suppressed. Region labels are never
+burned into the picture.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +44,9 @@ from veotrex_edge_agent.qualification.metrics import BoundedSamples
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
     from numpy.typing import NDArray
+
+    from veotrex_edge_agent.live.portal_geometry import PortalSet
+    from veotrex_edge_agent.recorded.regions import IgnoreRegionSet
 
 # Defaults chosen for the demo: smooth enough to read as live, cheap enough to be invisible
 # against the detector's cost.
@@ -59,6 +69,10 @@ BOX_COLOURS = (
     (140, 255, 140),
     (80, 80, 255),
 )
+CANDIDATE_COLOUR = (150, 150, 150)
+REGION_COLOUR = (0, 190, 255)
+# Portals are drawn in a colour no track or region uses.
+PORTAL_COLOUR = (255, 120, 220)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +183,7 @@ class PreviewRenderer:
         self.previews_skipped_total = 0
         self.encode_failures_total = 0
         self._last_encode_monotonic = 0.0
+        self._first_encode_monotonic: float | None = None
         self._unavailable = False
 
     def _due(self, now: float) -> bool:
@@ -182,6 +197,9 @@ class PreviewRenderer:
         frame_index: int,
         occupancy: int,
         source_health: str,
+        candidates: Collection[int] = frozenset(),
+        regions: IgnoreRegionSet | None = None,
+        portals: PortalSet | None = None,
     ) -> PreviewFrame | None:
         """Encode this frame if one is due, otherwise skip it cheaply.
 
@@ -201,7 +219,9 @@ class PreviewRenderer:
 
         started = time.perf_counter_ns()
         try:
-            canvas = self._annotate(cv2, image, boxes, occupancy, source_health)
+            canvas = self._annotate(
+                cv2, image, boxes, occupancy, source_health, candidates, regions, portals
+            )
             ok, encoded = cv2.imencode(
                 ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), self.config.jpeg_quality]
             )
@@ -217,6 +237,8 @@ class PreviewRenderer:
             self.encode_failures_total += 1
             return None
         self._last_encode_monotonic = now
+        if self._first_encode_monotonic is None:
+            self._first_encode_monotonic = now
         self.previews_encoded_total += 1
         self.encode_ms.add((time.perf_counter_ns() - started) / 1e6)
         return frame
@@ -228,6 +250,9 @@ class PreviewRenderer:
         boxes: Sequence[tuple[int, tuple[float, ...]]],
         occupancy: int,
         source_health: str,
+        candidates: Collection[int] = frozenset(),
+        regions: IgnoreRegionSet | None = None,
+        portals: PortalSet | None = None,
     ) -> Any:
         """Boxes and track numbers on a copy of the frame.
 
@@ -246,11 +271,66 @@ class PreviewRenderer:
         else:
             canvas = image.copy()
 
+        canvas_height, canvas_width = canvas.shape[:2]
+        for number, region in enumerate(regions.regions if regions else (), start=1):
+            rx1, ry1, rx2, ry2 = region.pixels(canvas_width, canvas_height)
+            cv2.rectangle(canvas, (int(rx1), int(ry1)), (int(rx2), int(ry2)), REGION_COLOUR, 1)
+            cv2.putText(
+                canvas,
+                f"ignore region {number}",
+                (int(rx1) + 4, min(int(ry2) - 6, canvas_height - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                REGION_COLOUR,
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Portals (V1-05A): the doorway line, a short arrow from its midpoint into the room, and a
+        # number. The operator's label stays on the dashboard, never in the picture.
+        for number, portal in enumerate(portals.portals if portals else (), start=1):
+            if not portal.enabled:
+                continue  # a disabled portal is not evaluated, so it is not drawn as if it were
+            colour = PORTAL_COLOUR
+            start = (int(portal.x1 * canvas_width), int(portal.y1 * canvas_height))
+            end = (int(portal.x2 * canvas_width), int(portal.y2 * canvas_height))
+            cv2.line(canvas, start, end, colour, 2, cv2.LINE_AA)
+            # The inside normal is in normalised units; scaled to pixels it still points into
+            # the room's half of the picture.
+            nx, ny = portal.inside_normal
+            vx, vy = nx * canvas_width, ny * canvas_height
+            magnitude = max(math.hypot(vx, vy), 1e-9)
+            reach = 0.06 * min(canvas_width, canvas_height)
+            mx, my = (start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0
+            tip = (int(mx + vx / magnitude * reach), int(my + vy / magnitude * reach))
+            cv2.arrowedLine(canvas, (int(mx), int(my)), tip, colour, 2, cv2.LINE_AA, 0, 0.35)
+            portal_text = f"door {number} in"
+            cv2.putText(
+                canvas,
+                portal_text,
+                (tip[0] + 4, tip[1] + 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                colour,
+                1,
+                cv2.LINE_AA,
+            )
+
         for track_id, box in boxes:
-            colour = BOX_COLOURS[int(track_id) % len(BOX_COLOURS)]
+            candidate = int(track_id) in candidates
+            colour = (
+                CANDIDATE_COLOUR if candidate else BOX_COLOURS[int(track_id) % len(BOX_COLOURS)]
+            )
             x1, y1, x2, y2 = (float(value) * scale for value in box)
-            cv2.rectangle(canvas, (int(x1), int(y1)), (int(x2), int(y2)), colour, 2)
-            label = f"Track {int(track_id)}"
+            cv2.rectangle(
+                canvas, (int(x1), int(y1)), (int(x2), int(y2)), colour, 1 if candidate else 2
+            )
+            # Two plain literals rather than one conditional string, so the test that audits
+            # every word this module can draw still sees both of them.
+            if candidate:
+                label = f"Candidate {int(track_id)}"
+            else:
+                label = f"Track {int(track_id)}"
             # A filled strip behind the label so it stays readable over a bright scene.
             (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             top = max(int(y1) - text_height - 6, 0)
@@ -276,7 +356,9 @@ class PreviewRenderer:
         # The state is worded for a human by the same function the page uses - "RUNNING"
         # burned into the picture beside a person's box invites exactly the misreading a
         # client made of it.
-        status = f"people: {occupancy}   {health_label(source_health)}"
+        pending = sum(1 for track_id, _ in boxes if int(track_id) in candidates)
+        pending_text = f" (+{pending} candidate)" if pending else ""
+        status = f"people: {occupancy}{pending_text}   {health_label(source_health)}"
         cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 24), (16, 18, 22), -1)
         cv2.putText(
             canvas, status, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 226, 232), 1, cv2.LINE_AA
@@ -286,10 +368,27 @@ class PreviewRenderer:
     def clear(self) -> None:
         self.buffer.clear()
 
+    @property
+    def preview_fps(self) -> float:
+        """Encode rate between the first and the latest published preview.
+
+        Previews are drawn on inference frames, so this can never exceed the inference rate:
+        a box is only ever drawn on the frame it was detected in.
+        """
+        first = self._first_encode_monotonic
+        count = self.previews_encoded_total
+        if first is None or count < 2 or self._last_encode_monotonic <= first:
+            return 0.0
+        return (count - 1) / (self._last_encode_monotonic - first)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "previews_encoded_total": self.previews_encoded_total,
             "previews_skipped_total": self.previews_skipped_total,
+            # V1-03A names for the same two counters, and the rate they amount to.
+            "preview_frames_encoded_total": self.previews_encoded_total,
+            "preview_frames_skipped_total": self.previews_skipped_total,
+            "preview_fps": round(self.preview_fps, 3),
             "preview_encode_failures_total": self.encode_failures_total,
             "preview_target_fps": self.config.target_fps,
             "preview_encode_ms": {

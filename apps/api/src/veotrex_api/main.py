@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -6,6 +8,8 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -16,6 +20,12 @@ from veotrex_api.access import (
     require_permission,
 )
 from veotrex_api.authorization import Permission
+from veotrex_api.camera_portal_api import register_camera_portal_routes
+from veotrex_api.camera_portal_service import CameraPortalService
+from veotrex_api.child_roster_api import register_child_roster_routes
+from veotrex_api.child_roster_service import ChildRosterService
+from veotrex_api.classroom_api import register_classroom_routes
+from veotrex_api.classroom_service import ClassroomService
 from veotrex_api.config import Settings, get_settings
 from veotrex_api.credential_vault import (
     CredentialVault,
@@ -30,6 +40,15 @@ from veotrex_api.db import (
     require_unprivileged,
     verify_runtime_role,
 )
+from veotrex_api.edge_api import (
+    is_edge_event_upload,
+    is_edge_whep_offer,
+    register_edge_routes,
+    register_edge_runtime_routes,
+)
+from veotrex_api.edge_auth import EdgeAuthenticator
+from veotrex_api.edge_runtime import EdgeRuntimeService
+from veotrex_api.edge_whep import EdgeWhepBroker, WhepLeaseRegistry
 from veotrex_api.encrypted_vault import (
     EncryptedCredentialVault,
     VaultKeyProvider,
@@ -39,6 +58,8 @@ from veotrex_api.face_backend import (
     backend_for,
     supports_recognition,
 )
+from veotrex_api.guardian_api import register_guardian_routes
+from veotrex_api.guardian_service import GuardianService
 from veotrex_api.identity import Auth0IdentityVerifier, IdentityVerifier
 from veotrex_api.logging import configure_logging
 from veotrex_api.request_media import (
@@ -49,10 +70,19 @@ from veotrex_api.request_media import (
     canonical_code_payload,
     normalize_media_type,
 )
-from veotrex_api.ring_client import RingAmbiguousResult, RingClient, RingClientError
+from veotrex_api.ring_client import (
+    SDP_MEDIA_TYPE,
+    RingAmbiguousResult,
+    RingClient,
+    RingClientError,
+)
 from veotrex_api.ring_inventory_service import RingInventoryError, RingInventoryService
 from veotrex_api.ring_service import RingLinkError, RingLinkService
 from veotrex_api.ring_webhook import RingWebhookError, RingWebhookService
+from veotrex_api.room_transition_api import (
+    RoomTransitionService,
+    register_room_transition_routes,
+)
 from veotrex_api.secrets import DefaultSecretResolver, SecretResolver
 from veotrex_api.staff_api import (
     is_enrollment_upload,
@@ -61,6 +91,8 @@ from veotrex_api.staff_api import (
 )
 from veotrex_api.staff_media import ALLOWED_MEDIA_TYPES, StaffMediaStore
 from veotrex_api.staff_recognition import StaffRecognitionService
+from veotrex_api.staff_roster_api import register_staff_roster_routes
+from veotrex_api.staff_roster_service import StaffRosterService
 from veotrex_api.staff_service import StaffEnrollmentService
 
 require_read_operational = require_permission(Permission.READ_OPERATIONAL)
@@ -239,6 +271,19 @@ def create_app(
         resolved_vault,
         inventory_service,
     )
+    # Edge WHEP broker (V1-DEMO-03B). The lease registry is process-local and bounded; it is
+    # correct only because the API runs as a single worker process (ADR 0021).
+    edge_whep_broker = EdgeWhepBroker(
+        resolved_settings,
+        resolved_factory,
+        ring_service,
+        resolved_ring_client,
+        WhepLeaseRegistry(
+            max_active=resolved_settings.edge_whep_max_active_leases,
+            max_per_node=resolved_settings.edge_whep_max_leases_per_node,
+            ttl_seconds=resolved_settings.edge_whep_lease_ttl_seconds,
+        ),
+    )
     resolved_media = staff_media or StaffMediaStore(Path(resolved_settings.staff_media_dir))
     resolved_face_backend = face_backend or _face_backend_for(resolved_settings)
     staff_service = StaffEnrollmentService(
@@ -303,12 +348,38 @@ def create_app(
             environment=resolved_settings.environment,
             version=resolved_settings.app_version,
         )
+        expiry = asyncio.create_task(edge_whep_broker.run_expiry_loop())
         yield
+        expiry.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await expiry
+        # Outstanding Ring sessions are torn down while the Ring client is still open.
+        await edge_whep_broker.shutdown()
         await resolved_ring_client.aclose()
         await resolved_engine.dispose()
         logger.info("service_stopped", service=resolved_settings.service_name)
 
     app = FastAPI(title="VeoTrex API", version=resolved_settings.app_version, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_failed(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default echoes each rejected input back, which fails outright for a JSON
+        # NaN/Infinity (a 500 instead of a 422) and repeats request content into responses.
+        # Same shape, without the echo (V1-05B).
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "type": error.get("type"),
+                        "loc": list(error.get("loc", ())),
+                        "msg": error.get("msg"),
+                    }
+                    for error in exc.errors()
+                ]
+            },
+        )
+
     app.state.engine = resolved_engine
     app.state.settings = resolved_settings
     app.state.identity_verifier = identity_verifier or Auth0IdentityVerifier(resolved_settings)
@@ -321,6 +392,27 @@ def create_app(
         window_seconds=60,
     )
     app.state.staff_service = staff_service
+    app.state.edge_authenticator = EdgeAuthenticator(
+        resolved_factory, AuthenticationFailureLogLimiter()
+    )
+    app.state.edge_whep_broker = edge_whep_broker
+    register_edge_routes(
+        app,
+        edge_whep_broker,
+        AuthenticationFailureLogLimiter(
+            limit=resolved_settings.edge_whep_rate_limit_per_minute, window_seconds=60
+        ),
+    )
+    # Edge runtime config + anonymous room-transition ingest (V1-05B): machine routes for the
+    # authenticated node's own cameras only.
+    app.state.edge_runtime_service = EdgeRuntimeService(resolved_factory)
+    register_edge_runtime_routes(
+        app,
+        app.state.edge_runtime_service,
+        AuthenticationFailureLogLimiter(
+            limit=resolved_settings.edge_runtime_rate_limit_per_minute, window_seconds=60
+        ),
+    )
     app.state.staff_recognition_service = recognition_service
     register_staff_routes(
         app,
@@ -330,6 +422,29 @@ def create_app(
             window_seconds=60,
         ),
     )
+    # Classrooms and configured ratio policies (V1-04A).
+    app.state.classroom_service = ClassroomService(resolved_factory)
+    register_classroom_routes(app, app.state.classroom_service)
+    # Facility staff roster, ratio eligibility and operator staff check-in/out (V1-04C). Always
+    # registered and independent of the face backend: presence is recorded by an operator, never
+    # by recognition.
+    app.state.staff_roster_service = StaffRosterService(resolved_factory)
+    register_staff_roster_routes(app, app.state.staff_roster_service)
+    # Facility child roster and operator attendance check-in/out (V1-04D). Human routes only;
+    # independent of any camera or face backend, and never reachable by an edge credential.
+    app.state.child_roster_service = ChildRosterService(resolved_factory)
+    register_child_roster_routes(app, app.state.child_roster_service)
+    # Guardian contacts, child associations and authorized release (V1-04E). Human routes only;
+    # no camera, face backend or edge credential can reach them, and no route accepts an image.
+    app.state.guardian_service = GuardianService(resolved_factory)
+    register_guardian_routes(app, app.state.guardian_service)
+    # Camera doorway lines for anonymous room entry/exit (V1-05A). Human routes; a managed edge
+    # node can pull them through /v1/edge/runtime-config (V1-05B, not yet deployed).
+    app.state.camera_portal_service = CameraPortalService(resolved_factory)
+    register_camera_portal_routes(app, app.state.camera_portal_service)
+    # Anonymous room-transition timeline for operators (V1-05B). Read-only human route.
+    app.state.room_transition_service = RoomTransitionService(resolved_factory)
+    register_room_transition_routes(app, app.state.room_transition_service)
     if recognition_service is not None:
         register_recognition_test_route(
             app,
@@ -351,12 +466,21 @@ def create_app(
             media_type = ""
             is_token_exchange = request.url.path == "/v1/integrations/ring/token-exchange"
             is_enrollment_image = is_enrollment_upload(request.method, request.url.path)
+            is_edge_offer = is_edge_whep_offer(request.method, request.url.path)
+            is_edge_events = is_edge_event_upload(request.method, request.url.path)
             if is_token_exchange:
                 body_limit = resolved_settings.ring_token_exchange_body_bytes
             elif request.url.path == "/v1/providers/ring/webhooks":
                 body_limit = resolved_settings.ring_webhook_body_bytes
             elif is_enrollment_image:
                 body_limit = resolved_settings.staff_enrollment_image_bytes
+            elif is_edge_offer:
+                # Refused before authentication or forwarding: an oversized offer never
+                # reaches the broker, let alone Ring.
+                body_limit = resolved_settings.edge_whep_max_offer_bytes
+            elif is_edge_events:
+                # Refused before authentication: an oversized batch never reaches the database.
+                body_limit = resolved_settings.edge_event_max_batch_bytes
             if body_limit is not None:
                 media_type = normalize_media_type(request.headers.get("content-type"))
 
@@ -380,6 +504,8 @@ def create_app(
                     accepted = TOKEN_EXCHANGE_MEDIA_TYPES
                 elif is_enrollment_image:
                     accepted = ALLOWED_MEDIA_TYPES
+                elif is_edge_offer:
+                    accepted = frozenset({SDP_MEDIA_TYPE})
                 else:
                     accepted = frozenset({"application/json"})
                 if media_type not in accepted:

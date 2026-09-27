@@ -5,7 +5,11 @@
 ```text
 Tenant
 └─ Facility (jurisdiction, IANA timezone)
-   ├─ Area (room/building/other typed area)
+   ├─ Area (room/building/other typed area; kind CLASSROOM = a classroom, V1-04A)
+   │  ├─ ClassroomRatioPolicy (operator-configured, effective-dated; ADR 0024)
+   │  ├─ ClassroomPresenceSnapshot (operator-reported counts, append-only, expiring; ADR 0025)
+   │  ├─ StaffPresenceEvent (operator check-in / refresh / check-out, append-only, leased; ADR 0026)
+   │  ├─ ChildAttendanceEvent (operator check-in / refresh / check-out, append-only, leased; ADR 0027)
    │  └─ Zone
    │     └─ Camera
    ├─ CameraProviderConnection ── Camera
@@ -33,9 +37,53 @@ Deletion is restrictive. Core records transition to archived/disabled states; au
 cascade. Permanent erasure requires an explicit, separately audited retention workflow that accounts
 for legal holds and statutory requirements.
 
+## Classrooms and configured ratio policy (V1-04A)
+
+A classroom is an `Area` with `kind = 'CLASSROOM'` and an optional operator `age_band_label`; its
+cameras are those whose zone belongs to it. `classroom_ratio_policies` holds the owner's
+configured numbers (children per qualified staff member, minimum staff, optional group size) for
+an effective period in facility-local days. These are configured policies, not verified law.
+Ratio evaluation takes role counts only from approved presence sources; a camera's head count
+is never a child or staff count and is used only as a reconciliation diagnostic. See ADR 0024.
+
+The first connected presence source is MANUAL (ADR 0025): an operator reports children,
+qualified staff and visitors for a room as an append-only, short-lived snapshot (30 s - 15 min,
+default 2 min). Only the latest report can be authoritative; once revoked or expired the ratio
+is `INSUFFICIENT_DATA` and no earlier report is reused.
+
+A classroom's qualified-staff count can instead come from the staff roster (ADR 0026), chosen
+explicitly per classroom (`presence_source_mode`). `StaffRatioEligibility` places a tenant-wide
+`StaffProfile` on a facility's roster and records whether an operator designated them as counting
+toward the configured classroom policy (not a verified qualification). `StaffPresenceEvent` rows
+check them into a classroom for a bounded lease (default 15 min, max 4 h); a person's latest event
+decides their single current room. Children stay a manual aggregate count, and face recognition
+never checks anyone in.
+
+A classroom can also take its child count from attendance (ADR 0027,
+`ATTENDANCE_CHILDREN_PLUS_ROSTER_STAFF`). `ChildProfile` is a facility-scoped roster entry - a
+display name for operators' own screens, a status and an optional external reference - with no
+photo, biometric, date of birth or guardian data. `ChildAttendanceEvent` rows check a child into a
+classroom for 30 min - 12 h (default 12 h); the latest event decides the single current
+classroom. Cameras never create or change attendance.
+
+Pickup is modelled without biometrics (ADR 0028). `GuardianContact` is a facility-scoped adult
+contact (display name, status, optional external reference - no photo, document, phone or
+email). `ChildGuardianLink` associates a contact with a child: an operator relationship label with
+no legal meaning, and separately a `pickup_authorized` flag with an effective period.
+`ChildReleaseEvent` is the append-only record of an authorized release, tied by composite FK to the
+exact CHECKED_OUT attendance event and the exact link that authorized it. A direct check-out stays
+an administrative action and never creates a release.
+
 ## Constraints not yet modeled
 
 - Facility/building is represented by typed `Area`; whether Building deserves a separate entity is open.
 - Actor roles are placeholders pending the authorization model.
 - Tenant-specific activation of approved global policy versions requires a future effective-dated binding.
-- Child, guardian, staff-person, biometric, attendance, incident, and media entities are non-goals.
+- A `CameraPortal` (V1-05A, ADR 0029) is an operator doorway line on one classroom camera's picture,
+  used only to decide anonymous room entry / exit from track crossings. Room transition events are
+  edge-session facts and are not persisted yet.
+- Incident and media entities are non-goals. Guardian contacts and pickup authorization are
+  operator records (V1-04E, ADR 0028), never camera or biometric identities. Staff persons
+  and their biometric templates were added in V1-02A (ADR 0019). Children exist only as
+  facility roster entries with operator attendance events (V1-04D, ADR 0027) - never as a
+  camera, face or biometric identity - and the ratio engine sees only aggregate counts.

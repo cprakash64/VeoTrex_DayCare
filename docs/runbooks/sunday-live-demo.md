@@ -54,11 +54,14 @@ Replace the device with the one step 1 reported. Useful options:
 | `--source synthetic` | no camera at all; a moving synthetic scene |
 | `--no-preview` | metrics only, no camera image (lower cost) |
 | `--preview-fps 5` | slower preview if the machine is busy; inference is never throttled to match |
+| `--inference-fps 6` | the default detector cadence; it adapts down under load, never above this |
+| `--inference-min-fps 3` / `--inference-max-fps 8` | the band the adaptive scheduler stays in |
 | `--duration 300` | stop automatically after five minutes |
 | `--port 8891` | change the dashboard port |
 | `--pixel-format MJPG` | the default. YUYV at 720p is capped at 9 fps by USB 2.0 bandwidth |
 | `--view left` \| `right` | **only** for dual-lens modules that send both lenses in one frame |
 | `--ignore-region ...` | drop detections from a known fixed artifact. See below |
+| `--portal ...` | a doorway line for anonymous room entry/exit counts. See below |
 
 ### Masking a known false positive
 
@@ -75,8 +78,10 @@ uv run --all-packages veotrex-edge live-demo --device /dev/video0 \
 ```
 
 Repeatable, up to eight regions. The demo prints the regions it accepted at startup, and the
-dashboard shows an **Ignored detections** counter — watch it climb to confirm the region is
-doing something, and watch it stay put when a person walks past.
+dashboard's **Camera calibration** card lists every region, its label, the containment rule and
+**Detections suppressed**. The preview outlines and numbers each region. Watch the suppressed
+count climb to confirm the region is doing something, and watch it stay put when a person walks
+past.
 
 **A detection is dropped when at least 80% of its area falls inside a region.** Containment, not
 the centre point: an adult standing in front of a poster is taller and wider than the poster, so
@@ -98,9 +103,82 @@ neighbouring regions survived, correctly by the rule and probably not what the o
 Finding the numbers: divide the pixel position by the frame width and height. A poster whose
 top-left corner is at (790, 130) in a 1280x720 frame starts at `0.62,0.18`.
 
-To find them without measuring the room, run the demo with no regions, watch `/api/state`, and
-look for a track whose box does not move: a person drifts tens of pixels in a few seconds, a
-poster drifts one or two.
+To find them without measuring the room, run the demo with no regions and read the
+`occupancy_diagnostics` it prints on exit (also in `/api/state`). Every track has a normalized
+box envelope, confidence statistics and a centre spread. A long-lived candidate is labelled
+`PERSISTENT_LOW_CONFIDENCE_CANDIDATE` and comes with a `suggested_ignore_region`.
+
+**A suggestion is never applied automatically, and a still box is not proof of anything.** A
+person asleep, seated or working at a desk does not move either. Before you pass a suggestion
+back as `--ignore-region`, look at the dashboard and confirm with your own eyes that the box sits
+on a fixed object. Also check that nobody could ever be wholly inside that rectangle: a narrow
+strip masks a small or distant person entirely. Labels may use letters, digits, spaces and
+`. _ - ( ) / : #`.
+
+### Room entry and exit need a doorway line (V1-05A)
+
+"Appeared in view" is not "entered the room", and "no longer visible" is not "left it". To count
+entries and exits, draw a line across the doorway and say which side is the room:
+
+```
+uv run --all-packages veotrex-edge live-demo --device /dev/video0 \
+  --portal door:0.55,0.2,0.55,0.95,RIGHT,Classroom door
+```
+
+Format `[id:]x1,y1,x2,y2,INSIDE[,label][,deadband=D]`, normalised like ignore regions (origin top
+left). `INSIDE` is the room's side **as seen on the picture**: `LEFT`/`RIGHT` for a line running
+up and down the picture, `ABOVE`/`BELOW` for one running across it; the demo refuses a side that
+runs along the line. Up to four portals; an invalid one stops the demo before the camera or the
+detector starts. The **Room transitions** card shows entries, exits
+and "Entered via <door>" / "Exited via <door>"; the preview draws the line with an arrow into the
+room.
+
+The rules: a person's position is the bottom-centre of their box. A crossing needs them clearly on
+one side (outside `--portal-deadband`, default 0.02), then three detections in a row clearly on the
+other side (`--portal-confirm-observations`), through the drawn segment. Standing in the doorway
+counts nothing. Someone already inside when the demo starts, or first seen inside, did not enter;
+someone who vanishes inside did not leave; a reconnect clears everything. Only validated tracks
+(below) are counted - a candidate's crossing is reported as suppressed. Nobody is identified, and
+nothing is sent anywhere: the events stay on this dashboard.
+
+The web app can store the same lines per classroom camera (Classrooms -> camera -> Doorway lines)
+and shows each as a ready-to-copy `--portal` flag. No deployed edge fetches them yet.
+
+#### Managed doorway lines and uploaded events (V1-05B, implemented, not deployed)
+
+Instead of `--portal`, a node can take its camera's lines from the control plane and upload its
+room events (ADR 0030):
+
+```
+uv run --all-packages veotrex-edge live-demo --source ring --ring-camera <camera uuid> \
+  --control-plane-url https://<control plane> --credential-file /abs/edge.credential \
+  --managed-portals --state-dir /abs/private/state
+```
+
+- Same machine credential as the Ring broker; nothing new to issue. `--managed-camera` defaults to
+  `--ring-camera`. `--state-dir` (or `$VEOTREX_EDGE_STATE_DIR`) must be a 0700 directory you own:
+  it holds the last-known-good lines (`config/`) and the event outbox (`outbox/`).
+- Lines are re-read every `--config-refresh-seconds` (default 60). A bad or unreachable control
+  plane keeps the current lines; with no cache yet there are simply no room events until the
+  first successful fetch. Video is never stopped by either.
+- `--portal` and `--managed-portals` together are refused. With `--environment staging` or
+  `production`, `--portal` is refused outright.
+- Events are queued on disk first and survive restarts and outages; `room_transitions.managed` in
+  the dashboard state shows config age/version and queue depth, dropped and dead-letter counts.
+- Operators see them at Classrooms -> *Room transitions*: "Person entered via Main Door". Nobody is
+  identified.
+
+This path is not deployed: do not enable it on `veotrex-edge.service` until migration 0015 and the
+API are live and the runtime-role probe passes.
+
+### Occupancy counts evidence
+
+The big number counts **validated** person tracks only. A confirmed track becomes validated once
+3 of its last 10 detections score at or above the tracker's high threshold (0.30). Until then it
+is a **candidate**: drawn thin and grey as "Candidate N", shown as "Candidate person tracks" under
+the count, and not counted. A candidate is not "not a person". It may be a distant, occluded or
+small person whose detections are weak, which is why it is shown rather than hidden. Once
+validated, a track stays counted until it has not been seen for 2 s. See ADR 0023.
 
 It prints the dashboard URL and the tunnel command, then runs until `Ctrl-C`.
 
@@ -117,8 +195,18 @@ ssh -N -L 8891:127.0.0.1:8891 <user>@<jetson-host>
 Then open <http://127.0.0.1:8891/> on the laptop. Leave that SSH session running for the demo.
 
 The page shows the live camera image with tracking boxes drawn on it, the current head count,
-capture/processing/preview rates, detector/tracker/pipeline latency, frames dropped, and source
-health.
+capture/inference/preview rates, detector/tracker/pipeline latency, and source health. Frames
+the detector did not run on are split by cause (ADR 0022):
+
+| Row | Meaning |
+|---|---|
+| Inference scheduler skips | intentional sampling — inference was not due yet. Normal, and large |
+| Backpressure drops | inference was due but the detector was still busy. Should stay near 0 |
+| Transport/media drops | lost before capture; `–` when the source cannot measure it |
+
+`Inference FPS` shows the achieved rate and, in brackets, the rate the scheduler is currently
+aiming for. A bracketed value below `--inference-fps` means the scheduler slowed down because the
+detector got slower; it recovers gradually on its own.
 
 The picture is rendered on the Jetson onto the exact frame the tracker processed, so boxes
 cannot drift away from the person. Exactly one frame is held in memory at a time and **nothing
@@ -157,15 +245,21 @@ detector is running.
 still up, and that the port in the tunnel matches `--port`. `curl -s localhost:8891/healthz` on
 the Jetson itself distinguishes a dead demo from a dead tunnel.
 
-**Boxes lag behind the person.** Expected and by design. The detector runs slower than the
-camera, so the pipeline deliberately drops stale frames to keep latency bounded — the "frames
-dropped" counter is that policy working, not a fault. A current view with gaps beats a complete
-view that is seconds behind.
+**Boxes lag behind the person.** Expected and by design. The detector runs at ~6 fps on the
+newest camera frame, not on every frame, so a box is up to one inference period (~170 ms) plus
+one detection (~100 ms) behind a moving person. The "Inference scheduler skips" counter is that
+sampling working, not a fault. A current view with gaps beats a complete view that is seconds
+behind.
 
-**The picture looks choppier than the boxes are accurate.** The preview is encoded at about
-8 fps while tracking runs faster; that is deliberate, so the picture never costs inference more
-than a few percent. Measured on this Jetson: processing 15.7 fps without the preview and 15.1
-with it. `--preview-fps` lowers it further, `--no-preview` removes it entirely.
+**Backpressure drops are climbing.** The detector is slower than the schedule. The scheduler
+slows itself down within a second (watch the bracketed target in `Inference FPS`); if drops keep
+climbing at the minimum rate, the detector itself is slower than `--inference-min-fps` allows,
+and `inference_scheduler_state` in the final metrics reads `DETECTOR_BELOW_MINIMUM`.
+
+**The picture looks choppier than the camera.** The preview is drawn only on frames the detector
+ran on, so its rate is at most the inference rate (~6 fps) and at most `--preview-fps`. That is
+deliberate: the boxes are drawn on the frame they were detected in, so they cannot drift off the
+person. `--no-preview` removes the picture entirely.
 
 **The video area shows a broken-image icon and its alt text.** Fixed in V1-DEMO-01R1; if it
 ever comes back, the page is claiming a frame the browser refused to render. Check the browser

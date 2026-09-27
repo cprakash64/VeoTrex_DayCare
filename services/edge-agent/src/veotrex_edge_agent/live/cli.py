@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
 from dataclasses import asdict
 from typing import Any
+from uuid import UUID
 
 from veotrex_edge_agent.live.camera import (
     DEFAULT_PIXEL_FORMAT,
@@ -22,13 +24,35 @@ from veotrex_edge_agent.live.camera import (
     discover_cameras,
 )
 from veotrex_edge_agent.live.fake import FakeLiveSource
+from veotrex_edge_agent.live.managed_config import DEFAULT_REFRESH_SECONDS
+from veotrex_edge_agent.live.managed_session import (
+    ManagedEdgeSession,
+    PortalPlan,
+    PortalPlanError,
+    resolve_portal_plan,
+)
+from veotrex_edge_agent.live.portal_crossing import DEFAULT_CONFIRM_OBSERVATIONS, CrossingPolicy
+from veotrex_edge_agent.live.portal_geometry import (
+    DEFAULT_DEADBAND,
+    PortalError,
+    PortalSet,
+    build_portals,
+)
 from veotrex_edge_agent.live.preview import (
     DEFAULT_JPEG_QUALITY,
     DEFAULT_PREVIEW_FPS,
     PreviewConfig,
     PreviewRenderer,
 )
+from veotrex_edge_agent.live.ring import RingWhepSource
+from veotrex_edge_agent.live.room_event_outbox import DEFAULT_CAPACITY as DEFAULT_OUTBOX_CAPACITY
 from veotrex_edge_agent.live.runtime import LiveDemoRuntime
+from veotrex_edge_agent.live.scheduler import (
+    DEFAULT_INFERENCE_FPS,
+    DEFAULT_MAX_INFERENCE_FPS,
+    DEFAULT_MIN_INFERENCE_FPS,
+    InferenceRateConfig,
+)
 from veotrex_edge_agent.live.server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -44,8 +68,31 @@ from veotrex_edge_agent.recorded.regions import (
 )
 from veotrex_edge_agent.recorded.yolox import DetectorUnavailable, YoloxPersonDetector
 
-SOURCE_CHOICES = ("camera", "synthetic")
+SOURCE_CHOICES = ("camera", "synthetic", "ring")
+# The same variables EdgeSettings reads (V1-DEMO-03B), so the service and the demo agree.
+CONTROL_PLANE_URL_ENV = "VEOTREX_EDGE_CONTROL_PLANE_URL"
+CREDENTIAL_FILE_ENV = "VEOTREX_EDGE_CREDENTIAL_FILE"
+# Private (0700) directory for the managed-portal cache and the room-event outbox (V1-05B).
+STATE_DIR_ENV = "VEOTREX_EDGE_STATE_DIR"
 DETECTOR_CHOICES = ("yolox", "none")
+BROKER_CONFIGURATION_CATEGORIES = frozenset(
+    {
+        "ring_camera_id_must_be_a_veotrex_camera_uuid",
+        "control_plane_url_not_configured",
+        "control_plane_url_invalid",
+        "credential_file_not_configured",
+        "credential_file_path_not_absolute",
+        "credential_file_missing",
+        "credential_file_is_symlink",
+        "credential_file_not_regular",
+        "credential_file_permissions_too_open",
+        "credential_file_wrong_owner",
+        "credential_file_too_large",
+        "credential_file_empty",
+        "credential_file_unreadable",
+        "credential_malformed",
+    }
+)
 
 
 def add_discover_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -57,6 +104,38 @@ def add_discover_arguments(command: argparse.ArgumentParser) -> argparse.Argumen
 
 def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
     command.add_argument("--source", choices=SOURCE_CHOICES, default="camera")
+    command.add_argument(
+        "--ring-camera",
+        default=None,
+        help=(
+            "with --source ring: the VeoTrex camera UUID assigned to this edge node (never a "
+            "Ring device id). With --ring-media-qualification any local label is accepted"
+        ),
+    )
+    command.add_argument(
+        "--control-plane-url",
+        default=None,
+        help=(
+            "HTTPS origin of the VeoTrex control plane (default: "
+            f"${CONTROL_PLANE_URL_ENV}). The broker negotiates Ring on the node's behalf"
+        ),
+    )
+    command.add_argument(
+        "--credential-file",
+        default=None,
+        help=(
+            "absolute path of this node's 0600 machine-credential file (default: "
+            f"${CREDENTIAL_FILE_ENV}). Only the path is accepted; the credential never is"
+        ),
+    )
+    command.add_argument(
+        "--ring-media-qualification",
+        action="store_true",
+        help=(
+            "LOCAL ONLY: drive the Ring media path from a synthetic encoded stream instead of "
+            "a Ring session. Qualifies decode and frame delivery; contacts nothing"
+        ),
+    )
     command.add_argument(
         "--device",
         default="0",
@@ -102,6 +181,69 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
             "Lower values suppress more, and risk hiding a person standing in front of it"
         ),
     )
+    command.add_argument(
+        "--portal",
+        action="append",
+        default=None,
+        metavar="[id:]x1,y1,x2,y2,INSIDE[,label]",
+        dest="portals",
+        help=(
+            "a doorway line in normalized 0-1 frame coordinates, with INSIDE (LEFT, RIGHT, "
+            "ABOVE or BELOW, as seen on the picture) the side that is the room. A person "
+            "crossing it from one side to the other is reported as an anonymous room entry "
+            "or exit. Optional; repeatable up to 4 times"
+        ),
+    )
+    command.add_argument(
+        "--managed-portals",
+        action="store_true",
+        help=(
+            "take this camera's doorway lines from the VeoTrex control plane (refreshed "
+            "periodically, last-known-good kept) and upload its anonymous room events. Uses "
+            "--control-plane-url and --credential-file; cannot be combined with --portal. "
+            "The only portal source outside local/development/test/ci"
+        ),
+    )
+    command.add_argument(
+        "--managed-camera",
+        default=None,
+        help=(
+            "with --managed-portals: the VeoTrex camera UUID assigned to this edge node "
+            "(default: --ring-camera)"
+        ),
+    )
+    command.add_argument(
+        "--state-dir",
+        default=None,
+        help=(
+            "with --managed-portals: absolute path of a private (0700) directory for the "
+            f"config cache and the event outbox (default: ${STATE_DIR_ENV})"
+        ),
+    )
+    command.add_argument(
+        "--config-refresh-seconds",
+        type=float,
+        default=DEFAULT_REFRESH_SECONDS,
+        help="with --managed-portals: how often to re-read the configuration (30-600 s)",
+    )
+    command.add_argument(
+        "--outbox-capacity",
+        type=int,
+        default=DEFAULT_OUTBOX_CAPACITY,
+        help="with --managed-portals: most events held while the control plane is unreachable",
+    )
+    command.add_argument(
+        "--portal-deadband",
+        type=float,
+        default=DEFAULT_DEADBAND,
+        help="distance from a portal line within which a position counts as neither side",
+    )
+    command.add_argument(
+        "--portal-confirm-observations",
+        type=int,
+        default=DEFAULT_CONFIRM_OBSERVATIONS,
+        help="consecutive observations on the new side needed to confirm a crossing",
+    )
     command.add_argument("--detector", choices=DETECTOR_CHOICES, default="yolox")
     command.add_argument(
         "--environment",
@@ -131,6 +273,27 @@ def add_demo_arguments(command: argparse.ArgumentParser) -> argparse.ArgumentPar
     )
     command.add_argument(
         "--preview-quality", type=int, default=DEFAULT_JPEG_QUALITY, help="preview JPEG quality"
+    )
+    command.add_argument(
+        "--inference-fps",
+        type=float,
+        default=DEFAULT_INFERENCE_FPS,
+        help=(
+            "target detector rate. Inference runs on the newest frame at this cadence, not on "
+            "every camera frame, and slows automatically when the detector cannot sustain it"
+        ),
+    )
+    command.add_argument(
+        "--inference-min-fps",
+        type=float,
+        default=DEFAULT_MIN_INFERENCE_FPS,
+        help="slowest rate the adaptive scheduler may fall back to under load",
+    )
+    command.add_argument(
+        "--inference-max-fps",
+        type=float,
+        default=DEFAULT_MAX_INFERENCE_FPS,
+        help="hard ceiling on the detector rate; --inference-fps may not exceed it",
     )
     command.add_argument(
         "--max-frames", type=int, default=None, help="stop after this many processed frames"
@@ -173,6 +336,8 @@ def _source(arguments: argparse.Namespace) -> Any:
             fps=arguments.fps,
             interval_seconds=1.0 / max(arguments.fps, 1.0),
         )
+    if arguments.source == "ring":
+        return _ring_source(arguments)
     return LocalCameraSource(
         arguments.device,
         width=arguments.width,
@@ -183,6 +348,100 @@ def _source(arguments: argparse.Namespace) -> Any:
     )
 
 
+def _ring_source(arguments: argparse.Namespace) -> Any:
+    """Build the Ring live source, or refuse in a way that says exactly what is missing.
+
+    The real path is brokered (V1-DEMO-03B/03C): the node presents its own machine credential to
+    the VeoTrex control plane, which negotiates with Ring server-side. The inputs are a VeoTrex
+    camera UUID, the control-plane origin and the credential file's path - never a credential,
+    a Ring token, a Ring device id or a provider URL. Everything is validated, and the
+    credential file read once, before any media process starts.
+    """
+    camera_id = arguments.ring_camera
+    if not camera_id:
+        raise LiveSourceError("ring_camera_id_required")
+    if arguments.ring_media_qualification:
+        # Explicitly named, never a fallback: the operator asked for the local media
+        # qualification, and what they get is synthetic imagery through the real decode path.
+        from veotrex_edge_agent.live.ring_fakes import FakeRingSessionProvider
+        from veotrex_edge_agent.live.ring_gst import GstFrameReader
+
+        print("Ring MEDIA QUALIFICATION: synthetic encoded stream, no Ring session, no network.")
+        return RingWhepSource(
+            camera_id,
+            FakeRingSessionProvider(),
+            GstFrameReader(source="synthetic", width=arguments.width, height=arguments.height),
+        )
+    return build_brokered_ring_source(
+        camera_id,
+        control_plane_url=arguments.control_plane_url or os.environ.get(CONTROL_PLANE_URL_ENV),
+        credential_file=arguments.credential_file or os.environ.get(CREDENTIAL_FILE_ENV),
+        environment=arguments.environment,
+    )
+
+
+def build_brokered_ring_source(
+    camera_id: str,
+    *,
+    control_plane_url: str | None,
+    credential_file: str | None,
+    environment: str,
+    reader: Any = None,
+    connection_factory: Any = None,
+    **source_options: Any,
+) -> RingWhepSource:
+    """Compose broker auth -> BrokerWhepClient/BrokeredWhepSessionProvider -> GstFrameReader
+    -> RingWhepSource. ``reader`` and ``connection_factory`` exist for local tests only;
+    ``source_options`` are RingWhepSource's own bounded timing and reconnect settings."""
+    from veotrex_edge_agent.camera_transport.broker_whep import (
+        BrokeredWhepExchange,
+        BrokeredWhepSessionProvider,
+        BrokerWhepClient,
+        ControlPlaneEndpoint,
+        EdgeCredentialError,
+        read_edge_credential,
+    )
+    from veotrex_edge_agent.live.ring_broker import BrokeredRingSessionProvider
+    from veotrex_edge_agent.live.ring_gst import GstFrameReader
+
+    try:
+        camera = UUID(camera_id)
+    except ValueError:
+        raise LiveSourceError("ring_camera_id_must_be_a_veotrex_camera_uuid") from None
+    if str(camera) != camera_id.lower():
+        raise LiveSourceError("ring_camera_id_must_be_a_veotrex_camera_uuid")
+    if not control_plane_url:
+        raise LiveSourceError("control_plane_url_not_configured")
+    if not credential_file:
+        raise LiveSourceError("credential_file_not_configured")
+    try:
+        endpoint = ControlPlaneEndpoint.parse(control_plane_url, environment=environment)
+    except ValueError:
+        raise LiveSourceError("control_plane_url_invalid") from None
+    try:
+        # Read once now so a missing or unprotected file fails before media opens. The value
+        # is discarded; each session re-reads the file, so a rotated credential is picked up.
+        read_edge_credential(credential_file)
+    except EdgeCredentialError as exc:
+        raise LiveSourceError(exc.reason) from None
+    client = (
+        BrokerWhepClient(endpoint)
+        if connection_factory is None
+        else BrokerWhepClient(endpoint, connection_factory=connection_factory)
+    )
+    provider = BrokeredRingSessionProvider(
+        camera,
+        BrokeredWhepSessionProvider(camera, endpoint, credential_file),
+        BrokeredWhepExchange(client),
+    )
+    return RingWhepSource(
+        str(camera),
+        provider,
+        reader or GstFrameReader(source="webrtc", decoder="nvidia"),
+        **source_options,
+    )
+
+
 def _detector(arguments: argparse.Namespace) -> Any:
     if arguments.detector == "none":
         return FakePersonDetector({})
@@ -190,24 +449,17 @@ def _detector(arguments: argparse.Namespace) -> Any:
 
 
 def run_demo_cli(arguments: argparse.Namespace) -> int:
+    # Every operator setting is validated before anything is started. A refusal after the
+    # detector's GPU worker is up would return without the ``finally`` that stops it.
     try:
-        source = _source(arguments)
-    except LiveSourceError as exc:
-        print(f"camera rejected: {exc.category}", file=sys.stderr)
+        inference_rate = InferenceRateConfig(
+            target_fps=arguments.inference_fps,
+            min_fps=arguments.inference_min_fps,
+            max_fps=arguments.inference_max_fps,
+        )
+    except ValueError as exc:
+        print(f"invalid inference rate: {exc}", file=sys.stderr)
         return 2
-    try:
-        detector = _detector(arguments)
-    except DetectorUnavailable as exc:
-        print(f"detector unavailable: {exc}", file=sys.stderr)
-        return 2
-
-    starting = getattr(detector, "start", None)
-    if callable(starting):
-        try:
-            starting()
-        except DetectorUnavailable as exc:
-            print(f"detector unavailable: {exc}", file=sys.stderr)
-            return 2
 
     preview: PreviewRenderer | None = None
     if not arguments.headless and not arguments.no_preview:
@@ -228,6 +480,98 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
     except IgnoreRegionError as exc:
         print(f"invalid ignore region: {exc}", file=sys.stderr)
         return 2
+    try:
+        # Validated with everything else, before a source opens or a GPU worker starts.
+        portals = build_portals(
+            getattr(arguments, "portals", None),
+            deadband=getattr(arguments, "portal_deadband", DEFAULT_DEADBAND),
+        )
+        crossing_policy = CrossingPolicy(
+            confirm_observations=getattr(
+                arguments, "portal_confirm_observations", DEFAULT_CONFIRM_OBSERVATIONS
+            )
+        )
+    except (PortalError, ValueError) as exc:
+        print(f"invalid portal: {exc}", file=sys.stderr)
+        return 2
+    try:
+        plan = portal_plan(arguments)
+    except PortalPlanError as exc:
+        print(f"portal source refused: {exc.category}", file=sys.stderr)
+        return 2
+    managed: ManagedEdgeSession | None = None
+    if plan.managed is not None:
+        try:
+            # Local I/O only (state directory, cache, outbox): still before any camera or GPU.
+            managed = ManagedEdgeSession.open(plan.managed)
+        except PortalPlanError as exc:
+            print(f"portal source refused: {exc.category}", file=sys.stderr)
+            return 2
+    try:
+        return _run_demo(
+            arguments, inference_rate, preview, regions, portals, crossing_policy, managed
+        )
+    finally:
+        if managed is not None:
+            managed.close()
+
+
+def portal_plan(arguments: argparse.Namespace) -> PortalPlan:
+    """Resolve where doorway lines come from (see ``managed_session``), before anything runs."""
+    managed_camera = getattr(arguments, "managed_camera", None)
+    if managed_camera is None and arguments.source == "ring":
+        managed_camera = arguments.ring_camera
+    return resolve_portal_plan(
+        environment=arguments.environment,
+        static_portals=bool(getattr(arguments, "portals", None)),
+        managed=bool(getattr(arguments, "managed_portals", False)),
+        camera_id=managed_camera,
+        control_plane_url=arguments.control_plane_url or os.environ.get(CONTROL_PLANE_URL_ENV),
+        credential_file=arguments.credential_file or os.environ.get(CREDENTIAL_FILE_ENV),
+        state_dir=getattr(arguments, "state_dir", None) or os.environ.get(STATE_DIR_ENV),
+        refresh_seconds=getattr(arguments, "config_refresh_seconds", DEFAULT_REFRESH_SECONDS),
+        outbox_capacity=getattr(arguments, "outbox_capacity", DEFAULT_OUTBOX_CAPACITY),
+    )
+
+
+def _run_demo(
+    arguments: argparse.Namespace,
+    inference_rate: InferenceRateConfig,
+    preview: PreviewRenderer | None,
+    regions: Any,
+    portals: PortalSet,
+    crossing_policy: CrossingPolicy,
+    managed: ManagedEdgeSession | None,
+) -> int:
+    try:
+        source = _source(arguments)
+    except LiveSourceError as exc:
+        print(f"camera rejected: {exc.category}", file=sys.stderr)
+        if exc.category in BROKER_CONFIGURATION_CATEGORIES:
+            print(
+                "The Ring source is brokered by the VeoTrex control plane and needs:\n"
+                "  --ring-camera <VeoTrex camera UUID assigned to this node>\n"
+                f"  --control-plane-url https://... (or ${CONTROL_PLANE_URL_ENV})\n"
+                f"  --credential-file /abs/path (or ${CREDENTIAL_FILE_ENV}), a 0600 file\n"
+                "The credential itself is never an argument. To qualify the media path locally\n"
+                "without any session, add --ring-media-qualification.",
+                file=sys.stderr,
+            )
+        return 2
+    try:
+        detector = _detector(arguments)
+    except DetectorUnavailable as exc:
+        print(f"detector unavailable: {exc}", file=sys.stderr)
+        return 2
+
+    starting = getattr(detector, "start", None)
+    if callable(starting):
+        try:
+            starting()
+        except DetectorUnavailable as exc:
+            print(f"detector unavailable: {exc}", file=sys.stderr)
+            return 2
+
     if regions:
         # Printed, not silent. Masking part of a camera's view is a decision an operator has
         # to be able to see they made, and to undo.
@@ -236,7 +580,48 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
             note = f"  {region.as_dict()}"
             print(note)
         print("  These suppress known fixed artifacts only. They are not detector qualification.")
-    runtime = LiveDemoRuntime(source, detector, preview=preview, ignore_regions=regions)
+        if regions.low_containment:
+            print(
+                f"  WARNING: --ignore-containment {regions.min_containment} is below 0.5: a "
+                "detection mostly OUTSIDE a region - a person standing in front of it - can be "
+                "suppressed."
+            )
+    if portals:
+        print(f"Room transitions from {len(portals.enabled)} configured portal(s):")
+        for portal in portals.portals:
+            print(f"  {portal.as_dict()}")
+        print(
+            "  Entry/exit is reported only for a track crossing a portal line. Appearing in or "
+            "leaving the view is never an entry or an exit, and nobody is identified."
+        )
+    if managed is not None:
+        cached, revision = managed.current()
+        print(
+            f"Room transitions from control-plane doorway lines for camera {managed.plan.camera_id}"
+            f" ({managed.plan.endpoint.origin}); refreshed every "
+            f"{managed.plan.refresh_seconds:g} s."
+        )
+        print(
+            f"  Last-known-good: {len(cached.portals)} line(s), revision {revision}"
+            if revision is not None
+            else "  No last-known-good configuration yet: no room events until the first fetch."
+        )
+        print("  Events are queued durably on this device and uploaded; nobody is identified.")
+    runtime = LiveDemoRuntime(
+        source,
+        detector,
+        preview=preview,
+        ignore_regions=regions,
+        inference_rate=inference_rate,
+        portals=portals,
+        crossing_policy=crossing_policy,
+        transition_sink=None if managed is None else managed.submit,
+        managed_status=None if managed is None else managed.snapshot,
+    )
+    if managed is not None:
+        # Stages the cached lines, then starts the refresher (first fetch immediately, on its
+        # own thread) and the uploader. Both are stopped by run_demo_cli's ``finally``.
+        managed.start(runtime.portals.stage)
     server: DemoServer | None = None
     code = 0
     try:
@@ -290,7 +675,17 @@ def run_demo_cli(arguments: argparse.Namespace) -> int:
 
     print(
         json.dumps(
-            {"metrics": runtime.metrics(), "failure": runtime.failure}, indent=2, sort_keys=True
+            {
+                "metrics": runtime.metrics(),
+                "failure": runtime.failure,
+                "calibration": runtime.calibration(),
+                # Geometry and confidence only. A suggested region in here is for review and is
+                # never applied unless the operator passes it back as --ignore-region.
+                "occupancy_diagnostics": runtime.occupancy_diagnostics(),
+                "room_transitions": runtime.room_transitions(),
+            },
+            indent=2,
+            sort_keys=True,
         )
     )
     return code

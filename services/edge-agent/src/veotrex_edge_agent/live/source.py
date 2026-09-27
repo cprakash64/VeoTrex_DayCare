@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -149,6 +149,7 @@ class SourceDescription:
     nominal_fps: float | None
 
 
+@runtime_checkable
 class LiveVideoSource(Protocol):
     """A source of live frames.
 
